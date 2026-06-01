@@ -1,0 +1,15 @@
+[Unit]
+Description=GitHub Actions Docker Ephemeral Runner - {{.ProfileName}}
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile={{.EnvironmentFile}}
+ExecStart={{.LoopBinaryPath}}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
