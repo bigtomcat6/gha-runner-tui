@@ -1,0 +1,4 @@
+gha-runner-tui
+gha-ephemeral-loop
+*.log
+*.tmp
