@@ -1,0 +1,15 @@
+[Unit]
+Description=GitHub Actions Docker Ephemeral Runner - {{.ProfileName}}
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment={{.GitHubTokenEnvRef}}=${{.GitHubTokenEnvRef}}
+ExecStart=/usr/local/bin/gha-ephemeral-loop --config {{.ProfileConfigPath}}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
