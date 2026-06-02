@@ -17,6 +17,9 @@ func TestLoadGlobalConfigUsesDefaultsWhenFileMissing(t *testing.T) {
 	if cfg.GitHub.TokenEnv != "GITHUB_TOKEN" {
 		t.Fatalf("expected default token env, got %q", cfg.GitHub.TokenEnv)
 	}
+	if cfg.GitHub.EnvFile != "/etc/gha-runner-tui/github.env" {
+		t.Fatalf("expected default github env file, got %q", cfg.GitHub.EnvFile)
+	}
 	if cfg.Paths.ProfilesDir != "/etc/gha-runner-tui/profiles" {
 		t.Fatalf("expected default profiles dir, got %q", cfg.Paths.ProfilesDir)
 	}
@@ -30,7 +33,7 @@ func TestLoadGlobalConfigMergesDefaults(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	content := []byte("github:\n  token_env: CI_GITHUB_TOKEN\npaths:\n  profiles_dir: /tmp/profiles\n")
+	content := []byte("github:\n  token_env: CI_GITHUB_TOKEN\n  env_file: /etc/gha-runner-tui/ci.env\npaths:\n  profiles_dir: /tmp/profiles\n")
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
@@ -42,6 +45,9 @@ func TestLoadGlobalConfigMergesDefaults(t *testing.T) {
 
 	if cfg.GitHub.TokenEnv != "CI_GITHUB_TOKEN" {
 		t.Fatalf("expected token env override, got %q", cfg.GitHub.TokenEnv)
+	}
+	if cfg.GitHub.EnvFile != "/etc/gha-runner-tui/ci.env" {
+		t.Fatalf("expected env file override, got %q", cfg.GitHub.EnvFile)
 	}
 	if cfg.GitHub.APIBaseURL != "https://api.github.com" {
 		t.Fatalf("expected default api base url, got %q", cfg.GitHub.APIBaseURL)

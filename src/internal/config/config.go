@@ -12,6 +12,7 @@ const (
 	defaultStateDir    = "/var/lib/gha-runner-tui/state"
 	defaultLogDir      = "/var/log/gha-runner-tui"
 	defaultTokenEnv    = "GITHUB_TOKEN"
+	defaultEnvFile     = "/etc/gha-runner-tui/github.env"
 	defaultAPIBaseURL  = "https://api.github.com"
 	defaultSvcPrefix   = "gha-"
 )
@@ -25,6 +26,7 @@ type GlobalConfig struct {
 
 type GitHubConfig struct {
 	TokenEnv   string `yaml:"token_env"`
+	EnvFile    string `yaml:"env_file"`
 	APIBaseURL string `yaml:"api_base_url"`
 }
 
@@ -46,6 +48,7 @@ func DefaultGlobalConfig() GlobalConfig {
 	return GlobalConfig{
 		GitHub: GitHubConfig{
 			TokenEnv:   defaultTokenEnv,
+			EnvFile:    defaultEnvFile,
 			APIBaseURL: defaultAPIBaseURL,
 		},
 		Paths: PathsConfig{
@@ -87,6 +90,9 @@ func LoadGlobalConfig(path string) (GlobalConfig, error) {
 func (c *GlobalConfig) applyDefaults() {
 	if c.GitHub.TokenEnv == "" {
 		c.GitHub.TokenEnv = defaultTokenEnv
+	}
+	if c.GitHub.EnvFile == "" {
+		c.GitHub.EnvFile = defaultEnvFile
 	}
 	if c.GitHub.APIBaseURL == "" {
 		c.GitHub.APIBaseURL = defaultAPIBaseURL

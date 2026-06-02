@@ -21,6 +21,11 @@ type Supervisor struct {
 	GitHub      gh.Client
 }
 
+type registrationTokenClient interface {
+	CreateRegistrationToken(ctx context.Context, owner, repo string) (string, error)
+	CreateOrgRegistrationToken(ctx context.Context, org string) (string, error)
+}
+
 type stateRecord struct {
 	Profile           string  `json:"profile"`
 	Repo              string  `json:"repo"`
@@ -59,7 +64,7 @@ func (s Supervisor) Run(ctx context.Context) error {
 		if err == nil {
 			if writeErr := s.writeState(profile, stateRecord{
 				Profile:           profile.Name,
-				Repo:              repoSlug(profile),
+				Repo:              targetSlug(profile),
 				State:             "sleeping",
 				Health:            "healthy",
 				LastTransitionAt:  time.Now().UTC().Format(time.RFC3339),
@@ -82,7 +87,7 @@ func (s Supervisor) Run(ctx context.Context) error {
 		lastError := err.Error()
 		if writeErr := s.writeState(profile, stateRecord{
 			Profile:           profile.Name,
-			Repo:              repoSlug(profile),
+			Repo:              targetSlug(profile),
 			State:             "backoff",
 			Health:            "warning",
 			LastTransitionAt:  time.Now().UTC().Format(time.RFC3339),
@@ -114,7 +119,7 @@ func (s Supervisor) runCycle(ctx context.Context, profile config.Profile, restar
 	result := cycleResult{exitCode: -1}
 	if err := s.writeState(profile, stateRecord{
 		Profile:          profile.Name,
-		Repo:             repoSlug(profile),
+		Repo:             targetSlug(profile),
 		State:            "cleaning",
 		Health:           "running",
 		LastTransitionAt: time.Now().UTC().Format(time.RFC3339),
@@ -129,7 +134,7 @@ func (s Supervisor) runCycle(ctx context.Context, profile config.Profile, restar
 
 	if err := s.writeState(profile, stateRecord{
 		Profile:          profile.Name,
-		Repo:             repoSlug(profile),
+		Repo:             targetSlug(profile),
 		State:            "registering",
 		Health:           "running",
 		LastTransitionAt: time.Now().UTC().Format(time.RFC3339),
@@ -138,7 +143,7 @@ func (s Supervisor) runCycle(ctx context.Context, profile config.Profile, restar
 		return result, err
 	}
 
-	registrationToken, err := s.GitHub.CreateRegistrationToken(ctx, profile.Repo.Owner, profile.Repo.Name)
+	registrationToken, err := registrationTokenForProfile(ctx, s.GitHub, profile)
 	if err != nil {
 		return result, err
 	}
@@ -153,7 +158,7 @@ func (s Supervisor) runCycle(ctx context.Context, profile config.Profile, restar
 
 	if err := s.writeState(profile, stateRecord{
 		Profile:           profile.Name,
-		Repo:              repoSlug(profile),
+		Repo:              targetSlug(profile),
 		State:             "starting",
 		Health:            "running",
 		LastTransitionAt:  time.Now().UTC().Format(time.RFC3339),
@@ -179,7 +184,7 @@ func (s Supervisor) runCycle(ctx context.Context, profile config.Profile, restar
 
 	if err := s.writeState(profile, stateRecord{
 		Profile:           profile.Name,
-		Repo:              repoSlug(profile),
+		Repo:              targetSlug(profile),
 		State:             "running-job",
 		Health:            "running",
 		LastTransitionAt:  time.Now().UTC().Format(time.RFC3339),
@@ -199,7 +204,7 @@ func (s Supervisor) runCycle(ctx context.Context, profile config.Profile, restar
 
 	if err := s.writeState(profile, stateRecord{
 		Profile:           profile.Name,
-		Repo:              repoSlug(profile),
+		Repo:              targetSlug(profile),
 		State:             "cleaning",
 		Health:            "running",
 		LastTransitionAt:  time.Now().UTC().Format(time.RFC3339),
@@ -226,13 +231,21 @@ func (s Supervisor) runCycle(ctx context.Context, profile config.Profile, restar
 }
 
 func runnerEnv(profile config.Profile, runnerName, registrationToken string) map[string]string {
-	env := make(map[string]string, len(profile.Docker.Env)+6)
+	env := make(map[string]string, len(profile.Docker.Env)+7)
 	for key, value := range profile.Docker.Env {
 		env[key] = value
 	}
 	env["RUNNER_NAME"] = runnerName
 	env["RUNNER_TOKEN"] = registrationToken
-	env["RUNNER_REPO_URL"] = fmt.Sprintf("https://github.com/%s/%s", profile.Repo.Owner, profile.Repo.Name)
+	target, err := profile.ResolveTarget()
+	if err == nil {
+		env["RUNNER_REPO_URL"] = target.GitHubURL()
+		if target.Scope == config.TargetScopeOrganization && profile.RunnerGroup.Name != "" {
+			env["RUNNER_GROUP"] = profile.RunnerGroup.Name
+		}
+	} else {
+		env["RUNNER_REPO_URL"] = fmt.Sprintf("https://github.com/%s/%s", profile.Repo.Owner, profile.Repo.Name)
+	}
 	env["RUNNER_LABELS"] = strings.Join(profile.Runner.Labels, ",")
 	env["RUNNER_WORKDIR"] = profile.Runner.Workdir
 	env["RUNNER_EPHEMERAL"] = fmt.Sprintf("%t", profile.Runner.Ephemeral)
@@ -257,8 +270,26 @@ func (s Supervisor) persistLogs(profile config.Profile, containerName, stamp, co
 	return os.WriteFile(path, []byte(content), 0o640)
 }
 
-func repoSlug(profile config.Profile) string {
-	return profile.Repo.Owner + "/" + profile.Repo.Name
+func registrationTokenForProfile(ctx context.Context, client registrationTokenClient, profile config.Profile) (string, error) {
+	target, err := profile.ResolveTarget()
+	if err != nil {
+		return "", err
+	}
+	if target.Scope == config.TargetScopeOrganization {
+		return client.CreateOrgRegistrationToken(ctx, target.OrgSlug)
+	}
+	return client.CreateRegistrationToken(ctx, target.Owner, target.Repo)
+}
+
+func targetSlug(profile config.Profile) string {
+	target, err := profile.ResolveTarget()
+	if err != nil {
+		return profile.Repo.Owner + "/" + profile.Repo.Name
+	}
+	if target.Scope == config.TargetScopeOrganization {
+		return "org:" + target.OrgSlug
+	}
+	return target.Owner + "/" + target.Repo
 }
 
 func optionalInt(value int, ok bool) *int {

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gha-runner-tui/internal/command"
 	"gha-runner-tui/internal/config"
 	"gha-runner-tui/internal/docker"
 	gh "gha-runner-tui/internal/github"
+	"gha-runner-tui/internal/state"
 	"gha-runner-tui/internal/systemd"
 )
 
@@ -56,6 +58,36 @@ func (r *scriptedRunner) Run(_ context.Context, name string, args ...string) ([]
 		return out, nil
 	}
 	return []byte("ok\n"), nil
+}
+
+type syncGitHub struct {
+	groups         []gh.RunnerGroup
+	orgRunners     []gh.Runner
+	createdGroups  []gh.RunnerGroup
+	deletedGroupID int64
+}
+
+func (g *syncGitHub) ListRepoRunners(context.Context, string, string) ([]gh.Runner, error) {
+	return nil, nil
+}
+
+func (g *syncGitHub) ListOrgRunners(context.Context, string) ([]gh.Runner, error) {
+	return g.orgRunners, nil
+}
+
+func (g *syncGitHub) ListOrgRunnerGroups(context.Context, string) ([]gh.RunnerGroup, error) {
+	return g.groups, nil
+}
+
+func (g *syncGitHub) CreateOrgRunnerGroup(_ context.Context, _ string, name, visibility string) (gh.RunnerGroup, error) {
+	group := gh.RunnerGroup{ID: 42, Name: name, Visibility: visibility}
+	g.createdGroups = append(g.createdGroups, group)
+	return group, nil
+}
+
+func (g *syncGitHub) DeleteOrgRunnerGroup(_ context.Context, _ string, id int64) error {
+	g.deletedGroupID = id
+	return nil
 }
 
 func TestCreateProfileUsesLegacyLayoutWhenLegacyTokenExists(t *testing.T) {
@@ -281,6 +313,187 @@ func TestRestartLoopKillsAllRunningContainersForMatchingRunnerName(t *testing.T)
 	for i, want := range expected {
 		if runner.calls[i] != want {
 			t.Fatalf("call %d: expected %q, got %q", i, want, runner.calls[i])
+		}
+	}
+}
+
+func TestSyncRunnerGroupCreatesMissingOrganizationGroup(t *testing.T) {
+	t.Parallel()
+
+	github := &syncGitHub{}
+	manager := NewRunnerManager("", systemd.Client{}, docker.Client{}, gh.NewClient("", "", "", nil, nil))
+	manager.GitHubAdmin = github
+
+	profile := config.Profile{
+		Name:        "example-org-swift",
+		Target:      config.TargetConfig{Scope: config.TargetScopeOrganization, Org: "Example Org"},
+		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "all"},
+		Runner:      config.RunnerConfig{Environment: "swift"},
+		Service:     config.ServiceConfig{Name: "gha-example-org-swift.service"},
+		Docker:      config.DockerProfile{ContainerNamePrefix: "gha-example-org-swift"},
+	}
+
+	if err := manager.SyncRunnerGroup(context.Background(), profile); err != nil {
+		t.Fatalf("SyncRunnerGroup returned error: %v", err)
+	}
+	if len(github.createdGroups) != 1 {
+		t.Fatalf("expected group creation, got %+v", github.createdGroups)
+	}
+}
+
+func TestSyncRunnerGroupRejectsExistingNonAllGroup(t *testing.T) {
+	t.Parallel()
+
+	github := &syncGitHub{
+		groups: []gh.RunnerGroup{{ID: 42, Name: "example-org-swift", Visibility: "selected"}},
+	}
+	manager := NewRunnerManager("", systemd.Client{}, docker.Client{}, gh.NewClient("", "", "", nil, nil))
+	manager.GitHubAdmin = github
+
+	profile := config.Profile{
+		Name:        "example-org-swift",
+		Target:      config.TargetConfig{Scope: config.TargetScopeOrganization, Org: "Example Org"},
+		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "all"},
+		Runner:      config.RunnerConfig{Environment: "swift"},
+		Service:     config.ServiceConfig{Name: "gha-example-org-swift.service"},
+		Docker:      config.DockerProfile{ContainerNamePrefix: "gha-example-org-swift"},
+	}
+
+	err := manager.SyncRunnerGroup(context.Background(), profile)
+	if err == nil {
+		t.Fatal("expected visibility mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "visibility") {
+		t.Fatalf("expected visibility error, got %v", err)
+	}
+}
+
+func TestDeleteRunnerGroupRejectsBusyRunner(t *testing.T) {
+	t.Parallel()
+
+	github := &syncGitHub{
+		groups: []gh.RunnerGroup{{ID: 42, Name: "example-org-swift", Visibility: "all"}},
+		orgRunners: []gh.Runner{{
+			ID: 1, Name: "example-org-swift-1", Status: state.GitHubOnline, Busy: true, RunnerGroupID: 42,
+		}},
+	}
+	manager := NewRunnerManager("", systemd.Client{}, docker.Client{}, gh.NewClient("", "", "", nil, nil))
+	manager.GitHubAdmin = github
+
+	profile := config.Profile{
+		Name:        "example-org-swift",
+		Target:      config.TargetConfig{Scope: config.TargetScopeOrganization, Org: "Example Org"},
+		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "all"},
+		Runner:      config.RunnerConfig{Environment: "swift"},
+		Service:     config.ServiceConfig{Name: "gha-example-org-swift.service"},
+		Docker:      config.DockerProfile{ContainerNamePrefix: "gha-example-org-swift"},
+	}
+
+	err := manager.DeleteRunnerGroup(context.Background(), profile)
+	if err == nil {
+		t.Fatal("expected busy runner error, got nil")
+	}
+}
+
+func TestDeleteRunnerGroupAllowsEmptyGroup(t *testing.T) {
+	t.Parallel()
+
+	github := &syncGitHub{
+		groups: []gh.RunnerGroup{{ID: 42, Name: "example-org-swift", Visibility: "all"}},
+	}
+	manager := NewRunnerManager("", systemd.Client{}, docker.Client{}, gh.NewClient("", "", "", nil, nil))
+	manager.GitHubAdmin = github
+
+	profile := config.Profile{
+		Name:        "example-org-swift",
+		Target:      config.TargetConfig{Scope: config.TargetScopeOrganization, Org: "Example Org"},
+		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "all"},
+		Runner:      config.RunnerConfig{Environment: "swift"},
+		Service:     config.ServiceConfig{Name: "gha-example-org-swift.service"},
+		Docker:      config.DockerProfile{ContainerNamePrefix: "gha-example-org-swift"},
+	}
+
+	if err := manager.DeleteRunnerGroup(context.Background(), profile); err != nil {
+		t.Fatalf("DeleteRunnerGroup returned error: %v", err)
+	}
+	if github.deletedGroupID != 42 {
+		t.Fatalf("expected group 42 deletion, got %d", github.deletedGroupID)
+	}
+}
+
+func TestCreateProfileDerivesOrganizationEnvironmentProfile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	stateDir := filepath.Join(root, "state")
+	logDir := filepath.Join(root, "logs")
+	systemdDir := filepath.Join(root, "systemd")
+	cfgPath := filepath.Join(root, "config.yaml")
+
+	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+paths:
+  profiles_dir: %s
+  state_dir: %s
+  log_dir: %s
+`, profilesDir, stateDir, logDir)), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+
+	runner := &recordingRunner{}
+	manager := NewRunnerManager(
+		cfgPath,
+		systemd.NewClient(runner),
+		docker.NewClient(command.OSRunner{}),
+		gh.NewClient("", "", "", nil, nil),
+	)
+	manager.SystemdUnitDir = systemdDir
+	manager.LegacyTokenFile = filepath.Join(root, "missing-token")
+
+	err := manager.CreateProfile(context.Background(), CreateProfileInput{
+		Scope:        config.TargetScopeOrganization,
+		Org:          "Example Org",
+		Environment:  "swift",
+		RunnerLabels: []string{"self-hosted", "linux", "x64", "docker", "swift"},
+		DockerImage:  "gha-runner-swift:latest",
+		CPUs:         "2",
+		Memory:       "4g",
+		Ephemeral:    true,
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile returned error: %v", err)
+	}
+
+	profilePath := filepath.Join(profilesDir, "example-org-swift.yaml")
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatalf("ReadFile profile returned error: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"scope: organization",
+		"org: Example Org",
+		"name: example-org-swift",
+		"visibility: all",
+		"environment: swift",
+		"container_name_prefix: gha-example-org-swift",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in profile:\n%s", want, text)
+		}
+	}
+
+	servicePath := filepath.Join(systemdDir, "gha-example-org-swift.service")
+	serviceData, err := os.ReadFile(servicePath)
+	if err != nil {
+		t.Fatalf("ReadFile service returned error: %v", err)
+	}
+	for _, want := range []string{
+		"EnvironmentFile=/etc/gha-runner-tui/github.env",
+		"ExecStart=/usr/local/bin/gha-ephemeral-loop --config " + profilePath,
+	} {
+		if !strings.Contains(string(serviceData), want) {
+			t.Fatalf("expected %q in service:\n%s", want, string(serviceData))
 		}
 	}
 }

@@ -27,6 +27,7 @@ type DockerClient interface {
 
 type GitHubClient interface {
 	ListRepoRunners(ctx context.Context, owner, repo string) ([]gh.Runner, error)
+	ListOrgRunners(ctx context.Context, org string) ([]gh.Runner, error)
 }
 
 type ProfileSnapshot struct {
@@ -134,20 +135,36 @@ func (s Service) loadProfile(ctx context.Context, profile config.Profile) Profil
 	}
 
 	if s.GitHub != nil {
-		runners, err := s.GitHub.ListRepoRunners(ctx, profile.Repo.Owner, profile.Repo.Name)
-		if err != nil {
-			snapshot.Errors = append(snapshot.Errors, "github: "+err.Error())
+		target, targetErr := profile.ResolveTarget()
+		if targetErr != nil {
+			snapshot.Errors = append(snapshot.Errors, "config: "+targetErr.Error())
 			snapshot.GitHubState = state.GitHubUnknown
 			snapshot.BusyState = state.BusyUnknown
 		} else {
-			exactRunnerName := snapshot.Loop.LastRunnerName
-			if exactRunnerName == "" {
-				exactRunnerName = profile.Runner.NamePrefix
+			var (
+				runners []gh.Runner
+				err     error
+			)
+			switch target.Scope {
+			case config.TargetScopeOrganization:
+				runners, err = s.GitHub.ListOrgRunners(ctx, target.OrgSlug)
+			default:
+				runners, err = s.GitHub.ListRepoRunners(ctx, target.Owner, target.Repo)
 			}
-			match := gh.MatchRunner(runners, exactRunnerName, profile.Runner.NamePrefix)
-			snapshot.GitHubRunner = match
-			snapshot.GitHubState = gh.RunnerState(match)
-			snapshot.BusyState = gh.BusyState(match)
+			if err != nil {
+				snapshot.Errors = append(snapshot.Errors, "github: "+err.Error())
+				snapshot.GitHubState = state.GitHubUnknown
+				snapshot.BusyState = state.BusyUnknown
+			} else {
+				exactRunnerName := snapshot.Loop.LastRunnerName
+				if exactRunnerName == "" {
+					exactRunnerName = profile.Runner.NamePrefix
+				}
+				match := gh.MatchRunner(runners, exactRunnerName, profile.Runner.NamePrefix)
+				snapshot.GitHubRunner = match
+				snapshot.GitHubState = gh.RunnerState(match)
+				snapshot.BusyState = gh.BusyState(match)
+			}
 		}
 	}
 

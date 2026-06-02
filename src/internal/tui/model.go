@@ -42,6 +42,7 @@ const (
 	actionRestart
 	actionKill
 	actionCleanup
+	actionDeleteGroup
 )
 
 type dashboardLoadedMsg struct {
@@ -316,6 +317,10 @@ func (m Model) updateDashboard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen = screenConfirm
 		}
 		return m, nil
+	case "g":
+		if snapshot := m.currentSnapshot(); snapshot != nil {
+			return m, syncRunnerGroupCmd(m.manager, snapshot.Profile)
+		}
 	}
 
 	var cmd tea.Cmd
@@ -393,6 +398,17 @@ func (m Model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			title:   "Cleanup stale resources",
 			body:    "Remove exited containers that match this profile's prefix?",
 			action:  actionCleanup,
+			profile: snapshot.Profile.Name,
+		}
+		m.screen = screenConfirm
+		return m, nil
+	case "g":
+		return m, syncRunnerGroupCmd(m.manager, snapshot.Profile)
+	case "D":
+		m.confirm = &confirmState{
+			title:   "Delete runner group",
+			body:    "Delete this organization runner group? Active or busy runners will block deletion.",
+			action:  actionDeleteGroup,
 			profile: snapshot.Profile.Name,
 		}
 		m.screen = screenConfirm
@@ -493,6 +509,8 @@ func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, killContainerCmd(m.manager, *snapshot)
 		case actionCleanup:
 			return m, cleanupCmd(m.manager, snapshot.Profile)
+		case actionDeleteGroup:
+			return m, deleteRunnerGroupCmd(m.manager, snapshot.Profile)
 		}
 	}
 	return m, nil
@@ -503,7 +521,7 @@ func (m Model) viewDashboard() string {
 	if len(m.dashboard.ProfileErrors) > 0 {
 		info += fmt.Sprintf("  Invalid profiles: %d", len(m.dashboard.ProfileErrors))
 	}
-	help := "[r] refresh  [enter] details  [c] create  [s] start  [x] stop  [R] restart  [?] help  [q] quit"
+	help := "[r] refresh  [enter] details  [c] create  [g] sync group  [s] start  [x] stop  [R] restart  [?] help  [q] quit"
 	return lipgloss.JoinVertical(lipgloss.Left, info, "", m.table.View(), "", help)
 }
 
@@ -546,7 +564,6 @@ func (m Model) viewDetail() string {
 
 	lines := []string{
 		fmt.Sprintf("Profile:            %s", snapshot.Profile.Name),
-		fmt.Sprintf("Repository:         %s/%s", snapshot.Profile.Repo.Owner, snapshot.Profile.Repo.Name),
 		fmt.Sprintf("Service:            %s", snapshot.Profile.Service.Name),
 		fmt.Sprintf("Service state:      %s", snapshot.Service.Active),
 		fmt.Sprintf("Loop state:         %s", snapshot.DisplayLoopState),
@@ -561,11 +578,21 @@ func (m Model) viewDetail() string {
 		fmt.Sprintf("Last exit code:     %s", lastExitCode),
 		fmt.Sprintf("Last error:         %s", lastError),
 	}
+	targetLabel := "Repository"
+	targetValue := snapshot.Profile.Repo.Owner + "/" + snapshot.Profile.Repo.Name
+	if target, err := snapshot.Profile.ResolveTarget(); err == nil && target.Scope == config.TargetScopeOrganization {
+		targetLabel = "Organization"
+		targetValue = target.OrgSlug
+	}
+	lines = append([]string{
+		fmt.Sprintf("Profile:            %s", snapshot.Profile.Name),
+		fmt.Sprintf("%-19s %s", targetLabel+":", targetValue),
+	}, lines[1:]...)
 	if summary := snapshot.ErrorSummary(); summary != "" {
 		lines = append(lines, "", "Observed errors:", summary)
 	}
 
-	help := "[j] systemd logs  [d] docker logs  [s] start  [x] stop  [R] restart  [k] kill  [C] cleanup  [b] back"
+	help := "[j] systemd logs  [d] docker logs  [g] sync group  [D] delete group  [s] start  [x] stop  [R] restart  [k] kill  [C] cleanup  [b] back"
 	return lipgloss.JoinVertical(lipgloss.Left, strings.Join(lines, "\n"), "", help)
 }
 
@@ -620,11 +647,14 @@ func (m Model) viewHelp() string {
 		"Dashboard:",
 		"  enter open selected profile detail",
 		"  c create profile",
+		"  g sync selected organization runner group",
 		"  s start selected loop",
 		"  x stop selected loop",
 		"  R restart selected loop",
 		"",
 		"Detail:",
+		"  g sync selected organization runner group",
+		"  D delete selected organization runner group",
 		"  j view systemd logs",
 		"  d view Docker logs",
 		"  k kill current container",
@@ -705,6 +735,9 @@ func newCreateFields() []createField {
 		value       string
 		placeholder string
 	}{
+		{label: "Target scope", value: "repository", placeholder: "repository or organization"},
+		{label: "Organization", placeholder: "Example Org"},
+		{label: "Environment", placeholder: "swift"},
 		{label: "Profile name", placeholder: "remind-me-swift"},
 		{label: "Repo owner", placeholder: "bigtomcat6"},
 		{label: "Repo name", placeholder: "remind-me"},
@@ -755,6 +788,9 @@ func (m Model) readCreateInput() (app.CreateProfileInput, error) {
 
 	labels := splitCSV(values["Runner labels"])
 	input := app.CreateProfileInput{
+		Scope:               config.TargetScope(strings.TrimSpace(values["Target scope"])),
+		Org:                 values["Organization"],
+		Environment:         values["Environment"],
 		Name:                values["Profile name"],
 		RepoOwner:           values["Repo owner"],
 		RepoName:            values["Repo name"],
@@ -767,11 +803,25 @@ func (m Model) readCreateInput() (app.CreateProfileInput, error) {
 		Ephemeral:           ephemeral,
 	}
 
-	if input.Name == "" || input.RepoOwner == "" || input.RepoName == "" || input.DockerImage == "" || input.ServiceName == "" || input.ContainerNamePrefix == "" {
-		return app.CreateProfileInput{}, fmt.Errorf("fill in all required fields before creating a profile")
+	switch input.Scope {
+	case config.TargetScopeOrganization:
+		if input.Org == "" || input.Environment == "" || input.DockerImage == "" {
+			return app.CreateProfileInput{}, fmt.Errorf("fill in organization, environment, and Docker image before creating an organization profile")
+		}
+	default:
+		if input.Name == "" || input.RepoOwner == "" || input.RepoName == "" || input.DockerImage == "" || input.ServiceName == "" || input.ContainerNamePrefix == "" {
+			return app.CreateProfileInput{}, fmt.Errorf("fill in all required fields before creating a profile")
+		}
 	}
 
 	return input, nil
+}
+
+func syncRunnerGroupCmd(manager app.RunnerManager, profile config.Profile) tea.Cmd {
+	return func() tea.Msg {
+		err := manager.SyncRunnerGroup(context.Background(), profile)
+		return actionDoneMsg{status: "runner group synced", err: err, reload: err == nil}
+	}
 }
 
 func (m Model) loadCurrentLogsCmd() tea.Cmd {
@@ -850,6 +900,13 @@ func cleanupCmd(manager app.RunnerManager, profile config.Profile) tea.Cmd {
 	return func() tea.Msg {
 		removed, err := manager.CleanupExited(context.Background(), profile)
 		return actionDoneMsg{status: app.FormatCleanupResult(removed), err: err, reload: err == nil}
+	}
+}
+
+func deleteRunnerGroupCmd(manager app.RunnerManager, profile config.Profile) tea.Cmd {
+	return func() tea.Msg {
+		err := manager.DeleteRunnerGroup(context.Background(), profile)
+		return actionDoneMsg{status: "runner group deleted", err: err, reload: err == nil}
 	}
 }
 
