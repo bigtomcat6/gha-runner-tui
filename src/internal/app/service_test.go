@@ -52,12 +52,21 @@ func (f fakeDocker) Inspect(_ context.Context, idOrName string) (dockerpkg.Conta
 }
 
 type fakeGitHub struct {
-	runners []gh.Runner
-	err     error
+	repoRunners []gh.Runner
+	orgRunners  []gh.Runner
+	err         error
+	repoCalls   []string
+	orgCalls    []string
 }
 
-func (f fakeGitHub) ListRepoRunners(context.Context, string, string) ([]gh.Runner, error) {
-	return f.runners, f.err
+func (f *fakeGitHub) ListRepoRunners(_ context.Context, owner, repo string) ([]gh.Runner, error) {
+	f.repoCalls = append(f.repoCalls, owner+"/"+repo)
+	return f.repoRunners, f.err
+}
+
+func (f *fakeGitHub) ListOrgRunners(_ context.Context, org string) ([]gh.Runner, error) {
+	f.orgCalls = append(f.orgCalls, org)
+	return f.orgRunners, f.err
 }
 
 func TestLoadDashboardBuildsHealthySleepingSnapshot(t *testing.T) {
@@ -108,7 +117,7 @@ loop:
 		Docker: fakeDocker{
 			container: dockerpkg.ContainerInfo{State: state.ContainerNone},
 		},
-		GitHub: fakeGitHub{},
+		GitHub: &fakeGitHub{},
 	}
 
 	dashboard, err := service.LoadDashboard(context.Background())
@@ -163,7 +172,7 @@ loop:
 		Docker: fakeDocker{
 			container: dockerpkg.ContainerInfo{State: state.ContainerNone},
 		},
-		GitHub: fakeGitHub{},
+		GitHub: &fakeGitHub{},
 	}
 
 	dashboard, err := service.LoadDashboard(context.Background())
@@ -227,8 +236,8 @@ func TestLoadProfileMarksDuplicateRunningContainersUnhealthy(t *testing.T) {
 				},
 			},
 		},
-		GitHub: fakeGitHub{
-			runners: []gh.Runner{
+		GitHub: &fakeGitHub{
+			repoRunners: []gh.Runner{
 				{Name: "gha-remind-me-exp", Status: state.GitHubOnline},
 			},
 		},
@@ -244,5 +253,77 @@ func TestLoadProfileMarksDuplicateRunningContainersUnhealthy(t *testing.T) {
 	}
 	if !strings.Contains(snapshot.ErrorSummary(), "multiple running containers matched profile") {
 		t.Fatalf("expected duplicate-container error, got %q", snapshot.ErrorSummary())
+	}
+}
+
+func TestLoadDashboardListsOrganizationRunnersForOrganizationProfile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(profilesDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll profiles returned error: %v", err)
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll state returned error: %v", err)
+	}
+
+	cfgPath := filepath.Join(root, "config.yaml")
+	statePath := filepath.Join(stateDir, "example-org-swift.json")
+	if err := os.WriteFile(cfgPath, []byte("paths:\n  profiles_dir: "+profilesDir+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(profilesDir, "example-org-swift.yaml"), []byte(`
+name: example-org-swift
+target:
+  scope: organization
+  org: Example Org
+runner_group:
+  name: example-org-swift
+  create: true
+  visibility: private
+service:
+  name: gha-example-org-swift.service
+runner:
+  environment: swift
+  name_prefix: example-org-swift
+docker:
+  container_name_prefix: gha-example-org-swift
+loop:
+  state_file: `+statePath+`
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile profile returned error: %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte(`{"profile":"example-org-swift","state":"sleeping","last_runner_name":"example-org-swift-1"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile state returned error: %v", err)
+	}
+
+	github := &fakeGitHub{
+		orgRunners: []gh.Runner{{Name: "example-org-swift-1", Status: state.GitHubOnline}},
+	}
+	service := Service{
+		ConfigPath: cfgPath,
+		Systemd: fakeSystemd{
+			status: systemdpkg.ServiceStatus{Active: state.SystemdActive, Enabled: true},
+		},
+		Docker: fakeDocker{
+			container: dockerpkg.ContainerInfo{State: state.ContainerNone},
+		},
+		GitHub: github,
+	}
+
+	dashboard, err := service.LoadDashboard(context.Background())
+	if err != nil {
+		t.Fatalf("LoadDashboard returned error: %v", err)
+	}
+	if len(github.orgCalls) != 1 || github.orgCalls[0] != "example-org" {
+		t.Fatalf("expected org runner call, got %v", github.orgCalls)
+	}
+	if len(github.repoCalls) != 0 {
+		t.Fatalf("did not expect repo runner calls, got %v", github.repoCalls)
+	}
+	if dashboard.Profiles[0].GitHubRunner == nil {
+		t.Fatal("expected GitHub runner match")
 	}
 }

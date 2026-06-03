@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-Environment={{.GitHubTokenEnvRef}}=${{.GitHubTokenEnvRef}}
-ExecStart=/usr/local/bin/gha-ephemeral-loop --config {{.ProfileConfigPath}}
+EnvironmentFile={{.GitHubEnvFile}}
+ExecStart={{.LoopBinaryPath}} --config {{.ProfileConfigPath}}
 Restart=always
 RestartSec=5
 

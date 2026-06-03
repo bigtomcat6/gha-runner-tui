@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,5 +60,69 @@ func TestLoadProfileValidatesRequiredFields(t *testing.T) {
 	_, err := LoadProfile(path)
 	if err == nil {
 		t.Fatal("expected validation error, got nil")
+	}
+}
+
+func TestLoadProfileValidatesOrganizationProfile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "org.yaml")
+	if err := os.WriteFile(path, []byte(`
+name: example-org-swift
+target:
+  scope: organization
+  org: Example Org
+runner_group:
+  name: example-org-swift
+  create: true
+  visibility: private
+service:
+  name: gha-example-org-swift.service
+runner:
+  environment: swift
+docker:
+  container_name_prefix: gha-example-org-swift
+loop:
+  state_file: /var/lib/gha-runner-tui/state/example-org-swift.json
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	profile, err := LoadProfile(path)
+	if err != nil {
+		t.Fatalf("LoadProfile returned error: %v", err)
+	}
+	if profile.Runner.Environment != "swift" {
+		t.Fatalf("expected swift environment, got %q", profile.Runner.Environment)
+	}
+}
+
+func TestLoadProfileRejectsOrganizationProfileWithoutEnvironment(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "org.yaml")
+	if err := os.WriteFile(path, []byte(`
+name: example-org
+target:
+  scope: organization
+  org: Example Org
+runner_group:
+  name: example-org
+  create: true
+  visibility: private
+service:
+  name: gha-example-org.service
+docker:
+  container_name_prefix: gha-example-org
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	_, err := LoadProfile(path)
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "runner.environment") {
+		t.Fatalf("expected runner.environment error, got %v", err)
 	}
 }

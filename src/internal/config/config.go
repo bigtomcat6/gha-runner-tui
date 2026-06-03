@@ -12,8 +12,10 @@ const (
 	defaultStateDir    = "/var/lib/gha-runner-tui/state"
 	defaultLogDir      = "/var/log/gha-runner-tui"
 	defaultTokenEnv    = "GITHUB_TOKEN"
+	defaultEnvFile     = "/etc/gha-runner-tui/github.env"
 	defaultAPIBaseURL  = "https://api.github.com"
 	defaultSvcPrefix   = "gha-"
+	defaultLoopBinary  = "/usr/local/bin/gha-ephemeral-loop"
 )
 
 type GlobalConfig struct {
@@ -25,6 +27,7 @@ type GlobalConfig struct {
 
 type GitHubConfig struct {
 	TokenEnv   string `yaml:"token_env"`
+	EnvFile    string `yaml:"env_file"`
 	APIBaseURL string `yaml:"api_base_url"`
 }
 
@@ -35,7 +38,8 @@ type PathsConfig struct {
 }
 
 type SystemdConfig struct {
-	ServicePrefix string `yaml:"service_prefix"`
+	ServicePrefix  string `yaml:"service_prefix"`
+	LoopBinaryPath string `yaml:"loop_binary_path"`
 }
 
 type DockerConfig struct {
@@ -46,6 +50,7 @@ func DefaultGlobalConfig() GlobalConfig {
 	return GlobalConfig{
 		GitHub: GitHubConfig{
 			TokenEnv:   defaultTokenEnv,
+			EnvFile:    defaultEnvFile,
 			APIBaseURL: defaultAPIBaseURL,
 		},
 		Paths: PathsConfig{
@@ -54,7 +59,8 @@ func DefaultGlobalConfig() GlobalConfig {
 			LogDir:      defaultLogDir,
 		},
 		Systemd: SystemdConfig{
-			ServicePrefix: defaultSvcPrefix,
+			ServicePrefix:  defaultSvcPrefix,
+			LoopBinaryPath: defaultLoopBinary,
 		},
 		Docker: DockerConfig{
 			UseCLI: true,
@@ -88,6 +94,9 @@ func (c *GlobalConfig) applyDefaults() {
 	if c.GitHub.TokenEnv == "" {
 		c.GitHub.TokenEnv = defaultTokenEnv
 	}
+	if c.GitHub.EnvFile == "" {
+		c.GitHub.EnvFile = defaultEnvFile
+	}
 	if c.GitHub.APIBaseURL == "" {
 		c.GitHub.APIBaseURL = defaultAPIBaseURL
 	}
@@ -102,6 +111,9 @@ func (c *GlobalConfig) applyDefaults() {
 	}
 	if c.Systemd.ServicePrefix == "" {
 		c.Systemd.ServicePrefix = defaultSvcPrefix
+	}
+	if c.Systemd.LoopBinaryPath == "" {
+		c.Systemd.LoopBinaryPath = defaultLoopBinary
 	}
 	if !c.Docker.UseCLI {
 		c.Docker.UseCLI = true

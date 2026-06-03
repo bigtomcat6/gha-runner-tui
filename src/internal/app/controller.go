@@ -23,6 +23,15 @@ import (
 
 var ErrNoCurrentContainer = errors.New("no current container exists for this profile")
 
+type GitHubAdminClient interface {
+	ListOrgRunnerGroups(ctx context.Context, org string) ([]gh.RunnerGroup, error)
+	ListOrgRunnerGroupRunners(ctx context.Context, org string, id int64) ([]gh.Runner, error)
+	CreateOrgRunnerGroup(ctx context.Context, org, name, visibility string) (gh.RunnerGroup, error)
+	UpdateOrgRunnerGroup(ctx context.Context, org string, id int64, name, visibility string) (gh.RunnerGroup, error)
+	DeleteOrgRunnerGroup(ctx context.Context, org string, id int64) error
+	ListOrgRunners(ctx context.Context, org string) ([]gh.Runner, error)
+}
+
 type RunnerManager struct {
 	ConfigPath       string
 	SystemdUnitDir   string
@@ -34,9 +43,13 @@ type RunnerManager struct {
 	Systemd          systemdpkg.Client
 	Docker           dockerpkg.Client
 	GitHub           gh.Client
+	GitHubAdmin      GitHubAdminClient
 }
 
 type CreateProfileInput struct {
+	Scope               config.TargetScope
+	Org                 string
+	Environment         string
 	Name                string
 	RepoOwner           string
 	RepoName            string
@@ -67,11 +80,121 @@ func NewRunnerManager(configPath string, systemd systemdpkg.Client, docker docke
 		Systemd:          systemd,
 		Docker:           docker,
 		GitHub:           github,
+		GitHubAdmin:      github,
 	}
 }
 
 func (m RunnerManager) Dashboard(ctx context.Context) (Dashboard, error) {
 	return m.Service.LoadDashboard(ctx)
+}
+
+func (m RunnerManager) SyncRunnerGroup(ctx context.Context, profile config.Profile) error {
+	if m.GitHubAdmin == nil {
+		return errors.New("github admin client is not configured")
+	}
+
+	target, err := profile.ResolveTarget()
+	if err != nil {
+		return err
+	}
+	if target.Scope != config.TargetScopeOrganization {
+		return nil
+	}
+	desiredVisibility := profile.OrganizationRunnerGroupVisibility()
+
+	groups, err := m.GitHubAdmin.ListOrgRunnerGroups(ctx, target.OrgSlug)
+	if err != nil {
+		return err
+	}
+
+	for _, group := range groups {
+		if group.Name != profile.RunnerGroup.Name {
+			continue
+		}
+		if group.Visibility == desiredVisibility && !group.AllowsPublicRepositories {
+			return nil
+		}
+		_, err := m.GitHubAdmin.UpdateOrgRunnerGroup(ctx, target.OrgSlug, group.ID, group.Name, desiredVisibility)
+		return err
+	}
+
+	if !profile.RunnerGroup.Create {
+		return fmt.Errorf("runner group %q does not exist", profile.RunnerGroup.Name)
+	}
+
+	_, err = m.GitHubAdmin.CreateOrgRunnerGroup(ctx, target.OrgSlug, profile.RunnerGroup.Name, desiredVisibility)
+	return err
+}
+
+func (m RunnerManager) SyncProfilePath(ctx context.Context, profilePath string) error {
+	profile, err := config.LoadProfile(profilePath)
+	if err != nil {
+		return err
+	}
+	return m.SyncRunnerGroup(ctx, profile)
+}
+
+func (m RunnerManager) SyncConfigProfiles(ctx context.Context) error {
+	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
+	if err != nil {
+		return err
+	}
+
+	profiles, profileErrors, err := config.LoadProfiles(cfg.Paths.ProfilesDir)
+	if err != nil {
+		return err
+	}
+	if len(profileErrors) > 0 {
+		return profileErrors[0]
+	}
+	for _, profile := range profiles {
+		if err := m.SyncRunnerGroup(ctx, profile); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m RunnerManager) DeleteRunnerGroup(ctx context.Context, profile config.Profile) error {
+	if m.GitHubAdmin == nil {
+		return errors.New("github admin client is not configured")
+	}
+
+	target, err := profile.ResolveTarget()
+	if err != nil {
+		return err
+	}
+	if target.Scope != config.TargetScopeOrganization {
+		return errors.New("runner group deletion only supports organization profiles")
+	}
+
+	groups, err := m.GitHubAdmin.ListOrgRunnerGroups(ctx, target.OrgSlug)
+	if err != nil {
+		return err
+	}
+
+	var targetGroup *gh.RunnerGroup
+	for i := range groups {
+		if groups[i].Name == profile.RunnerGroup.Name {
+			targetGroup = &groups[i]
+			break
+		}
+	}
+	if targetGroup == nil {
+		return fmt.Errorf("runner group %q does not exist", profile.RunnerGroup.Name)
+	}
+
+	runners, err := m.GitHubAdmin.ListOrgRunnerGroupRunners(ctx, target.OrgSlug, targetGroup.ID)
+	if err != nil {
+		return err
+	}
+	for _, runner := range runners {
+		if runner.Busy || runner.Status == state.GitHubOnline {
+			return fmt.Errorf("runner group %q still has active runner %q", targetGroup.Name, runner.Name)
+		}
+	}
+
+	return m.GitHubAdmin.DeleteOrgRunnerGroup(ctx, target.OrgSlug, targetGroup.ID)
 }
 
 func (m RunnerManager) StartLoop(ctx context.Context, profile config.Profile) error {
@@ -200,6 +323,10 @@ func (m RunnerManager) killContainers(ctx context.Context, containers []dockerpk
 }
 
 func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInput) error {
+	if input.Scope == config.TargetScopeOrganization {
+		return m.createOrganizationProfile(ctx, input)
+	}
+
 	if m.shouldUseLegacyCreate() {
 		return m.createLegacyProfile(ctx, input)
 	}
@@ -273,7 +400,109 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 	servicePath := filepath.Join(m.SystemdUnitDir, profile.Service.Name)
 	serviceData, err := renderServiceFile(serviceTemplateData{
 		ProfileName:       profile.Name,
-		GitHubTokenEnvRef: cfg.GitHub.TokenEnv,
+		GitHubEnvFile:     cfg.GitHub.EnvFile,
+		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
+		ProfileConfigPath: profilePath,
+	})
+	if err != nil {
+		return err
+	}
+	if err := m.writeManagedFile(ctx, servicePath, serviceData, 0o644); err != nil {
+		return err
+	}
+
+	if err := m.Systemd.DaemonReload(ctx); err != nil {
+		return err
+	}
+	if err := m.Systemd.Enable(ctx, profile.Service.Name); err != nil {
+		return err
+	}
+	return m.Systemd.Start(ctx, profile.Service.Name)
+}
+
+func (m RunnerManager) createOrganizationProfile(ctx context.Context, input CreateProfileInput) error {
+	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
+	if err != nil {
+		return err
+	}
+
+	names, err := config.DeriveOrganizationEnvironmentNames(input.Org, input.Environment, cfg.Paths.StateDir, cfg.Paths.LogDir)
+	if err != nil {
+		return err
+	}
+
+	profile := config.Profile{
+		Name: names.ProfileName,
+		Target: config.TargetConfig{
+			Scope: config.TargetScopeOrganization,
+			Org:   input.Org,
+		},
+		Service: config.ServiceConfig{
+			Name: names.ServiceName,
+		},
+		RunnerGroup: config.RunnerGroupConfig{
+			Name:       names.RunnerGroupName,
+			Create:     true,
+			Visibility: config.RunnerGroupVisibilityPrivate,
+		},
+		Runner: config.RunnerConfig{
+			Ephemeral:   input.Ephemeral,
+			Environment: input.Environment,
+			NamePrefix:  names.RunnerNamePrefix,
+			Workdir:     "/tmp/actions-runner",
+			Labels:      input.RunnerLabels,
+		},
+		Docker: config.DockerProfile{
+			Image:               input.DockerImage,
+			ContainerNamePrefix: names.ContainerNamePrefix,
+			CPUs:                input.CPUs,
+			Memory:              input.Memory,
+			RemoveAfterExit:     true,
+			Volumes:             []string{"/var/run/docker.sock:/var/run/docker.sock"},
+			Env: map[string]string{
+				"RUNNER_ALLOW_RUNASROOT": "1",
+			},
+		},
+		Loop: config.LoopConfig{
+			IntervalSeconds:   5,
+			BackoffSeconds:    30,
+			MaxBackoffSeconds: 300,
+			StateFile:         names.StateFile,
+			LogDir:            names.LogDir,
+		},
+	}
+
+	if err := profile.Validate(); err != nil {
+		return err
+	}
+
+	if err := m.ensureDir(ctx, cfg.Paths.ProfilesDir); err != nil {
+		return err
+	}
+	if err := m.ensureDir(ctx, cfg.Paths.StateDir); err != nil {
+		return err
+	}
+	if err := m.ensureDir(ctx, cfg.Paths.LogDir); err != nil {
+		return err
+	}
+	if err := m.ensureDir(ctx, m.SystemdUnitDir); err != nil {
+		return err
+	}
+
+	profilePath := filepath.Join(cfg.Paths.ProfilesDir, profile.Name+".yaml")
+	profileData, err := renderProfileYAML(profile)
+	if err != nil {
+		return err
+	}
+	if err := m.writeManagedFile(ctx, profilePath, profileData, 0o640); err != nil {
+		return err
+	}
+
+	servicePath := filepath.Join(m.SystemdUnitDir, profile.Service.Name)
+	serviceData, err := renderServiceFile(serviceTemplateData{
+		ProfileName:       profile.Name,
+		GitHubEnvFile:     cfg.GitHub.EnvFile,
+		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
 		ProfileConfigPath: profilePath,
 	})
 	if err != nil {
@@ -338,7 +567,8 @@ func (m RunnerManager) createLegacyProfile(ctx context.Context, input CreateProf
 
 type serviceTemplateData struct {
 	ProfileName       string
-	GitHubTokenEnvRef string
+	GitHubEnvFile     string
+	LoopBinaryPath    string
 	ProfileConfigPath string
 }
 
