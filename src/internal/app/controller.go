@@ -27,6 +27,7 @@ type GitHubAdminClient interface {
 	ListOrgRunnerGroups(ctx context.Context, org string) ([]gh.RunnerGroup, error)
 	ListOrgRunnerGroupRunners(ctx context.Context, org string, id int64) ([]gh.Runner, error)
 	CreateOrgRunnerGroup(ctx context.Context, org, name, visibility string) (gh.RunnerGroup, error)
+	UpdateOrgRunnerGroup(ctx context.Context, org string, id int64, name, visibility string) (gh.RunnerGroup, error)
 	DeleteOrgRunnerGroup(ctx context.Context, org string, id int64) error
 	ListOrgRunners(ctx context.Context, org string) ([]gh.Runner, error)
 }
@@ -99,6 +100,7 @@ func (m RunnerManager) SyncRunnerGroup(ctx context.Context, profile config.Profi
 	if target.Scope != config.TargetScopeOrganization {
 		return nil
 	}
+	desiredVisibility := profile.OrganizationRunnerGroupVisibility()
 
 	groups, err := m.GitHubAdmin.ListOrgRunnerGroups(ctx, target.OrgSlug)
 	if err != nil {
@@ -109,17 +111,18 @@ func (m RunnerManager) SyncRunnerGroup(ctx context.Context, profile config.Profi
 		if group.Name != profile.RunnerGroup.Name {
 			continue
 		}
-		if group.Visibility != config.RunnerGroupVisibilityAll {
-			return fmt.Errorf("runner group %q has visibility %q, expected %q", group.Name, group.Visibility, config.RunnerGroupVisibilityAll)
+		if group.Visibility == desiredVisibility && !group.AllowsPublicRepositories {
+			return nil
 		}
-		return nil
+		_, err := m.GitHubAdmin.UpdateOrgRunnerGroup(ctx, target.OrgSlug, group.ID, group.Name, desiredVisibility)
+		return err
 	}
 
 	if !profile.RunnerGroup.Create {
 		return fmt.Errorf("runner group %q does not exist", profile.RunnerGroup.Name)
 	}
 
-	_, err = m.GitHubAdmin.CreateOrgRunnerGroup(ctx, target.OrgSlug, profile.RunnerGroup.Name, config.RunnerGroupVisibilityAll)
+	_, err = m.GitHubAdmin.CreateOrgRunnerGroup(ctx, target.OrgSlug, profile.RunnerGroup.Name, desiredVisibility)
 	return err
 }
 
@@ -440,7 +443,7 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		RunnerGroup: config.RunnerGroupConfig{
 			Name:       names.RunnerGroupName,
 			Create:     true,
-			Visibility: config.RunnerGroupVisibilityAll,
+			Visibility: config.RunnerGroupVisibilityPrivate,
 		},
 		Runner: config.RunnerConfig{
 			Ephemeral:   input.Ephemeral,

@@ -166,10 +166,10 @@ func TestListOrgRunnerGroupsParsesGroups(t *testing.T) {
 				t.Fatalf("unexpected path: %s", r.URL.Path)
 			}
 		},
-		response: &http.Response{
+	response: &http.Response{
 			StatusCode: http.StatusOK,
 			Body: io.NopCloser(strings.NewReader(
-				`{"runner_groups":[{"id":42,"name":"example-org-swift","visibility":"all"}]}`,
+				`{"runner_groups":[{"id":42,"name":"example-org-swift","visibility":"private","allows_public_repositories":false}]}`,
 			)),
 			Header: make(http.Header),
 		},
@@ -179,7 +179,7 @@ func TestListOrgRunnerGroupsParsesGroups(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListOrgRunnerGroups returned error: %v", err)
 	}
-	if len(groups) != 1 || groups[0].ID != 42 || groups[0].Visibility != "all" {
+	if len(groups) != 1 || groups[0].ID != 42 || groups[0].Visibility != "private" || groups[0].AllowsPublicRepositories {
 		t.Fatalf("unexpected groups: %+v", groups)
 	}
 }
@@ -210,7 +210,7 @@ func TestListOrgRunnerGroupRunnersUsesGroupEndpoint(t *testing.T) {
 	}
 }
 
-func TestCreateOrgRunnerGroupSendsVisibilityAll(t *testing.T) {
+func TestCreateOrgRunnerGroupDefaultsToPrivateRepositories(t *testing.T) {
 	t.Setenv("TEST_GITHUB_TOKEN", "test-token")
 	client := NewClient("https://example.test", "TEST_GITHUB_TOKEN", "", nil, fakeHTTPDoer{
 		check: func(r *http.Request) {
@@ -224,24 +224,63 @@ func TestCreateOrgRunnerGroupSendsVisibilityAll(t *testing.T) {
 			if !strings.Contains(string(body), `"name":"example-org-swift"`) {
 				t.Fatalf("missing group name in body: %s", string(body))
 			}
-			if !strings.Contains(string(body), `"visibility":"all"`) {
+			if !strings.Contains(string(body), `"visibility":"private"`) {
 				t.Fatalf("missing visibility in body: %s", string(body))
+			}
+			if !strings.Contains(string(body), `"allows_public_repositories":false`) {
+				t.Fatalf("missing public repo policy in body: %s", string(body))
 			}
 		},
 		response: &http.Response{
 			StatusCode: http.StatusCreated,
 			Body: io.NopCloser(strings.NewReader(
-				`{"id":42,"name":"example-org-swift","visibility":"all"}`,
+				`{"id":42,"name":"example-org-swift","visibility":"private","allows_public_repositories":false}`,
 			)),
 			Header: make(http.Header),
 		},
 	})
 
-	group, err := client.CreateOrgRunnerGroup(context.Background(), "example-org", "example-org-swift", "all")
+	group, err := client.CreateOrgRunnerGroup(context.Background(), "example-org", "example-org-swift", "private")
 	if err != nil {
 		t.Fatalf("CreateOrgRunnerGroup returned error: %v", err)
 	}
-	if group.ID != 42 {
+	if group.ID != 42 || group.AllowsPublicRepositories {
+		t.Fatalf("unexpected group: %+v", group)
+	}
+}
+
+func TestUpdateOrgRunnerGroupDisablesPublicRepositories(t *testing.T) {
+	t.Setenv("TEST_GITHUB_TOKEN", "test-token")
+	client := NewClient("https://example.test", "TEST_GITHUB_TOKEN", "", nil, fakeHTTPDoer{
+		check: func(r *http.Request) {
+			if r.Method != http.MethodPatch {
+				t.Fatalf("unexpected method: %s", r.Method)
+			}
+			if r.URL.Path != "/orgs/example-org/actions/runner-groups/42" {
+				t.Fatalf("unexpected path: %s", r.URL.Path)
+			}
+			body, _ := io.ReadAll(r.Body)
+			if !strings.Contains(string(body), `"visibility":"private"`) {
+				t.Fatalf("missing visibility in body: %s", string(body))
+			}
+			if !strings.Contains(string(body), `"allows_public_repositories":false`) {
+				t.Fatalf("missing public repo policy in body: %s", string(body))
+			}
+		},
+		response: &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":42,"name":"example-org-swift","visibility":"private","allows_public_repositories":false}`,
+			)),
+			Header: make(http.Header),
+		},
+	})
+
+	group, err := client.UpdateOrgRunnerGroup(context.Background(), "example-org", 42, "example-org-swift", "private")
+	if err != nil {
+		t.Fatalf("UpdateOrgRunnerGroup returned error: %v", err)
+	}
+	if group.Visibility != "private" || group.AllowsPublicRepositories {
 		t.Fatalf("unexpected group: %+v", group)
 	}
 }

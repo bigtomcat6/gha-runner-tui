@@ -65,6 +65,7 @@ type syncGitHub struct {
 	orgRunners     []gh.Runner
 	groupRunners   map[int64][]gh.Runner
 	createdGroups  []gh.RunnerGroup
+	updatedGroups  []gh.RunnerGroup
 	deletedGroupID int64
 }
 
@@ -85,8 +86,14 @@ func (g *syncGitHub) ListOrgRunnerGroupRunners(_ context.Context, _ string, id i
 }
 
 func (g *syncGitHub) CreateOrgRunnerGroup(_ context.Context, _ string, name, visibility string) (gh.RunnerGroup, error) {
-	group := gh.RunnerGroup{ID: 42, Name: name, Visibility: visibility}
+	group := gh.RunnerGroup{ID: 42, Name: name, Visibility: visibility, AllowsPublicRepositories: false}
 	g.createdGroups = append(g.createdGroups, group)
+	return group, nil
+}
+
+func (g *syncGitHub) UpdateOrgRunnerGroup(_ context.Context, _ string, id int64, name, visibility string) (gh.RunnerGroup, error) {
+	group := gh.RunnerGroup{ID: id, Name: name, Visibility: visibility, AllowsPublicRepositories: false}
+	g.updatedGroups = append(g.updatedGroups, group)
 	return group, nil
 }
 
@@ -332,7 +339,7 @@ func TestSyncRunnerGroupCreatesMissingOrganizationGroup(t *testing.T) {
 	profile := config.Profile{
 		Name:        "example-org-swift",
 		Target:      config.TargetConfig{Scope: config.TargetScopeOrganization, Org: "Example Org"},
-		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "all"},
+		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "private"},
 		Runner:      config.RunnerConfig{Environment: "swift"},
 		Service:     config.ServiceConfig{Name: "gha-example-org-swift.service"},
 		Docker:      config.DockerProfile{ContainerNamePrefix: "gha-example-org-swift"},
@@ -346,11 +353,11 @@ func TestSyncRunnerGroupCreatesMissingOrganizationGroup(t *testing.T) {
 	}
 }
 
-func TestSyncRunnerGroupRejectsExistingNonAllGroup(t *testing.T) {
+func TestSyncRunnerGroupUpdatesExistingVisibilityPolicy(t *testing.T) {
 	t.Parallel()
 
 	github := &syncGitHub{
-		groups: []gh.RunnerGroup{{ID: 42, Name: "example-org-swift", Visibility: "selected"}},
+		groups: []gh.RunnerGroup{{ID: 42, Name: "example-org-swift", Visibility: "all", AllowsPublicRepositories: true}},
 	}
 	manager := NewRunnerManager("", systemd.Client{}, docker.Client{}, gh.NewClient("", "", "", nil, nil))
 	manager.GitHubAdmin = github
@@ -358,18 +365,20 @@ func TestSyncRunnerGroupRejectsExistingNonAllGroup(t *testing.T) {
 	profile := config.Profile{
 		Name:        "example-org-swift",
 		Target:      config.TargetConfig{Scope: config.TargetScopeOrganization, Org: "Example Org"},
-		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "all"},
+		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "private"},
 		Runner:      config.RunnerConfig{Environment: "swift"},
 		Service:     config.ServiceConfig{Name: "gha-example-org-swift.service"},
 		Docker:      config.DockerProfile{ContainerNamePrefix: "gha-example-org-swift"},
 	}
 
-	err := manager.SyncRunnerGroup(context.Background(), profile)
-	if err == nil {
-		t.Fatal("expected visibility mismatch error, got nil")
+	if err := manager.SyncRunnerGroup(context.Background(), profile); err != nil {
+		t.Fatalf("SyncRunnerGroup returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "visibility") {
-		t.Fatalf("expected visibility error, got %v", err)
+	if len(github.updatedGroups) != 1 {
+		t.Fatalf("expected group update, got %+v", github.updatedGroups)
+	}
+	if github.updatedGroups[0].Visibility != "private" {
+		t.Fatalf("expected private visibility update, got %+v", github.updatedGroups[0])
 	}
 }
 
@@ -390,7 +399,7 @@ func TestDeleteRunnerGroupRejectsBusyRunner(t *testing.T) {
 	profile := config.Profile{
 		Name:        "example-org-swift",
 		Target:      config.TargetConfig{Scope: config.TargetScopeOrganization, Org: "Example Org"},
-		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "all"},
+		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "private"},
 		Runner:      config.RunnerConfig{Environment: "swift"},
 		Service:     config.ServiceConfig{Name: "gha-example-org-swift.service"},
 		Docker:      config.DockerProfile{ContainerNamePrefix: "gha-example-org-swift"},
@@ -414,7 +423,7 @@ func TestDeleteRunnerGroupAllowsEmptyGroup(t *testing.T) {
 	profile := config.Profile{
 		Name:        "example-org-swift",
 		Target:      config.TargetConfig{Scope: config.TargetScopeOrganization, Org: "Example Org"},
-		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "all"},
+		RunnerGroup: config.RunnerGroupConfig{Name: "example-org-swift", Create: true, Visibility: "private"},
 		Runner:      config.RunnerConfig{Environment: "swift"},
 		Service:     config.ServiceConfig{Name: "gha-example-org-swift.service"},
 		Docker:      config.DockerProfile{ContainerNamePrefix: "gha-example-org-swift"},
@@ -485,7 +494,7 @@ systemd:
 		"scope: organization",
 		"org: Example Org",
 		"name: example-org-swift",
-		"visibility: all",
+		"visibility: private",
 		"environment: swift",
 		"container_name_prefix: gha-example-org-swift",
 	} {

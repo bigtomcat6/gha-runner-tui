@@ -40,9 +40,10 @@ type Runner struct {
 }
 
 type RunnerGroup struct {
-	ID         int64
-	Name       string
-	Visibility string
+	ID                       int64
+	Name                     string
+	Visibility               string
+	AllowsPublicRepositories bool
 }
 
 type rawRunner struct {
@@ -138,9 +139,10 @@ func (c Client) DeleteOrgRunner(ctx context.Context, org string, id int64) error
 func (c Client) ListOrgRunnerGroups(ctx context.Context, org string) ([]RunnerGroup, error) {
 	var payload struct {
 		RunnerGroups []struct {
-			ID         int64  `json:"id"`
-			Name       string `json:"name"`
-			Visibility string `json:"visibility"`
+			ID                       int64  `json:"id"`
+			Name                     string `json:"name"`
+			Visibility               string `json:"visibility"`
+			AllowsPublicRepositories bool   `json:"allows_public_repositories"`
 		} `json:"runner_groups"`
 	}
 	if err := c.requestJSON(ctx, http.MethodGet, fmt.Sprintf("/orgs/%s/actions/runner-groups", org), nil, &payload); err != nil {
@@ -150,9 +152,10 @@ func (c Client) ListOrgRunnerGroups(ctx context.Context, org string) ([]RunnerGr
 	groups := make([]RunnerGroup, 0, len(payload.RunnerGroups))
 	for _, group := range payload.RunnerGroups {
 		groups = append(groups, RunnerGroup{
-			ID:         group.ID,
-			Name:       group.Name,
-			Visibility: group.Visibility,
+			ID:                       group.ID,
+			Name:                     group.Name,
+			Visibility:               group.Visibility,
+			AllowsPublicRepositories: group.AllowsPublicRepositories,
 		})
 	}
 	return groups, nil
@@ -170,18 +173,41 @@ func (c Client) ListOrgRunnerGroupRunners(ctx context.Context, org string, id in
 
 func (c Client) CreateOrgRunnerGroup(ctx context.Context, org, name, visibility string) (RunnerGroup, error) {
 	var payload struct {
-		ID         int64  `json:"id"`
-		Name       string `json:"name"`
-		Visibility string `json:"visibility"`
+		ID                       int64  `json:"id"`
+		Name                     string `json:"name"`
+		Visibility               string `json:"visibility"`
+		AllowsPublicRepositories bool   `json:"allows_public_repositories"`
 	}
 	err := c.requestJSON(ctx, http.MethodPost, fmt.Sprintf("/orgs/%s/actions/runner-groups", org), map[string]any{
-		"name":       name,
-		"visibility": visibility,
+		"name":                       name,
+		"visibility":                 visibility,
+		"allows_public_repositories": false,
 	}, &payload)
 	return RunnerGroup{
-		ID:         payload.ID,
-		Name:       payload.Name,
-		Visibility: payload.Visibility,
+		ID:                       payload.ID,
+		Name:                     payload.Name,
+		Visibility:               payload.Visibility,
+		AllowsPublicRepositories: payload.AllowsPublicRepositories,
+	}, err
+}
+
+func (c Client) UpdateOrgRunnerGroup(ctx context.Context, org string, id int64, name, visibility string) (RunnerGroup, error) {
+	var payload struct {
+		ID                       int64  `json:"id"`
+		Name                     string `json:"name"`
+		Visibility               string `json:"visibility"`
+		AllowsPublicRepositories bool   `json:"allows_public_repositories"`
+	}
+	err := c.requestJSON(ctx, http.MethodPatch, fmt.Sprintf("/orgs/%s/actions/runner-groups/%d", org, id), map[string]any{
+		"name":                       name,
+		"visibility":                 visibility,
+		"allows_public_repositories": false,
+	}, &payload)
+	return RunnerGroup{
+		ID:                       payload.ID,
+		Name:                     payload.Name,
+		Visibility:               payload.Visibility,
+		AllowsPublicRepositories: payload.AllowsPublicRepositories,
 	}, err
 }
 

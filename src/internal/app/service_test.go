@@ -282,7 +282,7 @@ target:
 runner_group:
   name: example-org-swift
   create: true
-  visibility: all
+  visibility: private
 service:
   name: gha-example-org-swift.service
 runner:

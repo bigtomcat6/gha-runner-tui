@@ -35,7 +35,10 @@ const (
 	TargetScopeOrganization TargetScope = "organization"
 )
 
-const RunnerGroupVisibilityAll = "all"
+const (
+	RunnerGroupVisibilityAll     = "all"
+	RunnerGroupVisibilityPrivate = "private"
+)
 
 type TargetConfig struct {
 	Scope TargetScope `yaml:"scope"`
@@ -182,8 +185,8 @@ func (p Profile) Validate() error {
 			return errors.New("runner.environment is required for organization profiles")
 		case p.RunnerGroup.Name == "":
 			return errors.New("runner_group.name is required for organization profiles")
-		case p.RunnerGroup.Visibility != "" && p.RunnerGroup.Visibility != RunnerGroupVisibilityAll:
-			return errors.New("runner_group.visibility must be all")
+		case p.RunnerGroup.Visibility != "" && p.RunnerGroup.Visibility != RunnerGroupVisibilityAll && p.RunnerGroup.Visibility != RunnerGroupVisibilityPrivate:
+			return errors.New("runner_group.visibility must be all or private")
 		}
 	}
 
@@ -239,6 +242,13 @@ func NormalizeOrgSlug(value string) (string, error) {
 		return "", errors.New("target.org normalizes to empty slug")
 	}
 	return slug, nil
+}
+
+func (p Profile) OrganizationRunnerGroupVisibility() string {
+	if strings.TrimSpace(p.RunnerGroup.Visibility) != "" {
+		return p.RunnerGroup.Visibility
+	}
+	return RunnerGroupVisibilityPrivate
 }
 
 func DeriveOrganizationEnvironmentNames(org, environment, stateDir, logDir string) (DerivedOrganizationNames, error) {

@@ -39,7 +39,7 @@ func TestResolveTargetSupportsOrganizationProfile(t *testing.T) {
 		RunnerGroup: RunnerGroupConfig{
 			Name:       "example-org-swift",
 			Create:     true,
-			Visibility: RunnerGroupVisibilityAll,
+			Visibility: RunnerGroupVisibilityPrivate,
 		},
 		Runner:  RunnerConfig{Environment: "swift"},
 		Service: ServiceConfig{Name: "gha-example-org-swift.service"},
@@ -97,5 +97,14 @@ func TestDeriveOrganizationEnvironmentNames(t *testing.T) {
 	}
 	if names.LogDir != "/logs/example-org-swift" {
 		t.Fatalf("unexpected log dir: %q", names.LogDir)
+	}
+}
+
+func TestOrganizationRunnerGroupVisibilityDefaultsToPrivate(t *testing.T) {
+	t.Parallel()
+
+	profile := Profile{}
+	if got := profile.OrganizationRunnerGroupVisibility(); got != RunnerGroupVisibilityPrivate {
+		t.Fatalf("expected private default, got %q", got)
 	}
 }
