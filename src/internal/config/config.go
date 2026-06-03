@@ -15,6 +15,7 @@ const (
 	defaultEnvFile     = "/etc/gha-runner-tui/github.env"
 	defaultAPIBaseURL  = "https://api.github.com"
 	defaultSvcPrefix   = "gha-"
+	defaultLoopBinary  = "/usr/local/bin/gha-ephemeral-loop"
 )
 
 type GlobalConfig struct {
@@ -37,7 +38,8 @@ type PathsConfig struct {
 }
 
 type SystemdConfig struct {
-	ServicePrefix string `yaml:"service_prefix"`
+	ServicePrefix  string `yaml:"service_prefix"`
+	LoopBinaryPath string `yaml:"loop_binary_path"`
 }
 
 type DockerConfig struct {
@@ -57,7 +59,8 @@ func DefaultGlobalConfig() GlobalConfig {
 			LogDir:      defaultLogDir,
 		},
 		Systemd: SystemdConfig{
-			ServicePrefix: defaultSvcPrefix,
+			ServicePrefix:  defaultSvcPrefix,
+			LoopBinaryPath: defaultLoopBinary,
 		},
 		Docker: DockerConfig{
 			UseCLI: true,
@@ -108,6 +111,9 @@ func (c *GlobalConfig) applyDefaults() {
 	}
 	if c.Systemd.ServicePrefix == "" {
 		c.Systemd.ServicePrefix = defaultSvcPrefix
+	}
+	if c.Systemd.LoopBinaryPath == "" {
+		c.Systemd.LoopBinaryPath = defaultLoopBinary
 	}
 	if !c.Docker.UseCLI {
 		c.Docker.UseCLI = true

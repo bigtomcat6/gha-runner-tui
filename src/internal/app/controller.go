@@ -25,6 +25,7 @@ var ErrNoCurrentContainer = errors.New("no current container exists for this pro
 
 type GitHubAdminClient interface {
 	ListOrgRunnerGroups(ctx context.Context, org string) ([]gh.RunnerGroup, error)
+	ListOrgRunnerGroupRunners(ctx context.Context, org string, id int64) ([]gh.Runner, error)
 	CreateOrgRunnerGroup(ctx context.Context, org, name, visibility string) (gh.RunnerGroup, error)
 	DeleteOrgRunnerGroup(ctx context.Context, org string, id int64) error
 	ListOrgRunners(ctx context.Context, org string) ([]gh.Runner, error)
@@ -180,14 +181,11 @@ func (m RunnerManager) DeleteRunnerGroup(ctx context.Context, profile config.Pro
 		return fmt.Errorf("runner group %q does not exist", profile.RunnerGroup.Name)
 	}
 
-	runners, err := m.GitHubAdmin.ListOrgRunners(ctx, target.OrgSlug)
+	runners, err := m.GitHubAdmin.ListOrgRunnerGroupRunners(ctx, target.OrgSlug, targetGroup.ID)
 	if err != nil {
 		return err
 	}
 	for _, runner := range runners {
-		if runner.RunnerGroupID != targetGroup.ID {
-			continue
-		}
 		if runner.Busy || runner.Status == state.GitHubOnline {
 			return fmt.Errorf("runner group %q still has active runner %q", targetGroup.Name, runner.Name)
 		}
@@ -400,6 +398,7 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 	serviceData, err := renderServiceFile(serviceTemplateData{
 		ProfileName:       profile.Name,
 		GitHubEnvFile:     cfg.GitHub.EnvFile,
+		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
 		ProfileConfigPath: profilePath,
 	})
 	if err != nil {
@@ -500,6 +499,7 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 	serviceData, err := renderServiceFile(serviceTemplateData{
 		ProfileName:       profile.Name,
 		GitHubEnvFile:     cfg.GitHub.EnvFile,
+		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
 		ProfileConfigPath: profilePath,
 	})
 	if err != nil {
@@ -565,6 +565,7 @@ func (m RunnerManager) createLegacyProfile(ctx context.Context, input CreateProf
 type serviceTemplateData struct {
 	ProfileName       string
 	GitHubEnvFile     string
+	LoopBinaryPath    string
 	ProfileConfigPath string
 }
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -45,5 +47,23 @@ func TestRunSyncWithProfilePath(t *testing.T) {
 	}
 	if fake.configCalls != 0 {
 		t.Fatalf("did not expect config sync, got %d", fake.configCalls)
+	}
+}
+
+func TestGithubConfigForManagerUsesEnvFileOverride(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("github:\n  token_env: CI_GITHUB_TOKEN\n  env_file: /etc/gha-runner-tui/github.env\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	cfg := githubConfigForManager(configPath)
+	if cfg.TokenEnv != "CI_GITHUB_TOKEN" {
+		t.Fatalf("unexpected token env: %q", cfg.TokenEnv)
+	}
+	if cfg.EnvFile != "/etc/gha-runner-tui/github.env" {
+		t.Fatalf("unexpected env file: %q", cfg.EnvFile)
 	}
 }

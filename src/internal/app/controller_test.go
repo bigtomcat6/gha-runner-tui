@@ -63,6 +63,7 @@ func (r *scriptedRunner) Run(_ context.Context, name string, args ...string) ([]
 type syncGitHub struct {
 	groups         []gh.RunnerGroup
 	orgRunners     []gh.Runner
+	groupRunners   map[int64][]gh.Runner
 	createdGroups  []gh.RunnerGroup
 	deletedGroupID int64
 }
@@ -77,6 +78,10 @@ func (g *syncGitHub) ListOrgRunners(context.Context, string) ([]gh.Runner, error
 
 func (g *syncGitHub) ListOrgRunnerGroups(context.Context, string) ([]gh.RunnerGroup, error) {
 	return g.groups, nil
+}
+
+func (g *syncGitHub) ListOrgRunnerGroupRunners(_ context.Context, _ string, id int64) ([]gh.Runner, error) {
+	return g.groupRunners[id], nil
 }
 
 func (g *syncGitHub) CreateOrgRunnerGroup(_ context.Context, _ string, name, visibility string) (gh.RunnerGroup, error) {
@@ -373,9 +378,11 @@ func TestDeleteRunnerGroupRejectsBusyRunner(t *testing.T) {
 
 	github := &syncGitHub{
 		groups: []gh.RunnerGroup{{ID: 42, Name: "example-org-swift", Visibility: "all"}},
-		orgRunners: []gh.Runner{{
-			ID: 1, Name: "example-org-swift-1", Status: state.GitHubOnline, Busy: true, RunnerGroupID: 42,
-		}},
+		groupRunners: map[int64][]gh.Runner{
+			42: {{
+				ID: 1, Name: "example-org-swift-1", Status: state.GitHubOnline, Busy: true, RunnerGroupID: 42,
+			}},
+		},
 	}
 	manager := NewRunnerManager("", systemd.Client{}, docker.Client{}, gh.NewClient("", "", "", nil, nil))
 	manager.GitHubAdmin = github
@@ -432,10 +439,14 @@ func TestCreateProfileDerivesOrganizationEnvironmentProfile(t *testing.T) {
 	cfgPath := filepath.Join(root, "config.yaml")
 
 	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+github:
+  env_file: /etc/gha-runner-tui/github.env
 paths:
   profiles_dir: %s
   state_dir: %s
   log_dir: %s
+systemd:
+  loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui
 `, profilesDir, stateDir, logDir)), 0o600); err != nil {
 		t.Fatalf("WriteFile config returned error: %v", err)
 	}
@@ -490,7 +501,7 @@ paths:
 	}
 	for _, want := range []string{
 		"EnvironmentFile=/etc/gha-runner-tui/github.env",
-		"ExecStart=/usr/local/bin/gha-ephemeral-loop --config " + profilePath,
+		"ExecStart=/usr/local/bin/gha-ephemeral-loop-tui --config " + profilePath,
 	} {
 		if !strings.Contains(string(serviceData), want) {
 			t.Fatalf("expected %q in service:\n%s", want, string(serviceData))

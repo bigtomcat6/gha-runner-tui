@@ -12,6 +12,7 @@ import (
 
 	"gha-runner-tui/internal/app"
 	"gha-runner-tui/internal/command"
+	"gha-runner-tui/internal/config"
 	"gha-runner-tui/internal/docker"
 	gh "gha-runner-tui/internal/github"
 	"gha-runner-tui/internal/systemd"
@@ -59,15 +60,24 @@ func main() {
 
 func newManager(configPath, systemdUnitDir string) app.RunnerManager {
 	runner := command.NewSudoRunner(command.OSRunner{})
+	githubConfig := githubConfigForManager(configPath)
 	manager := app.NewRunnerManager(
 		configPath,
 		systemd.NewClient(runner),
 		docker.NewClient(runner),
-		gh.NewClient("", "", "", runner, http.DefaultClient),
+		gh.NewClient(githubConfig.APIBaseURL, githubConfig.TokenEnv, githubConfig.EnvFile, runner, http.DefaultClient),
 	)
 	manager.Runner = runner
 	manager.SystemdUnitDir = systemdUnitDir
 	return manager
+}
+
+func githubConfigForManager(configPath string) config.GitHubConfig {
+	cfg, err := config.LoadGlobalConfig(configPath)
+	if err != nil {
+		return config.DefaultGlobalConfig().GitHub
+	}
+	return cfg.GitHub
 }
 
 func parseSyncArgs(args []string) (syncOptions, error) {

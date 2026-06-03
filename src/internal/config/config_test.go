@@ -23,6 +23,9 @@ func TestLoadGlobalConfigUsesDefaultsWhenFileMissing(t *testing.T) {
 	if cfg.Paths.ProfilesDir != "/etc/gha-runner-tui/profiles" {
 		t.Fatalf("expected default profiles dir, got %q", cfg.Paths.ProfilesDir)
 	}
+	if cfg.Systemd.LoopBinaryPath != "/usr/local/bin/gha-ephemeral-loop" {
+		t.Fatalf("expected default loop binary path, got %q", cfg.Systemd.LoopBinaryPath)
+	}
 	if !cfg.Docker.UseCLI {
 		t.Fatal("expected docker.use_cli to default to true")
 	}
@@ -33,7 +36,7 @@ func TestLoadGlobalConfigMergesDefaults(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	content := []byte("github:\n  token_env: CI_GITHUB_TOKEN\n  env_file: /etc/gha-runner-tui/ci.env\npaths:\n  profiles_dir: /tmp/profiles\n")
+	content := []byte("github:\n  token_env: CI_GITHUB_TOKEN\n  env_file: /etc/gha-runner-tui/ci.env\npaths:\n  profiles_dir: /tmp/profiles\nsystemd:\n  loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui\n")
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
@@ -57,6 +60,9 @@ func TestLoadGlobalConfigMergesDefaults(t *testing.T) {
 	}
 	if cfg.Paths.StateDir != "/var/lib/gha-runner-tui/state" {
 		t.Fatalf("expected default state dir, got %q", cfg.Paths.StateDir)
+	}
+	if cfg.Systemd.LoopBinaryPath != "/usr/local/bin/gha-ephemeral-loop-tui" {
+		t.Fatalf("expected loop binary override, got %q", cfg.Systemd.LoopBinaryPath)
 	}
 	if !cfg.Docker.UseCLI {
 		t.Fatal("expected docker.use_cli to remain true")

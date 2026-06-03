@@ -158,6 +158,16 @@ func (c Client) ListOrgRunnerGroups(ctx context.Context, org string) ([]RunnerGr
 	return groups, nil
 }
 
+func (c Client) ListOrgRunnerGroupRunners(ctx context.Context, org string, id int64) ([]Runner, error) {
+	var payload struct {
+		Runners []rawRunner `json:"runners"`
+	}
+	if err := c.requestJSON(ctx, http.MethodGet, fmt.Sprintf("/orgs/%s/actions/runner-groups/%d/runners", org, id), nil, &payload); err != nil {
+		return nil, err
+	}
+	return mapRunners(payload.Runners), nil
+}
+
 func (c Client) CreateOrgRunnerGroup(ctx context.Context, org, name, visibility string) (RunnerGroup, error) {
 	var payload struct {
 		ID         int64  `json:"id"`
@@ -281,17 +291,44 @@ func (c Client) resolveToken(ctx context.Context) (string, error) {
 		return "", ErrMissingToken
 	}
 	if data, err := os.ReadFile(c.tokenFile); err == nil {
-		if token := strings.TrimSpace(string(data)); token != "" {
+		if token := c.parseTokenFile(string(data)); token != "" {
 			return token, nil
 		}
 	}
 	if c.runner != nil {
 		out, err := c.runner.Run(ctx, "cat", c.tokenFile)
 		if err == nil {
-			if token := strings.TrimSpace(string(out)); token != "" {
+			if token := c.parseTokenFile(string(out)); token != "" {
 				return token, nil
 			}
 		}
 	}
 	return "", ErrMissingToken
+}
+
+func (c Client) parseTokenFile(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	if !strings.Contains(trimmed, "\n") && !strings.Contains(trimmed, "=") {
+		return trimmed
+	}
+
+	for _, line := range strings.Split(trimmed, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(key) != c.tokenEnv {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	return ""
 }

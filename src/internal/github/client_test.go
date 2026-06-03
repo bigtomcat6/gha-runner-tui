@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -57,6 +59,32 @@ func TestListRepoRunnersRequiresToken(t *testing.T) {
 	_, err := client.ListRepoRunners(context.Background(), "bigtomcat6", "remind-me")
 	if err != ErrMissingToken {
 		t.Fatalf("expected ErrMissingToken, got %v", err)
+	}
+}
+
+func TestListRepoRunnersReadsEnvStyleTokenFile(t *testing.T) {
+	t.Setenv("TEST_GITHUB_TOKEN_FROM_FILE", "")
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "github.env")
+	if err := os.WriteFile(tokenFile, []byte("GITHUB_TOKEN=test-token-from-file\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	client := NewClient("https://example.test", "GITHUB_TOKEN", tokenFile, nil, fakeHTTPDoer{
+		check: func(r *http.Request) {
+			if got := r.Header.Get("Authorization"); got != "Bearer test-token-from-file" {
+				t.Fatalf("expected auth header from env file, got %q", got)
+			}
+		},
+		response: &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"runners":[]}`)),
+			Header:     make(http.Header),
+		},
+	})
+
+	if _, err := client.ListRepoRunners(context.Background(), "bigtomcat6", "remind-me"); err != nil {
+		t.Fatalf("ListRepoRunners returned error: %v", err)
 	}
 }
 
@@ -153,6 +181,32 @@ func TestListOrgRunnerGroupsParsesGroups(t *testing.T) {
 	}
 	if len(groups) != 1 || groups[0].ID != 42 || groups[0].Visibility != "all" {
 		t.Fatalf("unexpected groups: %+v", groups)
+	}
+}
+
+func TestListOrgRunnerGroupRunnersUsesGroupEndpoint(t *testing.T) {
+	t.Setenv("TEST_GITHUB_TOKEN", "test-token")
+	client := NewClient("https://example.test", "TEST_GITHUB_TOKEN", "", nil, fakeHTTPDoer{
+		check: func(r *http.Request) {
+			if r.URL.Path != "/orgs/example-org/actions/runner-groups/42/runners" {
+				t.Fatalf("unexpected path: %s", r.URL.Path)
+			}
+		},
+		response: &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(
+				`{"runners":[{"id":1,"name":"example-org-swift-1","status":"online","busy":true}]}`,
+			)),
+			Header: make(http.Header),
+		},
+	})
+
+	runners, err := client.ListOrgRunnerGroupRunners(context.Background(), "example-org", 42)
+	if err != nil {
+		t.Fatalf("ListOrgRunnerGroupRunners returned error: %v", err)
+	}
+	if len(runners) != 1 || !runners[0].Busy {
+		t.Fatalf("unexpected runners: %+v", runners)
 	}
 }
 
