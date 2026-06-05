@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -15,6 +16,7 @@ type Profile struct {
 	Name        string            `yaml:"name"`
 	Target      TargetConfig      `yaml:"target,omitempty"`
 	Repo        RepoConfig        `yaml:"repo,omitempty"`
+	GitHub      GitHubProfile     `yaml:"github,omitempty"`
 	Service     ServiceConfig     `yaml:"service"`
 	RunnerGroup RunnerGroupConfig `yaml:"runner_group,omitempty"`
 	Runner      RunnerConfig      `yaml:"runner"`
@@ -26,6 +28,12 @@ type Profile struct {
 type RepoConfig struct {
 	Owner string `yaml:"owner"`
 	Name  string `yaml:"name"`
+}
+
+type GitHubProfile struct {
+	TokenEnv  string `yaml:"token_env,omitempty"`
+	EnvFile   string `yaml:"env_file,omitempty"`
+	TokenFile string `yaml:"token_file,omitempty"`
 }
 
 type TargetScope string
@@ -214,10 +222,16 @@ func (p Profile) Validate() error {
 	switch {
 	case p.Name == "":
 		return errors.New("name is required")
+	case !isSafeManagedName(p.Name):
+		return errors.New("name must contain only lowercase letters, digits, and hyphens")
 	case p.Service.Name == "":
 		return errors.New("service.name is required")
+	case !isSafeServiceName(p.Service.Name):
+		return errors.New("service.name must be a safe .service basename")
 	case p.Docker.ContainerNamePrefix == "":
 		return errors.New("docker.container_name_prefix is required")
+	case !isSafeManagedName(p.Docker.ContainerNamePrefix):
+		return errors.New("docker.container_name_prefix must contain only lowercase letters, digits, and hyphens")
 	}
 
 	if target.Scope == TargetScopeOrganization {
@@ -332,6 +346,48 @@ func firstNonEmpty(values ...string) string {
 }
 
 func normalizeNameComponent(value string) string {
-	parts := strings.Fields(strings.ToLower(strings.TrimSpace(value)))
-	return strings.Join(parts, "-")
+	var b strings.Builder
+	lastDash := true
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		switch {
+		case unicode.IsLetter(r) && r <= unicode.MaxASCII:
+			b.WriteRune(r)
+			lastDash = false
+		case unicode.IsDigit(r):
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func isSafeManagedName(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) || strings.Contains(value, "/") || strings.Contains(value, `\`) {
+		return false
+	}
+	for i, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-':
+			if i == 0 || i == len(value)-1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeServiceName(value string) bool {
+	if !strings.HasSuffix(value, ".service") {
+		return false
+	}
+	return isSafeManagedName(strings.TrimSuffix(value, ".service"))
 }

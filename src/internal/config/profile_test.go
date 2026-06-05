@@ -126,3 +126,81 @@ docker:
 		t.Fatalf("expected runner.environment error, got %v", err)
 	}
 }
+
+func TestLoadProfileRejectsUnsafeManagedNames(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name: "unsafe profile name",
+			content: `
+name: ../escape
+repo:
+  owner: bigtomcat6
+  name: remind-me
+service:
+  name: gha-remind-me-swift.service
+docker:
+  container_name_prefix: gha-remind-me-swift
+loop:
+  state_file: /var/lib/gha-runner-tui/state/remind-me-swift.json
+`,
+			want: "name",
+		},
+		{
+			name: "unsafe service name",
+			content: `
+name: remind-me-swift
+repo:
+  owner: bigtomcat6
+  name: remind-me
+service:
+  name: ../gha-remind-me-swift.service
+docker:
+  container_name_prefix: gha-remind-me-swift
+loop:
+  state_file: /var/lib/gha-runner-tui/state/remind-me-swift.json
+`,
+			want: "service.name",
+		},
+		{
+			name: "unsafe container prefix",
+			content: `
+name: remind-me-swift
+repo:
+  owner: bigtomcat6
+  name: remind-me
+service:
+  name: gha-remind-me-swift.service
+docker:
+  container_name_prefix: ../gha-remind-me-swift
+loop:
+  state_file: /var/lib/gha-runner-tui/state/remind-me-swift.json
+`,
+			want: "docker.container_name_prefix",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "bad.yaml")
+			if err := os.WriteFile(path, []byte(strings.TrimPrefix(tt.content, "\n")), 0o600); err != nil {
+				t.Fatalf("WriteFile returned error: %v", err)
+			}
+
+			_, err := LoadProfile(path)
+			if err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %q error, got %v", tt.want, err)
+			}
+		})
+	}
+}

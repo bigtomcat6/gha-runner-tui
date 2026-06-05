@@ -79,7 +79,7 @@ func loadLegacyProfile(unitPath string) (Profile, error) {
 	repoName := values["REPO_NAME"]
 	containerPrefix := ""
 	if repoName != "" {
-		containerPrefix = "gha-" + repoName + "-"
+		containerPrefix = strings.TrimSuffix("gha-"+repoName, "-")
 	}
 
 	profile := Profile{

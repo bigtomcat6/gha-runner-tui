@@ -60,7 +60,7 @@ IMAGE=gha-runner-base:latest
 	if profile.Runner.NamePrefix != "o-tokyo-s2-remind-me-base" {
 		t.Fatalf("unexpected runner name %q", profile.Runner.NamePrefix)
 	}
-	if profile.Docker.ContainerNamePrefix != "gha-remind-me-" {
+	if profile.Docker.ContainerNamePrefix != "gha-remind-me" {
 		t.Fatalf("unexpected container prefix %q", profile.Docker.ContainerNamePrefix)
 	}
 	if profile.Docker.Image != "gha-runner-base:latest" {

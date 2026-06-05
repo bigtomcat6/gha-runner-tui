@@ -68,6 +68,14 @@ func (s Service) LoadDashboard(ctx context.Context) (Dashboard, error) {
 	if err != nil {
 		return Dashboard{}, err
 	}
+	githubMigrationResults, err := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{
+		TokenEnv: cfg.GitHub.TokenEnv,
+		EnvFile:  cfg.GitHub.EnvFile,
+	})
+	if err != nil {
+		return Dashboard{}, err
+	}
+	migrationResults = append(migrationResults, githubMigrationResults...)
 
 	profiles, profileErrors, err := config.LoadProfiles(cfg.Paths.ProfilesDir)
 	if err != nil {

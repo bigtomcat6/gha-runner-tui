@@ -137,6 +137,16 @@ func (m RunnerManager) SyncProfilePath(ctx context.Context, profilePath string) 
 	if _, err := config.MigrateProfileAccessMode(profilePath); err != nil {
 		return err
 	}
+	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
+	if err != nil {
+		return err
+	}
+	if _, err := config.MigrateProfileGitHubConfig(profilePath, config.GitHubProfile{
+		TokenEnv: cfg.GitHub.TokenEnv,
+		EnvFile:  cfg.GitHub.EnvFile,
+	}); err != nil {
+		return err
+	}
 	profile, err := config.LoadProfile(profilePath)
 	if err != nil {
 		return err
@@ -151,6 +161,12 @@ func (m RunnerManager) SyncConfigProfiles(ctx context.Context) error {
 	}
 
 	if _, err := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir); err != nil {
+		return err
+	}
+	if _, err := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{
+		TokenEnv: cfg.GitHub.TokenEnv,
+		EnvFile:  cfg.GitHub.EnvFile,
+	}); err != nil {
 		return err
 	}
 
@@ -361,6 +377,10 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 			Owner: input.RepoOwner,
 			Name:  input.RepoName,
 		},
+		GitHub: config.GitHubProfile{
+			TokenEnv: cfg.GitHub.TokenEnv,
+			EnvFile:  cfg.GitHub.EnvFile,
+		},
 		Service: config.ServiceConfig{
 			Name: input.ServiceName,
 		},
@@ -393,6 +413,25 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		return err
 	}
 
+	stateFile, err := confineManagedPath(cfg.Paths.StateDir, profile.Loop.StateFile)
+	if err != nil {
+		return err
+	}
+	logDir, err := confineManagedPath(cfg.Paths.LogDir, profile.Loop.LogDir)
+	if err != nil {
+		return err
+	}
+	profilePath, err := confineJoin(cfg.Paths.ProfilesDir, profile.Name+".yaml")
+	if err != nil {
+		return err
+	}
+	servicePath, err := confineJoin(m.SystemdUnitDir, profile.Service.Name)
+	if err != nil {
+		return err
+	}
+	profile.Loop.StateFile = stateFile
+	profile.Loop.LogDir = logDir
+
 	if err := m.ensureDir(ctx, cfg.Paths.ProfilesDir); err != nil {
 		return err
 	}
@@ -406,7 +445,6 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		return err
 	}
 
-	profilePath := filepath.Join(cfg.Paths.ProfilesDir, profile.Name+".yaml")
 	profileData, err := renderProfileYAML(profile)
 	if err != nil {
 		return err
@@ -415,10 +453,9 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		return err
 	}
 
-	servicePath := filepath.Join(m.SystemdUnitDir, profile.Service.Name)
 	serviceData, err := renderServiceFile(serviceTemplateData{
 		ProfileName:       profile.Name,
-		GitHubEnvFile:     cfg.GitHub.EnvFile,
+		GitHubEnvFile:     profile.GitHub.EnvFile,
 		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
 		ProfileConfigPath: profilePath,
 	})
@@ -460,6 +497,10 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 			Scope: config.TargetScopeOrganization,
 			Org:   input.Org,
 		},
+		GitHub: config.GitHubProfile{
+			TokenEnv: cfg.GitHub.TokenEnv,
+			EnvFile:  cfg.GitHub.EnvFile,
+		},
 		Service: config.ServiceConfig{
 			Name: names.ServiceName,
 		},
@@ -498,6 +539,25 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 
+	stateFile, err := confineManagedPath(cfg.Paths.StateDir, profile.Loop.StateFile)
+	if err != nil {
+		return err
+	}
+	logDir, err := confineManagedPath(cfg.Paths.LogDir, profile.Loop.LogDir)
+	if err != nil {
+		return err
+	}
+	profilePath, err := confineJoin(cfg.Paths.ProfilesDir, profile.Name+".yaml")
+	if err != nil {
+		return err
+	}
+	servicePath, err := confineJoin(m.SystemdUnitDir, profile.Service.Name)
+	if err != nil {
+		return err
+	}
+	profile.Loop.StateFile = stateFile
+	profile.Loop.LogDir = logDir
+
 	if err := m.ensureDir(ctx, cfg.Paths.ProfilesDir); err != nil {
 		return err
 	}
@@ -511,7 +571,6 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 
-	profilePath := filepath.Join(cfg.Paths.ProfilesDir, profile.Name+".yaml")
 	profileData, err := renderProfileYAML(profile)
 	if err != nil {
 		return err
@@ -520,10 +579,9 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 
-	servicePath := filepath.Join(m.SystemdUnitDir, profile.Service.Name)
 	serviceData, err := renderServiceFile(serviceTemplateData{
 		ProfileName:       profile.Name,
-		GitHubEnvFile:     cfg.GitHub.EnvFile,
+		GitHubEnvFile:     profile.GitHub.EnvFile,
 		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
 		ProfileConfigPath: profilePath,
 	})
@@ -638,6 +696,32 @@ func containsString(items []string, want string) bool {
 	return false
 }
 
+func confineJoin(root, leaf string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("managed root is required")
+	}
+	if strings.Contains(leaf, string(os.PathSeparator)) {
+		return "", fmt.Errorf("managed leaf %q must be a basename", leaf)
+	}
+	return confineManagedPath(root, filepath.Join(root, leaf))
+}
+
+func confineManagedPath(root, target string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("managed root is required")
+	}
+	cleanRoot := filepath.Clean(root)
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("managed path escapes root %q: %s", cleanRoot, cleanTarget)
+	}
+	return cleanTarget, nil
+}
+
 func (m RunnerManager) shouldUseLegacyCreate() bool {
 	if m.LegacyEnvDir == "" || m.LegacyLoopBinary == "" {
 		return false
@@ -647,6 +731,37 @@ func (m RunnerManager) shouldUseLegacyCreate() bool {
 }
 
 func (m RunnerManager) createLegacyProfile(ctx context.Context, input CreateProfileInput) error {
+	profile := config.Profile{
+		Name: input.Name,
+		Repo: config.RepoConfig{
+			Owner: input.RepoOwner,
+			Name:  input.RepoName,
+		},
+		Service: config.ServiceConfig{
+			Name: input.ServiceName,
+		},
+		Runner: config.RunnerConfig{
+			Ephemeral:  input.Ephemeral,
+			NamePrefix: input.Name,
+		},
+		Docker: config.DockerProfile{
+			Image:               input.DockerImage,
+			ContainerNamePrefix: input.ContainerNamePrefix,
+		},
+	}
+	if err := profile.Validate(); err != nil {
+		return err
+	}
+
+	envPath, err := confineJoin(m.LegacyEnvDir, input.Name+".env")
+	if err != nil {
+		return err
+	}
+	servicePath, err := confineJoin(m.SystemdUnitDir, input.ServiceName)
+	if err != nil {
+		return err
+	}
+
 	if err := m.ensureDir(ctx, m.LegacyEnvDir); err != nil {
 		return err
 	}
@@ -654,13 +769,11 @@ func (m RunnerManager) createLegacyProfile(ctx context.Context, input CreateProf
 		return err
 	}
 
-	envPath := filepath.Join(m.LegacyEnvDir, input.Name+".env")
 	envData := renderLegacyEnvFile(input)
 	if err := m.writeManagedFile(ctx, envPath, envData, 0o644); err != nil {
 		return err
 	}
 
-	servicePath := filepath.Join(m.SystemdUnitDir, input.ServiceName)
 	serviceData, err := renderLegacyServiceFile(legacyServiceTemplateData{
 		ProfileName:     input.Name,
 		EnvironmentFile: envPath,
