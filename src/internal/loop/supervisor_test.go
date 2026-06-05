@@ -41,6 +41,15 @@ func TestRunnerEnvForRepositoryProfile(t *testing.T) {
 	if env["RUNNER_REPO_URL"] != "https://github.com/bigtomcat6/remind-me" {
 		t.Fatalf("unexpected repo url: %q", env["RUNNER_REPO_URL"])
 	}
+	if env["REPO_URL"] != "https://github.com/bigtomcat6/remind-me" {
+		t.Fatalf("unexpected legacy repo url: %q", env["REPO_URL"])
+	}
+	if env["RUNNER_TOKEN"] != "token" {
+		t.Fatalf("unexpected runner token: %q", env["RUNNER_TOKEN"])
+	}
+	if env["REG_TOKEN"] != "token" {
+		t.Fatalf("unexpected legacy registration token: %q", env["REG_TOKEN"])
+	}
 	if _, ok := env["RUNNER_GROUP"]; ok {
 		t.Fatalf("did not expect RUNNER_GROUP, got %q", env["RUNNER_GROUP"])
 	}
@@ -68,6 +77,12 @@ func TestRunnerEnvForOrganizationProfile(t *testing.T) {
 	env := runnerEnv(profile, "example-org-swift-1", "token")
 	if env["RUNNER_REPO_URL"] != "https://github.com/example-org" {
 		t.Fatalf("unexpected org url: %q", env["RUNNER_REPO_URL"])
+	}
+	if env["REPO_URL"] != "https://github.com/example-org" {
+		t.Fatalf("unexpected legacy org url: %q", env["REPO_URL"])
+	}
+	if env["REG_TOKEN"] != "token" {
+		t.Fatalf("unexpected legacy registration token: %q", env["REG_TOKEN"])
 	}
 	if env["RUNNER_GROUP"] != "example-org-swift" {
 		t.Fatalf("unexpected runner group: %q", env["RUNNER_GROUP"])
