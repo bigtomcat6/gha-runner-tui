@@ -6,7 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
+{{- if .GitHubEnvFile }}
 EnvironmentFile={{.GitHubEnvFile}}
+{{- end }}
 ExecStart={{.LoopBinaryPath}} --config {{.ProfileConfigPath}}
 Restart=always
 RestartSec=5

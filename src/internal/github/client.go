@@ -17,8 +17,6 @@ import (
 
 var ErrMissingToken = errors.New("github token is not configured")
 
-const defaultLegacyTokenFile = "/etc/gha-runner/github_pat"
-
 type HTTPDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
@@ -60,9 +58,6 @@ func NewClient(baseURL, tokenEnv, tokenFile string, runner command.Runner, httpC
 	}
 	if tokenEnv == "" {
 		tokenEnv = "GITHUB_TOKEN"
-	}
-	if tokenFile == "" {
-		tokenFile = defaultLegacyTokenFile
 	}
 	if httpClient == nil {
 		httpClient = http.DefaultClient

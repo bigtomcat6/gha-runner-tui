@@ -100,6 +100,27 @@ func TestDeriveOrganizationEnvironmentNames(t *testing.T) {
 	}
 }
 
+func TestDeriveOrganizationEnvironmentNamesSanitizesUnsafeComponents(t *testing.T) {
+	t.Parallel()
+
+	names, err := DeriveOrganizationEnvironmentNames("../Example Org", "../../swift prod", "/state", "/logs")
+	if err != nil {
+		t.Fatalf("DeriveOrganizationEnvironmentNames returned error: %v", err)
+	}
+	if names.ProfileName != "example-org-swift-prod" {
+		t.Fatalf("unexpected sanitized profile name: %q", names.ProfileName)
+	}
+	if names.ServiceName != "gha-example-org-swift-prod.service" {
+		t.Fatalf("unexpected sanitized service name: %q", names.ServiceName)
+	}
+	if names.StateFile != "/state/example-org-swift-prod.json" {
+		t.Fatalf("unexpected sanitized state file: %q", names.StateFile)
+	}
+	if names.LogDir != "/logs/example-org-swift-prod" {
+		t.Fatalf("unexpected sanitized log dir: %q", names.LogDir)
+	}
+}
+
 func TestOrganizationRunnerGroupVisibilityDefaultsToPrivate(t *testing.T) {
 	t.Parallel()
 

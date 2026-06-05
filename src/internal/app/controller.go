@@ -50,6 +50,7 @@ type CreateProfileInput struct {
 	Scope               config.TargetScope
 	Org                 string
 	Environment         string
+	DockerAccess        string
 	Name                string
 	RepoOwner           string
 	RepoName            string
@@ -60,6 +61,12 @@ type CreateProfileInput struct {
 	CPUs                string
 	Memory              string
 	Ephemeral           bool
+}
+
+type resolvedDockerAccess struct {
+	Mode    config.DockerAccessMode
+	Volumes []string
+	Env     map[string]string
 }
 
 func NewRunnerManager(configPath string, systemd systemdpkg.Client, docker dockerpkg.Client, github gh.Client) RunnerManager {
@@ -127,6 +134,19 @@ func (m RunnerManager) SyncRunnerGroup(ctx context.Context, profile config.Profi
 }
 
 func (m RunnerManager) SyncProfilePath(ctx context.Context, profilePath string) error {
+	if _, err := config.MigrateProfileAccessMode(profilePath); err != nil {
+		return err
+	}
+	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
+	if err != nil {
+		return err
+	}
+	if _, err := config.MigrateProfileGitHubConfig(profilePath, config.GitHubProfile{
+		TokenEnv: cfg.GitHub.TokenEnv,
+		EnvFile:  cfg.GitHub.EnvFile,
+	}); err != nil {
+		return err
+	}
 	profile, err := config.LoadProfile(profilePath)
 	if err != nil {
 		return err
@@ -137,6 +157,16 @@ func (m RunnerManager) SyncProfilePath(ctx context.Context, profilePath string) 
 func (m RunnerManager) SyncConfigProfiles(ctx context.Context) error {
 	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
 	if err != nil {
+		return err
+	}
+
+	if _, err := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir); err != nil {
+		return err
+	}
+	if _, err := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{
+		TokenEnv: cfg.GitHub.TokenEnv,
+		EnvFile:  cfg.GitHub.EnvFile,
+	}); err != nil {
 		return err
 	}
 
@@ -336,11 +366,20 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		return err
 	}
 
+	dockerAccess, err := resolveDockerAccessForCreate(cfg, input.DockerAccess)
+	if err != nil {
+		return err
+	}
+
 	profile := config.Profile{
 		Name: input.Name,
 		Repo: config.RepoConfig{
 			Owner: input.RepoOwner,
 			Name:  input.RepoName,
+		},
+		GitHub: config.GitHubProfile{
+			TokenEnv: cfg.GitHub.TokenEnv,
+			EnvFile:  cfg.GitHub.EnvFile,
 		},
 		Service: config.ServiceConfig{
 			Name: input.ServiceName,
@@ -352,15 +391,14 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 			Labels:     input.RunnerLabels,
 		},
 		Docker: config.DockerProfile{
+			AccessMode:          dockerAccess.Mode,
 			Image:               input.DockerImage,
 			ContainerNamePrefix: input.ContainerNamePrefix,
 			CPUs:                input.CPUs,
 			Memory:              input.Memory,
 			RemoveAfterExit:     true,
-			Volumes:             []string{"/var/run/docker.sock:/var/run/docker.sock"},
-			Env: map[string]string{
-				"RUNNER_ALLOW_RUNASROOT": "1",
-			},
+			Volumes:             dockerAccess.Volumes,
+			Env:                 dockerAccess.Env,
 		},
 		Loop: config.LoopConfig{
 			IntervalSeconds:   5,
@@ -375,6 +413,25 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		return err
 	}
 
+	stateFile, err := confineManagedPath(cfg.Paths.StateDir, profile.Loop.StateFile)
+	if err != nil {
+		return err
+	}
+	logDir, err := confineManagedPath(cfg.Paths.LogDir, profile.Loop.LogDir)
+	if err != nil {
+		return err
+	}
+	profilePath, err := confineJoin(cfg.Paths.ProfilesDir, profile.Name+".yaml")
+	if err != nil {
+		return err
+	}
+	servicePath, err := confineJoin(m.SystemdUnitDir, profile.Service.Name)
+	if err != nil {
+		return err
+	}
+	profile.Loop.StateFile = stateFile
+	profile.Loop.LogDir = logDir
+
 	if err := m.ensureDir(ctx, cfg.Paths.ProfilesDir); err != nil {
 		return err
 	}
@@ -388,7 +445,6 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		return err
 	}
 
-	profilePath := filepath.Join(cfg.Paths.ProfilesDir, profile.Name+".yaml")
 	profileData, err := renderProfileYAML(profile)
 	if err != nil {
 		return err
@@ -397,10 +453,9 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		return err
 	}
 
-	servicePath := filepath.Join(m.SystemdUnitDir, profile.Service.Name)
 	serviceData, err := renderServiceFile(serviceTemplateData{
 		ProfileName:       profile.Name,
-		GitHubEnvFile:     cfg.GitHub.EnvFile,
+		GitHubEnvFile:     profile.GitHub.EnvFile,
 		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
 		ProfileConfigPath: profilePath,
 	})
@@ -426,6 +481,11 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 
+	dockerAccess, err := resolveDockerAccessForCreate(cfg, input.DockerAccess)
+	if err != nil {
+		return err
+	}
+
 	names, err := config.DeriveOrganizationEnvironmentNames(input.Org, input.Environment, cfg.Paths.StateDir, cfg.Paths.LogDir)
 	if err != nil {
 		return err
@@ -436,6 +496,10 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		Target: config.TargetConfig{
 			Scope: config.TargetScopeOrganization,
 			Org:   input.Org,
+		},
+		GitHub: config.GitHubProfile{
+			TokenEnv: cfg.GitHub.TokenEnv,
+			EnvFile:  cfg.GitHub.EnvFile,
 		},
 		Service: config.ServiceConfig{
 			Name: names.ServiceName,
@@ -453,15 +517,14 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 			Labels:      input.RunnerLabels,
 		},
 		Docker: config.DockerProfile{
+			AccessMode:          dockerAccess.Mode,
 			Image:               input.DockerImage,
 			ContainerNamePrefix: names.ContainerNamePrefix,
 			CPUs:                input.CPUs,
 			Memory:              input.Memory,
 			RemoveAfterExit:     true,
-			Volumes:             []string{"/var/run/docker.sock:/var/run/docker.sock"},
-			Env: map[string]string{
-				"RUNNER_ALLOW_RUNASROOT": "1",
-			},
+			Volumes:             dockerAccess.Volumes,
+			Env:                 dockerAccess.Env,
 		},
 		Loop: config.LoopConfig{
 			IntervalSeconds:   5,
@@ -476,6 +539,25 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 
+	stateFile, err := confineManagedPath(cfg.Paths.StateDir, profile.Loop.StateFile)
+	if err != nil {
+		return err
+	}
+	logDir, err := confineManagedPath(cfg.Paths.LogDir, profile.Loop.LogDir)
+	if err != nil {
+		return err
+	}
+	profilePath, err := confineJoin(cfg.Paths.ProfilesDir, profile.Name+".yaml")
+	if err != nil {
+		return err
+	}
+	servicePath, err := confineJoin(m.SystemdUnitDir, profile.Service.Name)
+	if err != nil {
+		return err
+	}
+	profile.Loop.StateFile = stateFile
+	profile.Loop.LogDir = logDir
+
 	if err := m.ensureDir(ctx, cfg.Paths.ProfilesDir); err != nil {
 		return err
 	}
@@ -489,7 +571,6 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 
-	profilePath := filepath.Join(cfg.Paths.ProfilesDir, profile.Name+".yaml")
 	profileData, err := renderProfileYAML(profile)
 	if err != nil {
 		return err
@@ -498,10 +579,9 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 
-	servicePath := filepath.Join(m.SystemdUnitDir, profile.Service.Name)
 	serviceData, err := renderServiceFile(serviceTemplateData{
 		ProfileName:       profile.Name,
-		GitHubEnvFile:     cfg.GitHub.EnvFile,
+		GitHubEnvFile:     profile.GitHub.EnvFile,
 		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
 		ProfileConfigPath: profilePath,
 	})
@@ -521,6 +601,127 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 	return m.Systemd.Start(ctx, profile.Service.Name)
 }
 
+func resolveDockerAccessForCreate(cfg config.GlobalConfig, requested string) (resolvedDockerAccess, error) {
+	mode := strings.TrimSpace(requested)
+	if mode == "" || mode == "default" {
+		mode = string(cfg.Docker.DefaultAccessMode)
+	}
+
+	containerSocketPath := "/var/run/docker.sock"
+	switch config.DockerAccessMode(mode) {
+	case config.DockerAccessModeRootless:
+		socketPath := strings.TrimSpace(cfg.Docker.RootlessSocketPath)
+		if socketPath == "" && cfg.Docker.AutoDetectRootlessSocket {
+			var err error
+			socketPath, err = detectRootlessSocket()
+			if err != nil {
+				return resolvedDockerAccess{}, fmt.Errorf("rootless Docker is required for this profile, but no rootless socket is configured or detectable; set docker.rootless_socket_path in config.yaml or choose host-socket explicitly: %w", err)
+			}
+		}
+		if socketPath == "" {
+			return resolvedDockerAccess{}, errors.New("rootless Docker is required for this profile, but no rootless socket is configured or detectable; set docker.rootless_socket_path in config.yaml or choose host-socket explicitly")
+		}
+		if !pathExists(socketPath) {
+			return resolvedDockerAccess{}, fmt.Errorf("configured rootless Docker socket does not exist: %s", socketPath)
+		}
+		return resolvedDockerAccess{
+			Mode:    config.DockerAccessModeRootless,
+			Volumes: []string{socketPath + ":" + containerSocketPath},
+			Env: map[string]string{
+				"DOCKER_HOST":            "unix://" + containerSocketPath,
+				"RUNNER_ALLOW_RUNASROOT": "1",
+			},
+		}, nil
+	case config.DockerAccessModeHostSocket:
+		if !cfg.Docker.AllowHostSocketOptIn {
+			return resolvedDockerAccess{}, errors.New("host-socket Docker access is disabled by configuration")
+		}
+		hostSocketPath := strings.TrimSpace(cfg.Docker.HostSocketPath)
+		if hostSocketPath == "" {
+			hostSocketPath = "/var/run/docker.sock"
+		}
+		return resolvedDockerAccess{
+			Mode:    config.DockerAccessModeHostSocket,
+			Volumes: []string{hostSocketPath + ":" + containerSocketPath},
+			Env: map[string]string{
+				"DOCKER_HOST":            "unix://" + containerSocketPath,
+				"RUNNER_ALLOW_RUNASROOT": "1",
+			},
+		}, nil
+	default:
+		return resolvedDockerAccess{}, fmt.Errorf("unsupported docker access mode %q", requested)
+	}
+}
+
+func detectRootlessSocket() (string, error) {
+	candidates := make([]string, 0, 2)
+	if dockerHost := strings.TrimSpace(os.Getenv("DOCKER_HOST")); strings.HasPrefix(dockerHost, "unix://") {
+		socketPath := strings.TrimPrefix(dockerHost, "unix://")
+		if pathExists(socketPath) {
+			candidates = append(candidates, socketPath)
+		}
+	}
+
+	paths, err := filepath.Glob("/run/user/*/docker.sock")
+	if err != nil {
+		return "", err
+	}
+	for _, path := range paths {
+		if pathExists(path) && !containsString(candidates, path) {
+			candidates = append(candidates, path)
+		}
+	}
+
+	switch len(candidates) {
+	case 1:
+		return candidates[0], nil
+	case 0:
+		return "", errors.New("no usable rootless Docker socket found")
+	default:
+		return "", fmt.Errorf("multiple rootless Docker sockets detected: %s", strings.Join(candidates, ", "))
+	}
+}
+
+func pathExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func confineJoin(root, leaf string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("managed root is required")
+	}
+	if strings.Contains(leaf, string(os.PathSeparator)) {
+		return "", fmt.Errorf("managed leaf %q must be a basename", leaf)
+	}
+	return confineManagedPath(root, filepath.Join(root, leaf))
+}
+
+func confineManagedPath(root, target string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("managed root is required")
+	}
+	cleanRoot := filepath.Clean(root)
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("managed path escapes root %q: %s", cleanRoot, cleanTarget)
+	}
+	return cleanTarget, nil
+}
+
 func (m RunnerManager) shouldUseLegacyCreate() bool {
 	if m.LegacyEnvDir == "" || m.LegacyLoopBinary == "" {
 		return false
@@ -530,6 +731,37 @@ func (m RunnerManager) shouldUseLegacyCreate() bool {
 }
 
 func (m RunnerManager) createLegacyProfile(ctx context.Context, input CreateProfileInput) error {
+	profile := config.Profile{
+		Name: input.Name,
+		Repo: config.RepoConfig{
+			Owner: input.RepoOwner,
+			Name:  input.RepoName,
+		},
+		Service: config.ServiceConfig{
+			Name: input.ServiceName,
+		},
+		Runner: config.RunnerConfig{
+			Ephemeral:  input.Ephemeral,
+			NamePrefix: input.Name,
+		},
+		Docker: config.DockerProfile{
+			Image:               input.DockerImage,
+			ContainerNamePrefix: input.ContainerNamePrefix,
+		},
+	}
+	if err := profile.Validate(); err != nil {
+		return err
+	}
+
+	envPath, err := confineJoin(m.LegacyEnvDir, input.Name+".env")
+	if err != nil {
+		return err
+	}
+	servicePath, err := confineJoin(m.SystemdUnitDir, input.ServiceName)
+	if err != nil {
+		return err
+	}
+
 	if err := m.ensureDir(ctx, m.LegacyEnvDir); err != nil {
 		return err
 	}
@@ -537,13 +769,11 @@ func (m RunnerManager) createLegacyProfile(ctx context.Context, input CreateProf
 		return err
 	}
 
-	envPath := filepath.Join(m.LegacyEnvDir, input.Name+".env")
 	envData := renderLegacyEnvFile(input)
 	if err := m.writeManagedFile(ctx, envPath, envData, 0o644); err != nil {
 		return err
 	}
 
-	servicePath := filepath.Join(m.SystemdUnitDir, input.ServiceName)
 	serviceData, err := renderLegacyServiceFile(legacyServiceTemplateData{
 		ProfileName:     input.Name,
 		EnvironmentFile: envPath,

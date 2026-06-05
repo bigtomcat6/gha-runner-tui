@@ -231,20 +231,24 @@ func (s Supervisor) runCycle(ctx context.Context, profile config.Profile, restar
 }
 
 func runnerEnv(profile config.Profile, runnerName, registrationToken string) map[string]string {
-	env := make(map[string]string, len(profile.Docker.Env)+7)
+	env := make(map[string]string, len(profile.Docker.Env)+9)
 	for key, value := range profile.Docker.Env {
 		env[key] = value
 	}
 	env["RUNNER_NAME"] = runnerName
 	env["RUNNER_TOKEN"] = registrationToken
+	env["REG_TOKEN"] = registrationToken
 	target, err := profile.ResolveTarget()
 	if err == nil {
 		env["RUNNER_REPO_URL"] = target.GitHubURL()
+		env["REPO_URL"] = target.GitHubURL()
 		if target.Scope == config.TargetScopeOrganization && profile.RunnerGroup.Name != "" {
 			env["RUNNER_GROUP"] = profile.RunnerGroup.Name
 		}
 	} else {
-		env["RUNNER_REPO_URL"] = fmt.Sprintf("https://github.com/%s/%s", profile.Repo.Owner, profile.Repo.Name)
+		repoURL := fmt.Sprintf("https://github.com/%s/%s", profile.Repo.Owner, profile.Repo.Name)
+		env["RUNNER_REPO_URL"] = repoURL
+		env["REPO_URL"] = repoURL
 	}
 	env["RUNNER_LABELS"] = strings.Join(profile.Runner.Labels, ",")
 	env["RUNNER_WORKDIR"] = profile.Runner.Workdir

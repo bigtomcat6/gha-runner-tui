@@ -45,9 +45,10 @@ type ProfileSnapshot struct {
 }
 
 type Dashboard struct {
-	Config        config.GlobalConfig
-	Profiles      []ProfileSnapshot
-	ProfileErrors []config.ProfileLoadError
+	Config            config.GlobalConfig
+	Profiles          []ProfileSnapshot
+	ProfileErrors     []config.ProfileLoadError
+	MigrationWarnings []string
 }
 
 type Service struct {
@@ -62,6 +63,19 @@ func (s Service) LoadDashboard(ctx context.Context) (Dashboard, error) {
 	if err != nil {
 		return Dashboard{}, err
 	}
+
+	migrationResults, err := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir)
+	if err != nil {
+		return Dashboard{}, err
+	}
+	githubMigrationResults, err := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{
+		TokenEnv: cfg.GitHub.TokenEnv,
+		EnvFile:  cfg.GitHub.EnvFile,
+	})
+	if err != nil {
+		return Dashboard{}, err
+	}
+	migrationResults = append(migrationResults, githubMigrationResults...)
 
 	profiles, profileErrors, err := config.LoadProfiles(cfg.Paths.ProfilesDir)
 	if err != nil {
@@ -86,9 +100,10 @@ func (s Service) LoadDashboard(ctx context.Context) (Dashboard, error) {
 	})
 
 	return Dashboard{
-		Config:        cfg,
-		Profiles:      snapshots,
-		ProfileErrors: profileErrors,
+		Config:            cfg,
+		Profiles:          snapshots,
+		ProfileErrors:     profileErrors,
+		MigrationWarnings: migrationWarnings(migrationResults),
 	}, nil
 }
 
@@ -206,6 +221,17 @@ func inferredLoopState(service systemdpkg.ServiceStatus) state.LoopStatus {
 
 func (p ProfileSnapshot) ErrorSummary() string {
 	return strings.Join(p.Errors, "; ")
+}
+
+func migrationWarnings(results []config.ProfileMigrationResult) []string {
+	warnings := make([]string, 0)
+	for _, result := range results {
+		switch result.Status {
+		case config.ProfileMigrationSkipped, config.ProfileMigrationFailed:
+			warnings = append(warnings, fmt.Sprintf("%s: %s", result.Path, result.Message))
+		}
+	}
+	return warnings
 }
 
 func (s Service) matchContainer(ctx context.Context, profile config.Profile, loopState state.LoopState) (dockerpkg.ContainerInfo, error) {

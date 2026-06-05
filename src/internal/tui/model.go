@@ -521,6 +521,9 @@ func (m Model) viewDashboard() string {
 	if len(m.dashboard.ProfileErrors) > 0 {
 		info += fmt.Sprintf("  Invalid profiles: %d", len(m.dashboard.ProfileErrors))
 	}
+	if len(m.dashboard.MigrationWarnings) > 0 {
+		info += fmt.Sprintf("  Migration warnings: %d", len(m.dashboard.MigrationWarnings))
+	}
 	help := "[r] refresh  [enter] details  [c] create  [g] sync group  [s] start  [x] stop  [R] restart  [?] help  [q] quit"
 	return lipgloss.JoinVertical(lipgloss.Left, info, "", m.table.View(), "", help)
 }
@@ -571,6 +574,7 @@ func (m Model) viewDetail() string {
 		fmt.Sprintf("Container:          %s", containerName),
 		fmt.Sprintf("Container ID:       %s", containerID),
 		fmt.Sprintf("Docker image:       %s", dash(snapshot.Profile.Docker.Image)),
+		fmt.Sprintf("Docker access:      %s", dockerAccessLabel(snapshot.Profile)),
 		fmt.Sprintf("GitHub runner:      %s", githubRunner),
 		fmt.Sprintf("GitHub status:      %s", snapshot.GitHubState),
 		fmt.Sprintf("GitHub busy:        %s", snapshot.BusyState),
@@ -738,6 +742,7 @@ func newCreateFields() []createField {
 		{label: "Target scope", value: "repository", placeholder: "repository or organization"},
 		{label: "Organization", placeholder: "Example Org"},
 		{label: "Environment", placeholder: "swift"},
+		{label: "Docker access", value: "default", placeholder: "default, rootless, or host-socket"},
 		{label: "Profile name", placeholder: "remind-me-swift"},
 		{label: "Repo owner", placeholder: "bigtomcat6"},
 		{label: "Repo name", placeholder: "remind-me"},
@@ -791,6 +796,7 @@ func (m Model) readCreateInput() (app.CreateProfileInput, error) {
 		Scope:               config.TargetScope(strings.TrimSpace(values["Target scope"])),
 		Org:                 values["Organization"],
 		Environment:         values["Environment"],
+		DockerAccess:        values["Docker access"],
 		Name:                values["Profile name"],
 		RepoOwner:           values["Repo owner"],
 		RepoName:            values["Repo name"],
@@ -801,6 +807,12 @@ func (m Model) readCreateInput() (app.CreateProfileInput, error) {
 		CPUs:                values["CPU limit"],
 		Memory:              values["Memory limit"],
 		Ephemeral:           ephemeral,
+	}
+
+	switch input.DockerAccess {
+	case "", "default", "rootless", "host-socket":
+	default:
+		return app.CreateProfileInput{}, fmt.Errorf("docker access must be default, rootless, or host-socket")
 	}
 
 	switch input.Scope {
@@ -865,6 +877,17 @@ func loadDockerLogsCmd(manager app.RunnerManager, snapshot app.ProfileSnapshot) 
 			kind:    logKindDocker,
 			err:     err,
 		}
+	}
+}
+
+func dockerAccessLabel(profile config.Profile) string {
+	switch profile.DockerAccessMode() {
+	case config.DockerAccessModeRootless:
+		return "rootless"
+	case config.DockerAccessModeHostSocket:
+		return "host-socket (unsafe)"
+	default:
+		return "unknown"
 	}
 }
 

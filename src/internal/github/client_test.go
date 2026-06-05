@@ -88,6 +88,15 @@ func TestListRepoRunnersReadsEnvStyleTokenFile(t *testing.T) {
 	}
 }
 
+func TestNewClientDoesNotInjectImplicitLegacyTokenFile(t *testing.T) {
+	t.Parallel()
+
+	client := NewClient("https://example.test", "TEST_GITHUB_TOKEN", "", nil, nil)
+	if client.tokenFile != "" {
+		t.Fatalf("expected empty tokenFile without explicit configuration, got %q", client.tokenFile)
+	}
+}
+
 func TestMatchRunnerPrefersExactName(t *testing.T) {
 	t.Parallel()
 
@@ -166,7 +175,7 @@ func TestListOrgRunnerGroupsParsesGroups(t *testing.T) {
 				t.Fatalf("unexpected path: %s", r.URL.Path)
 			}
 		},
-	response: &http.Response{
+		response: &http.Response{
 			StatusCode: http.StatusOK,
 			Body: io.NopCloser(strings.NewReader(
 				`{"runner_groups":[{"id":42,"name":"example-org-swift","visibility":"private","allows_public_repositories":false}]}`,
