@@ -29,6 +29,18 @@ func TestLoadGlobalConfigUsesDefaultsWhenFileMissing(t *testing.T) {
 	if !cfg.Docker.UseCLI {
 		t.Fatal("expected docker.use_cli to default to true")
 	}
+	if cfg.Docker.DefaultAccessMode != DockerAccessModeRootless {
+		t.Fatalf("expected default docker access mode %q, got %q", DockerAccessModeRootless, cfg.Docker.DefaultAccessMode)
+	}
+	if !cfg.Docker.AutoDetectRootlessSocket {
+		t.Fatal("expected docker.auto_detect_rootless_socket to default to true")
+	}
+	if !cfg.Docker.AllowHostSocketOptIn {
+		t.Fatal("expected docker.allow_host_socket_opt_in to default to true")
+	}
+	if cfg.Docker.HostSocketPath != "/var/run/docker.sock" {
+		t.Fatalf("expected default host socket path, got %q", cfg.Docker.HostSocketPath)
+	}
 }
 
 func TestLoadGlobalConfigMergesDefaults(t *testing.T) {
@@ -36,7 +48,7 @@ func TestLoadGlobalConfigMergesDefaults(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	content := []byte("github:\n  token_env: CI_GITHUB_TOKEN\n  env_file: /etc/gha-runner-tui/ci.env\npaths:\n  profiles_dir: /tmp/profiles\nsystemd:\n  loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui\n")
+	content := []byte("github:\n  token_env: CI_GITHUB_TOKEN\n  env_file: /etc/gha-runner-tui/ci.env\npaths:\n  profiles_dir: /tmp/profiles\nsystemd:\n  loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui\ndocker:\n  default_access_mode: host-socket\n  rootless_socket_path: /run/user/1001/docker.sock\n  auto_detect_rootless_socket: false\n  allow_host_socket_opt_in: false\n  host_socket_path: /custom/docker.sock\n")
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
@@ -66,5 +78,20 @@ func TestLoadGlobalConfigMergesDefaults(t *testing.T) {
 	}
 	if !cfg.Docker.UseCLI {
 		t.Fatal("expected docker.use_cli to remain true")
+	}
+	if cfg.Docker.DefaultAccessMode != DockerAccessModeHostSocket {
+		t.Fatalf("expected docker access mode override %q, got %q", DockerAccessModeHostSocket, cfg.Docker.DefaultAccessMode)
+	}
+	if cfg.Docker.RootlessSocketPath != "/run/user/1001/docker.sock" {
+		t.Fatalf("expected rootless socket path override, got %q", cfg.Docker.RootlessSocketPath)
+	}
+	if cfg.Docker.AutoDetectRootlessSocket {
+		t.Fatal("expected docker.auto_detect_rootless_socket override to be false")
+	}
+	if cfg.Docker.AllowHostSocketOptIn {
+		t.Fatal("expected docker.allow_host_socket_opt_in override to be false")
+	}
+	if cfg.Docker.HostSocketPath != "/custom/docker.sock" {
+		t.Fatalf("expected host socket path override, got %q", cfg.Docker.HostSocketPath)
 	}
 }

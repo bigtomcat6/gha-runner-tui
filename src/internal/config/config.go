@@ -16,6 +16,14 @@ const (
 	defaultAPIBaseURL  = "https://api.github.com"
 	defaultSvcPrefix   = "gha-"
 	defaultLoopBinary  = "/usr/local/bin/gha-ephemeral-loop"
+	defaultHostSocket  = "/var/run/docker.sock"
+)
+
+type DockerAccessMode string
+
+const (
+	DockerAccessModeRootless   DockerAccessMode = "rootless"
+	DockerAccessModeHostSocket DockerAccessMode = "host-socket"
 )
 
 type GlobalConfig struct {
@@ -43,7 +51,12 @@ type SystemdConfig struct {
 }
 
 type DockerConfig struct {
-	UseCLI bool `yaml:"use_cli"`
+	UseCLI                   bool             `yaml:"use_cli"`
+	DefaultAccessMode        DockerAccessMode `yaml:"default_access_mode"`
+	RootlessSocketPath       string           `yaml:"rootless_socket_path"`
+	AutoDetectRootlessSocket bool             `yaml:"auto_detect_rootless_socket"`
+	AllowHostSocketOptIn     bool             `yaml:"allow_host_socket_opt_in"`
+	HostSocketPath           string           `yaml:"host_socket_path"`
 }
 
 func DefaultGlobalConfig() GlobalConfig {
@@ -63,7 +76,11 @@ func DefaultGlobalConfig() GlobalConfig {
 			LoopBinaryPath: defaultLoopBinary,
 		},
 		Docker: DockerConfig{
-			UseCLI: true,
+			UseCLI:                   true,
+			DefaultAccessMode:        DockerAccessModeRootless,
+			AutoDetectRootlessSocket: true,
+			AllowHostSocketOptIn:     true,
+			HostSocketPath:           defaultHostSocket,
 		},
 	}
 }
@@ -117,5 +134,11 @@ func (c *GlobalConfig) applyDefaults() {
 	}
 	if !c.Docker.UseCLI {
 		c.Docker.UseCLI = true
+	}
+	if c.Docker.DefaultAccessMode == "" {
+		c.Docker.DefaultAccessMode = DockerAccessModeRootless
+	}
+	if c.Docker.HostSocketPath == "" {
+		c.Docker.HostSocketPath = defaultHostSocket
 	}
 }

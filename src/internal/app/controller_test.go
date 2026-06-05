@@ -230,6 +230,67 @@ func TestCreateProfileFallsBackToInstallForProtectedLegacyPaths(t *testing.T) {
 	}
 }
 
+func TestSyncConfigProfilesMigratesLegacyDockerAccessModeBeforeSync(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(profilesDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll profiles returned error: %v", err)
+	}
+
+	cfgPath := filepath.Join(root, "config.yaml")
+	profilePath := filepath.Join(profilesDir, "example-org-swift.yaml")
+	if err := os.WriteFile(cfgPath, []byte("paths:\n  profiles_dir: "+profilesDir+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+	if err := os.WriteFile(profilePath, []byte(`
+name: example-org-swift
+target:
+  scope: organization
+  org: Example Org
+runner_group:
+  name: example-org-swift
+  create: true
+  visibility: private
+service:
+  name: gha-example-org-swift.service
+runner:
+  environment: swift
+  name_prefix: example-org-swift
+docker:
+  image: runner:latest
+  container_name_prefix: gha-example-org-swift
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+loop:
+  state_file: /tmp/example-org-swift.json
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile profile returned error: %v", err)
+	}
+
+	github := &syncGitHub{}
+	manager := NewRunnerManager(
+		cfgPath,
+		systemd.NewClient(&recordingRunner{}),
+		docker.NewClient(command.OSRunner{}),
+		gh.NewClient("", "", "", nil, nil),
+	)
+	manager.GitHubAdmin = github
+
+	if err := manager.SyncConfigProfiles(context.Background()); err != nil {
+		t.Fatalf("SyncConfigProfiles returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatalf("ReadFile profile returned error: %v", err)
+	}
+	if !strings.Contains(string(data), "access_mode: host-socket") {
+		t.Fatalf("expected migrated access_mode before sync, got:\n%s", string(data))
+	}
+}
+
 func TestRestartLoopKillsRunningContainerBeforeRestartingService(t *testing.T) {
 	t.Parallel()
 
@@ -445,7 +506,11 @@ func TestCreateProfileDerivesOrganizationEnvironmentProfile(t *testing.T) {
 	stateDir := filepath.Join(root, "state")
 	logDir := filepath.Join(root, "logs")
 	systemdDir := filepath.Join(root, "systemd")
+	socketPath := filepath.Join(root, "docker.sock")
 	cfgPath := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(socketPath, []byte("socket"), 0o600); err != nil {
+		t.Fatalf("WriteFile socket returned error: %v", err)
+	}
 
 	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
 github:
@@ -456,7 +521,9 @@ paths:
   log_dir: %s
 systemd:
   loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui
-`, profilesDir, stateDir, logDir)), 0o600); err != nil {
+docker:
+  rootless_socket_path: %s
+`, profilesDir, stateDir, logDir, socketPath)), 0o600); err != nil {
 		t.Fatalf("WriteFile config returned error: %v", err)
 	}
 
@@ -497,6 +564,8 @@ systemd:
 		"visibility: private",
 		"environment: swift",
 		"container_name_prefix: gha-example-org-swift",
+		"access_mode: rootless",
+		socketPath + ":/var/run/docker.sock",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected %q in profile:\n%s", want, text)
@@ -515,6 +584,256 @@ systemd:
 		if !strings.Contains(string(serviceData), want) {
 			t.Fatalf("expected %q in service:\n%s", want, string(serviceData))
 		}
+	}
+}
+
+func TestCreateProfileDefaultsToRootlessAccessMode(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	stateDir := filepath.Join(root, "state")
+	logDir := filepath.Join(root, "logs")
+	systemdDir := filepath.Join(root, "systemd")
+	socketPath := filepath.Join(root, "docker.sock")
+	cfgPath := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(socketPath, []byte("socket"), 0o600); err != nil {
+		t.Fatalf("WriteFile socket returned error: %v", err)
+	}
+
+	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+github:
+  env_file: /etc/gha-runner-tui/github.env
+paths:
+  profiles_dir: %s
+  state_dir: %s
+  log_dir: %s
+systemd:
+  loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui
+docker:
+  rootless_socket_path: %s
+`, profilesDir, stateDir, logDir, socketPath)), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+
+	runner := &recordingRunner{}
+	manager := NewRunnerManager(
+		cfgPath,
+		systemd.NewClient(runner),
+		docker.NewClient(command.OSRunner{}),
+		gh.NewClient("", "", "", nil, nil),
+	)
+	manager.SystemdUnitDir = systemdDir
+	manager.LegacyTokenFile = filepath.Join(root, "missing-token")
+
+	err := manager.CreateProfile(context.Background(), CreateProfileInput{
+		Name:                "remind-me-swift",
+		RepoOwner:           "bigtomcat6",
+		RepoName:            "remind-me",
+		RunnerLabels:        []string{"self-hosted", "linux", "x64", "docker"},
+		DockerImage:         "gha-runner-base:latest",
+		ServiceName:         "gha-remind-me-swift.service",
+		ContainerNamePrefix: "gha-remind-me-swift",
+		CPUs:                "2",
+		Memory:              "4g",
+		Ephemeral:           true,
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(profilesDir, "remind-me-swift.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile profile returned error: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"access_mode: rootless",
+		socketPath + ":/var/run/docker.sock",
+		"DOCKER_HOST: unix:///var/run/docker.sock",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in profile:\n%s", want, text)
+		}
+	}
+}
+
+func TestCreateProfileAutoDetectsUniqueRootlessSocket(t *testing.T) {
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	stateDir := filepath.Join(root, "state")
+	logDir := filepath.Join(root, "logs")
+	systemdDir := filepath.Join(root, "systemd")
+	socketPath := filepath.Join(root, "detected.sock")
+	cfgPath := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(socketPath, []byte("socket"), 0o600); err != nil {
+		t.Fatalf("WriteFile socket returned error: %v", err)
+	}
+	t.Setenv("DOCKER_HOST", "unix://"+socketPath)
+
+	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+paths:
+  profiles_dir: %s
+  state_dir: %s
+  log_dir: %s
+systemd:
+  loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui
+docker:
+  auto_detect_rootless_socket: true
+`, profilesDir, stateDir, logDir)), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+
+	runner := &recordingRunner{}
+	manager := NewRunnerManager(
+		cfgPath,
+		systemd.NewClient(runner),
+		docker.NewClient(command.OSRunner{}),
+		gh.NewClient("", "", "", nil, nil),
+	)
+	manager.SystemdUnitDir = systemdDir
+	manager.LegacyTokenFile = filepath.Join(root, "missing-token")
+
+	err := manager.CreateProfile(context.Background(), CreateProfileInput{
+		Name:                "remind-me-swift",
+		RepoOwner:           "bigtomcat6",
+		RepoName:            "remind-me",
+		RunnerLabels:        []string{"self-hosted", "linux", "x64", "docker"},
+		DockerImage:         "gha-runner-base:latest",
+		ServiceName:         "gha-remind-me-swift.service",
+		ContainerNamePrefix: "gha-remind-me-swift",
+		CPUs:                "2",
+		Memory:              "4g",
+		Ephemeral:           true,
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(profilesDir, "remind-me-swift.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile profile returned error: %v", err)
+	}
+	if !strings.Contains(string(data), socketPath+":/var/run/docker.sock") {
+		t.Fatalf("expected auto-detected socket in profile:\n%s", string(data))
+	}
+}
+
+func TestCreateProfileAllowsExplicitHostSocketOptIn(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	stateDir := filepath.Join(root, "state")
+	logDir := filepath.Join(root, "logs")
+	systemdDir := filepath.Join(root, "systemd")
+	cfgPath := filepath.Join(root, "config.yaml")
+
+	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+paths:
+  profiles_dir: %s
+  state_dir: %s
+  log_dir: %s
+systemd:
+  loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui
+docker:
+  allow_host_socket_opt_in: true
+`, profilesDir, stateDir, logDir)), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+
+	runner := &recordingRunner{}
+	manager := NewRunnerManager(
+		cfgPath,
+		systemd.NewClient(runner),
+		docker.NewClient(command.OSRunner{}),
+		gh.NewClient("", "", "", nil, nil),
+	)
+	manager.SystemdUnitDir = systemdDir
+	manager.LegacyTokenFile = filepath.Join(root, "missing-token")
+
+	err := manager.CreateProfile(context.Background(), CreateProfileInput{
+		DockerAccess:        "host-socket",
+		Name:                "remind-me-swift",
+		RepoOwner:           "bigtomcat6",
+		RepoName:            "remind-me",
+		RunnerLabels:        []string{"self-hosted", "linux", "x64", "docker"},
+		DockerImage:         "gha-runner-base:latest",
+		ServiceName:         "gha-remind-me-swift.service",
+		ContainerNamePrefix: "gha-remind-me-swift",
+		CPUs:                "2",
+		Memory:              "4g",
+		Ephemeral:           true,
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(profilesDir, "remind-me-swift.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile profile returned error: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"access_mode: host-socket",
+		"/var/run/docker.sock:/var/run/docker.sock",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in profile:\n%s", want, text)
+		}
+	}
+}
+
+func TestCreateProfileRejectsHostSocketWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	stateDir := filepath.Join(root, "state")
+	logDir := filepath.Join(root, "logs")
+	systemdDir := filepath.Join(root, "systemd")
+	cfgPath := filepath.Join(root, "config.yaml")
+
+	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+paths:
+  profiles_dir: %s
+  state_dir: %s
+  log_dir: %s
+systemd:
+  loop_binary_path: /usr/local/bin/gha-ephemeral-loop-tui
+docker:
+  allow_host_socket_opt_in: false
+`, profilesDir, stateDir, logDir)), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+
+	manager := NewRunnerManager(
+		cfgPath,
+		systemd.NewClient(&recordingRunner{}),
+		docker.NewClient(command.OSRunner{}),
+		gh.NewClient("", "", "", nil, nil),
+	)
+	manager.SystemdUnitDir = systemdDir
+	manager.LegacyTokenFile = filepath.Join(root, "missing-token")
+
+	err := manager.CreateProfile(context.Background(), CreateProfileInput{
+		DockerAccess:        "host-socket",
+		Name:                "remind-me-swift",
+		RepoOwner:           "bigtomcat6",
+		RepoName:            "remind-me",
+		RunnerLabels:        []string{"self-hosted", "linux", "x64", "docker"},
+		DockerImage:         "gha-runner-base:latest",
+		ServiceName:         "gha-remind-me-swift.service",
+		ContainerNamePrefix: "gha-remind-me-swift",
+		CPUs:                "2",
+		Memory:              "4g",
+		Ephemeral:           true,
+	})
+	if err == nil {
+		t.Fatal("expected host-socket policy error, got nil")
+	}
+	if !strings.Contains(err.Error(), "host-socket") {
+		t.Fatalf("expected host-socket error, got %v", err)
 	}
 }
 

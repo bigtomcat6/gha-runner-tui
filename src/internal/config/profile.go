@@ -84,6 +84,7 @@ type RunnerConfig struct {
 }
 
 type DockerProfile struct {
+	AccessMode          DockerAccessMode  `yaml:"access_mode,omitempty"`
 	Image               string            `yaml:"image"`
 	ContainerNamePrefix string            `yaml:"container_name_prefix"`
 	CPUs                string            `yaml:"cpus"`
@@ -164,6 +165,46 @@ func LoadProfile(path string) (Profile, error) {
 	return profile, nil
 }
 
+func (p Profile) DockerAccessMode() DockerAccessMode {
+	if p.Docker.AccessMode != "" {
+		return p.Docker.AccessMode
+	}
+
+	hostSocketMatches := 0
+	rootlessSocketMatches := 0
+	for _, volume := range p.Docker.Volumes {
+		hostPath, containerPath, ok := splitVolumeMount(volume)
+		if !ok || containerPath != "/var/run/docker.sock" {
+			continue
+		}
+		switch hostPath {
+		case "/var/run/docker.sock":
+			hostSocketMatches++
+		case "":
+			continue
+		default:
+			rootlessSocketMatches++
+		}
+	}
+
+	switch {
+	case hostSocketMatches == 1 && rootlessSocketMatches == 0:
+		return DockerAccessModeHostSocket
+	case hostSocketMatches == 0 && rootlessSocketMatches == 1 && p.Docker.Env["DOCKER_HOST"] == "unix:///var/run/docker.sock":
+		return DockerAccessModeRootless
+	default:
+		return ""
+	}
+}
+
+func (p Profile) HasHostDockerSocket() bool {
+	return p.DockerAccessMode() == DockerAccessModeHostSocket
+}
+
+func (p Profile) HasRootlessDockerSocket() bool {
+	return p.DockerAccessMode() == DockerAccessModeRootless
+}
+
 func (p Profile) Validate() error {
 	target, err := p.ResolveTarget()
 	if err != nil {
@@ -191,6 +232,14 @@ func (p Profile) Validate() error {
 	}
 
 	return nil
+}
+
+func splitVolumeMount(value string) (hostPath, containerPath string, ok bool) {
+	parts := strings.Split(value, ":")
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), true
 }
 
 func (p Profile) ResolveTarget() (ResolvedTarget, error) {

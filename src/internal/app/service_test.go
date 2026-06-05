@@ -327,3 +327,123 @@ loop:
 		t.Fatal("expected GitHub runner match")
 	}
 }
+
+func TestLoadDashboardMigratesLegacyDockerAccessMode(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(profilesDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll profiles returned error: %v", err)
+	}
+
+	cfgPath := filepath.Join(root, "config.yaml")
+	profilePath := filepath.Join(profilesDir, "legacy.yaml")
+	if err := os.WriteFile(cfgPath, []byte("paths:\n  profiles_dir: "+profilesDir+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+	if err := os.WriteFile(profilePath, []byte(`
+name: legacy
+repo:
+  owner: example
+  name: repo
+service:
+  name: gha-legacy.service
+runner:
+  name_prefix: legacy
+docker:
+  image: runner:latest
+  container_name_prefix: gha-legacy
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+loop:
+  state_file: /tmp/legacy.json
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile profile returned error: %v", err)
+	}
+
+	service := Service{
+		ConfigPath: cfgPath,
+		Systemd:    fakeSystemd{status: systemdpkg.ServiceStatus{Active: state.SystemdInactive}},
+		Docker:     fakeDocker{container: dockerpkg.ContainerInfo{State: state.ContainerNone}},
+		GitHub:     &fakeGitHub{},
+	}
+
+	dashboard, err := service.LoadDashboard(context.Background())
+	if err != nil {
+		t.Fatalf("LoadDashboard returned error: %v", err)
+	}
+	if len(dashboard.Profiles) != 1 {
+		t.Fatalf("expected 1 profile, got %d", len(dashboard.Profiles))
+	}
+	if len(dashboard.MigrationWarnings) != 0 {
+		t.Fatalf("expected no migration warnings, got %v", dashboard.MigrationWarnings)
+	}
+
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatalf("ReadFile profile returned error: %v", err)
+	}
+	if !strings.Contains(string(data), "access_mode: host-socket") {
+		t.Fatalf("expected migrated access_mode, got:\n%s", string(data))
+	}
+}
+
+func TestLoadDashboardReportsMigrationWarningsForAmbiguousProfiles(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	profilesDir := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(profilesDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll profiles returned error: %v", err)
+	}
+
+	cfgPath := filepath.Join(root, "config.yaml")
+	profilePath := filepath.Join(profilesDir, "legacy.yaml")
+	if err := os.WriteFile(cfgPath, []byte("paths:\n  profiles_dir: "+profilesDir+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+	if err := os.WriteFile(profilePath, []byte(`
+name: legacy
+repo:
+  owner: example
+  name: repo
+service:
+  name: gha-legacy.service
+runner:
+  name_prefix: legacy
+docker:
+  image: runner:latest
+  container_name_prefix: gha-legacy
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    - /run/user/1001/docker.sock:/var/run/docker.sock
+  env:
+    DOCKER_HOST: unix:///var/run/docker.sock
+loop:
+  state_file: /tmp/legacy.json
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile profile returned error: %v", err)
+	}
+
+	service := Service{
+		ConfigPath: cfgPath,
+		Systemd:    fakeSystemd{status: systemdpkg.ServiceStatus{Active: state.SystemdInactive}},
+		Docker:     fakeDocker{container: dockerpkg.ContainerInfo{State: state.ContainerNone}},
+		GitHub:     &fakeGitHub{},
+	}
+
+	dashboard, err := service.LoadDashboard(context.Background())
+	if err != nil {
+		t.Fatalf("LoadDashboard returned error: %v", err)
+	}
+	if len(dashboard.Profiles) != 1 {
+		t.Fatalf("expected 1 profile, got %d", len(dashboard.Profiles))
+	}
+	if len(dashboard.MigrationWarnings) != 1 {
+		t.Fatalf("expected 1 migration warning, got %v", dashboard.MigrationWarnings)
+	}
+	if !strings.Contains(dashboard.MigrationWarnings[0], "ambiguous") {
+		t.Fatalf("expected ambiguous migration warning, got %v", dashboard.MigrationWarnings)
+	}
+}

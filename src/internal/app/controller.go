@@ -50,6 +50,7 @@ type CreateProfileInput struct {
 	Scope               config.TargetScope
 	Org                 string
 	Environment         string
+	DockerAccess        string
 	Name                string
 	RepoOwner           string
 	RepoName            string
@@ -60,6 +61,12 @@ type CreateProfileInput struct {
 	CPUs                string
 	Memory              string
 	Ephemeral           bool
+}
+
+type resolvedDockerAccess struct {
+	Mode    config.DockerAccessMode
+	Volumes []string
+	Env     map[string]string
 }
 
 func NewRunnerManager(configPath string, systemd systemdpkg.Client, docker dockerpkg.Client, github gh.Client) RunnerManager {
@@ -127,6 +134,9 @@ func (m RunnerManager) SyncRunnerGroup(ctx context.Context, profile config.Profi
 }
 
 func (m RunnerManager) SyncProfilePath(ctx context.Context, profilePath string) error {
+	if _, err := config.MigrateProfileAccessMode(profilePath); err != nil {
+		return err
+	}
 	profile, err := config.LoadProfile(profilePath)
 	if err != nil {
 		return err
@@ -137,6 +147,10 @@ func (m RunnerManager) SyncProfilePath(ctx context.Context, profilePath string) 
 func (m RunnerManager) SyncConfigProfiles(ctx context.Context) error {
 	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
 	if err != nil {
+		return err
+	}
+
+	if _, err := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir); err != nil {
 		return err
 	}
 
@@ -336,6 +350,11 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		return err
 	}
 
+	dockerAccess, err := resolveDockerAccessForCreate(cfg, input.DockerAccess)
+	if err != nil {
+		return err
+	}
+
 	profile := config.Profile{
 		Name: input.Name,
 		Repo: config.RepoConfig{
@@ -352,15 +371,14 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 			Labels:     input.RunnerLabels,
 		},
 		Docker: config.DockerProfile{
+			AccessMode:          dockerAccess.Mode,
 			Image:               input.DockerImage,
 			ContainerNamePrefix: input.ContainerNamePrefix,
 			CPUs:                input.CPUs,
 			Memory:              input.Memory,
 			RemoveAfterExit:     true,
-			Volumes:             []string{"/var/run/docker.sock:/var/run/docker.sock"},
-			Env: map[string]string{
-				"RUNNER_ALLOW_RUNASROOT": "1",
-			},
+			Volumes:             dockerAccess.Volumes,
+			Env:                 dockerAccess.Env,
 		},
 		Loop: config.LoopConfig{
 			IntervalSeconds:   5,
@@ -426,6 +444,11 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 
+	dockerAccess, err := resolveDockerAccessForCreate(cfg, input.DockerAccess)
+	if err != nil {
+		return err
+	}
+
 	names, err := config.DeriveOrganizationEnvironmentNames(input.Org, input.Environment, cfg.Paths.StateDir, cfg.Paths.LogDir)
 	if err != nil {
 		return err
@@ -453,15 +476,14 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 			Labels:      input.RunnerLabels,
 		},
 		Docker: config.DockerProfile{
+			AccessMode:          dockerAccess.Mode,
 			Image:               input.DockerImage,
 			ContainerNamePrefix: names.ContainerNamePrefix,
 			CPUs:                input.CPUs,
 			Memory:              input.Memory,
 			RemoveAfterExit:     true,
-			Volumes:             []string{"/var/run/docker.sock:/var/run/docker.sock"},
-			Env: map[string]string{
-				"RUNNER_ALLOW_RUNASROOT": "1",
-			},
+			Volumes:             dockerAccess.Volumes,
+			Env:                 dockerAccess.Env,
 		},
 		Loop: config.LoopConfig{
 			IntervalSeconds:   5,
@@ -519,6 +541,101 @@ func (m RunnerManager) createOrganizationProfile(ctx context.Context, input Crea
 		return err
 	}
 	return m.Systemd.Start(ctx, profile.Service.Name)
+}
+
+func resolveDockerAccessForCreate(cfg config.GlobalConfig, requested string) (resolvedDockerAccess, error) {
+	mode := strings.TrimSpace(requested)
+	if mode == "" || mode == "default" {
+		mode = string(cfg.Docker.DefaultAccessMode)
+	}
+
+	containerSocketPath := "/var/run/docker.sock"
+	switch config.DockerAccessMode(mode) {
+	case config.DockerAccessModeRootless:
+		socketPath := strings.TrimSpace(cfg.Docker.RootlessSocketPath)
+		if socketPath == "" && cfg.Docker.AutoDetectRootlessSocket {
+			var err error
+			socketPath, err = detectRootlessSocket()
+			if err != nil {
+				return resolvedDockerAccess{}, fmt.Errorf("rootless Docker is required for this profile, but no rootless socket is configured or detectable; set docker.rootless_socket_path in config.yaml or choose host-socket explicitly: %w", err)
+			}
+		}
+		if socketPath == "" {
+			return resolvedDockerAccess{}, errors.New("rootless Docker is required for this profile, but no rootless socket is configured or detectable; set docker.rootless_socket_path in config.yaml or choose host-socket explicitly")
+		}
+		if !pathExists(socketPath) {
+			return resolvedDockerAccess{}, fmt.Errorf("configured rootless Docker socket does not exist: %s", socketPath)
+		}
+		return resolvedDockerAccess{
+			Mode:    config.DockerAccessModeRootless,
+			Volumes: []string{socketPath + ":" + containerSocketPath},
+			Env: map[string]string{
+				"DOCKER_HOST":            "unix://" + containerSocketPath,
+				"RUNNER_ALLOW_RUNASROOT": "1",
+			},
+		}, nil
+	case config.DockerAccessModeHostSocket:
+		if !cfg.Docker.AllowHostSocketOptIn {
+			return resolvedDockerAccess{}, errors.New("host-socket Docker access is disabled by configuration")
+		}
+		hostSocketPath := strings.TrimSpace(cfg.Docker.HostSocketPath)
+		if hostSocketPath == "" {
+			hostSocketPath = "/var/run/docker.sock"
+		}
+		return resolvedDockerAccess{
+			Mode:    config.DockerAccessModeHostSocket,
+			Volumes: []string{hostSocketPath + ":" + containerSocketPath},
+			Env: map[string]string{
+				"DOCKER_HOST":            "unix://" + containerSocketPath,
+				"RUNNER_ALLOW_RUNASROOT": "1",
+			},
+		}, nil
+	default:
+		return resolvedDockerAccess{}, fmt.Errorf("unsupported docker access mode %q", requested)
+	}
+}
+
+func detectRootlessSocket() (string, error) {
+	candidates := make([]string, 0, 2)
+	if dockerHost := strings.TrimSpace(os.Getenv("DOCKER_HOST")); strings.HasPrefix(dockerHost, "unix://") {
+		socketPath := strings.TrimPrefix(dockerHost, "unix://")
+		if pathExists(socketPath) {
+			candidates = append(candidates, socketPath)
+		}
+	}
+
+	paths, err := filepath.Glob("/run/user/*/docker.sock")
+	if err != nil {
+		return "", err
+	}
+	for _, path := range paths {
+		if pathExists(path) && !containsString(candidates, path) {
+			candidates = append(candidates, path)
+		}
+	}
+
+	switch len(candidates) {
+	case 1:
+		return candidates[0], nil
+	case 0:
+		return "", errors.New("no usable rootless Docker socket found")
+	default:
+		return "", fmt.Errorf("multiple rootless Docker sockets detected: %s", strings.Join(candidates, ", "))
+	}
+}
+
+func pathExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (m RunnerManager) shouldUseLegacyCreate() bool {
