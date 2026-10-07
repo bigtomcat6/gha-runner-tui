@@ -13,16 +13,17 @@ import (
 )
 
 type Profile struct {
-	Name        string            `yaml:"name"`
-	Target      TargetConfig      `yaml:"target,omitempty"`
-	Repo        RepoConfig        `yaml:"repo,omitempty"`
-	GitHub      GitHubProfile     `yaml:"github,omitempty"`
-	Service     ServiceConfig     `yaml:"service"`
-	RunnerGroup RunnerGroupConfig `yaml:"runner_group,omitempty"`
-	Runner      RunnerConfig      `yaml:"runner"`
-	Docker      DockerProfile     `yaml:"docker"`
-	Loop        LoopConfig        `yaml:"loop"`
-	Source      string            `yaml:"-"`
+	Scheduler   ProfileSchedulerConfig `yaml:"scheduler" json:"scheduler"`
+	Name        string                 `yaml:"name"`
+	Target      TargetConfig           `yaml:"target,omitempty"`
+	Repo        RepoConfig             `yaml:"repo,omitempty"`
+	GitHub      GitHubProfile          `yaml:"github,omitempty"`
+	Service     ServiceConfig          `yaml:"service"`
+	RunnerGroup RunnerGroupConfig      `yaml:"runner_group,omitempty"`
+	Runner      RunnerConfig           `yaml:"runner"`
+	Docker      DockerProfile          `yaml:"docker"`
+	Loop        LoopConfig             `yaml:"loop"`
+	Source      string                 `yaml:"-"`
 }
 
 type RepoConfig struct {
@@ -31,9 +32,11 @@ type RepoConfig struct {
 }
 
 type GitHubProfile struct {
-	TokenEnv  string `yaml:"token_env,omitempty"`
-	EnvFile   string `yaml:"env_file,omitempty"`
-	TokenFile string `yaml:"token_file,omitempty"`
+	CredentialID  string `yaml:"credential_id,omitempty" json:"credential_id,omitempty"`
+	ResourceOwner string `yaml:"resource_owner,omitempty" json:"resource_owner,omitempty"`
+	TokenEnv      string `yaml:"token_env,omitempty"`
+	EnvFile       string `yaml:"env_file,omitempty"`
+	TokenFile     string `yaml:"token_file,omitempty"`
 }
 
 type TargetScope string
@@ -62,11 +65,11 @@ type RunnerGroupConfig struct {
 }
 
 type ResolvedTarget struct {
-	Scope   TargetScope
-	Owner   string
-	Repo    string
-	Org     string
-	OrgSlug string
+	Scope   TargetScope `yaml:"scope" json:"scope"`
+	Owner   string      `yaml:"owner" json:"owner"`
+	Repo    string      `yaml:"repo" json:"repo"`
+	Org     string      `yaml:"org" json:"org"`
+	OrgSlug string      `yaml:"org_slug" json:"org_slug"`
 }
 
 type DerivedOrganizationNames struct {

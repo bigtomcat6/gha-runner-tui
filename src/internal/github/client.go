@@ -1,17 +1,16 @@
 package github
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"strings"
+	"time"
 
 	"gha-runner-tui/internal/command"
+	"gha-runner-tui/internal/config"
 	"gha-runner-tui/internal/state"
 )
 
@@ -22,14 +21,17 @@ type HTTPDoer interface {
 }
 
 type Client struct {
-	baseURL   string
-	tokenEnv  string
-	tokenFile string
-	runner    command.Runner
-	http      HTTPDoer
+	observations *observationState
+	transport    *transport
+	initErr      error
+	legacy       bool
+	baseURL      string
+	tokenEnv     string
+	tokenFile    string
 }
 
 type Runner struct {
+	Labels        []string
 	ID            int64
 	Name          string
 	Status        state.GitHubStatus
@@ -42,9 +44,14 @@ type RunnerGroup struct {
 	Name                     string
 	Visibility               string
 	AllowsPublicRepositories bool
+	RestrictedToWorkflows    bool
+	SelectedWorkflows        []string
 }
 
 type rawRunner struct {
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
 	ID            int64  `json:"id"`
 	Name          string `json:"name"`
 	Status        string `json:"status"`
@@ -53,42 +60,21 @@ type rawRunner struct {
 }
 
 func NewClient(baseURL, tokenEnv, tokenFile string, runner command.Runner, httpClient HTTPDoer) Client {
-	if baseURL == "" {
-		baseURL = "https://api.github.com"
-	}
-	if tokenEnv == "" {
+	if tokenEnv == "" && tokenFile == "" {
 		tokenEnv = "GITHUB_TOKEN"
 	}
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	return Client{
-		baseURL:   strings.TrimRight(baseURL, "/"),
-		tokenEnv:  tokenEnv,
-		tokenFile: tokenFile,
-		runner:    runner,
-		http:      httpClient,
-	}
+	// Keep the old constructor signature, not its sudo/cat credential fallback.
+	c, err := NewScopedClient(baseURL, config.CredentialRef{ID: "legacy", ResourceOwner: "legacy", TokenEnv: tokenEnv, TokenFile: tokenFile}, CredentialIO{}, httpClient, nil, nil)
+	c.initErr, c.legacy, c.tokenEnv, c.tokenFile = err, true, tokenEnv, tokenFile
+	return c
 }
 
 func (c Client) ListRepoRunners(ctx context.Context, owner, repo string) ([]Runner, error) {
-	var payload struct {
-		Runners []rawRunner `json:"runners"`
-	}
-	if err := c.requestJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/actions/runners", owner, repo), nil, &payload); err != nil {
-		return nil, err
-	}
-	return mapRunners(payload.Runners), nil
+	return c.listRunners(ctx, fmt.Sprintf("/repos/%s/%s/actions/runners", owner, repo))
 }
 
 func (c Client) ListOrgRunners(ctx context.Context, org string) ([]Runner, error) {
-	var payload struct {
-		Runners []rawRunner `json:"runners"`
-	}
-	if err := c.requestJSON(ctx, http.MethodGet, fmt.Sprintf("/orgs/%s/actions/runners", org), nil, &payload); err != nil {
-		return nil, err
-	}
-	return mapRunners(payload.Runners), nil
+	return c.listRunners(ctx, fmt.Sprintf("/orgs/%s/actions/runners", org))
 }
 
 func (c Client) DeleteRunner(ctx context.Context, owner, repo string, id int64) error {
@@ -96,35 +82,58 @@ func (c Client) DeleteRunner(ctx context.Context, owner, repo string, id int64) 
 }
 
 func (c Client) CreateRegistrationToken(ctx context.Context, owner, repo string) (string, error) {
-	var payload struct {
-		Token string `json:"token"`
-	}
-	err := c.requestJSON(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/actions/runners/registration-token", owner, repo), map[string]any{}, &payload)
-	return payload.Token, err
+	return c.legacyToken(ctx, fmt.Sprintf("/repos/%s/%s/actions/runners/registration-token", owner, repo))
 }
 
 func (c Client) CreateRemoveToken(ctx context.Context, owner, repo string) (string, error) {
-	var payload struct {
-		Token string `json:"token"`
-	}
-	err := c.requestJSON(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/actions/runners/remove-token", owner, repo), map[string]any{}, &payload)
-	return payload.Token, err
+	return c.legacyToken(ctx, fmt.Sprintf("/repos/%s/%s/actions/runners/remove-token", owner, repo))
 }
 
 func (c Client) CreateOrgRegistrationToken(ctx context.Context, org string) (string, error) {
-	var payload struct {
-		Token string `json:"token"`
-	}
-	err := c.requestJSON(ctx, http.MethodPost, fmt.Sprintf("/orgs/%s/actions/runners/registration-token", org), map[string]any{}, &payload)
-	return payload.Token, err
+	return c.legacyToken(ctx, fmt.Sprintf("/orgs/%s/actions/runners/registration-token", org))
 }
 
 func (c Client) CreateOrgRemoveToken(ctx context.Context, org string) (string, error) {
-	var payload struct {
-		Token string `json:"token"`
+	return c.legacyToken(ctx, fmt.Sprintf("/orgs/%s/actions/runners/remove-token", org))
+}
+
+// CreateScopedRegistrationToken is the expiry-bearing host API. Legacy callers
+// retain their string-returning signatures but use the same validated decoder.
+func (c Client) CreateScopedRegistrationToken(ctx context.Context, target config.ResolvedTarget) (RegistrationToken, error) {
+	if target.Scope == config.TargetScopeOrganization {
+		return c.registrationToken(ctx, fmt.Sprintf("/orgs/%s/actions/runners/registration-token", target.OrgSlug))
 	}
-	err := c.requestJSON(ctx, http.MethodPost, fmt.Sprintf("/orgs/%s/actions/runners/remove-token", org), map[string]any{}, &payload)
-	return payload.Token, err
+	if target.Scope != config.TargetScopeRepository {
+		return RegistrationToken{}, errors.New("invalid registration target")
+	}
+	return c.registrationToken(ctx, fmt.Sprintf("/repos/%s/%s/actions/runners/registration-token", target.Owner, target.Repo))
+}
+
+func (c Client) legacyToken(ctx context.Context, path string) (string, error) {
+	token, err := c.registrationToken(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	defer token.Clear()
+	data := token.Bytes()
+	defer clear(data)
+	return string(data), nil
+}
+
+func (c Client) registrationToken(ctx context.Context, path string) (RegistrationToken, error) {
+	var payload struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := c.requestJSON(ctx, http.MethodPost, path, map[string]any{}, &payload); err != nil {
+		return RegistrationToken{}, err
+	}
+	if c.transport == nil || !payload.ExpiresAt.After(c.transport.now()) {
+		return RegistrationToken{}, errors.New("invalid registration token expiry")
+	}
+	value := []byte(payload.Token)
+	defer clear(value)
+	return NewRegistrationToken(value, payload.ExpiresAt)
 }
 
 func (c Client) DeleteOrgRunner(ctx context.Context, org string, id int64) error {
@@ -132,38 +141,34 @@ func (c Client) DeleteOrgRunner(ctx context.Context, org string, id int64) error
 }
 
 func (c Client) ListOrgRunnerGroups(ctx context.Context, org string) ([]RunnerGroup, error) {
-	var payload struct {
-		RunnerGroups []struct {
-			ID                       int64  `json:"id"`
-			Name                     string `json:"name"`
-			Visibility               string `json:"visibility"`
-			AllowsPublicRepositories bool   `json:"allows_public_repositories"`
-		} `json:"runner_groups"`
-	}
-	if err := c.requestJSON(ctx, http.MethodGet, fmt.Sprintf("/orgs/%s/actions/runner-groups", org), nil, &payload); err != nil {
+	raw, err := listPages[rawGroup](ctx, c, fmt.Sprintf("/orgs/%s/actions/runner-groups", org), "runner_groups", false)
+	if err != nil {
 		return nil, err
 	}
-
-	groups := make([]RunnerGroup, 0, len(payload.RunnerGroups))
-	for _, group := range payload.RunnerGroups {
+	groups := make([]RunnerGroup, 0, len(raw))
+	for _, group := range raw {
 		groups = append(groups, RunnerGroup{
 			ID:                       group.ID,
 			Name:                     group.Name,
 			Visibility:               group.Visibility,
-			AllowsPublicRepositories: group.AllowsPublicRepositories,
+			AllowsPublicRepositories: group.AllowsPublicRepositories != nil && *group.AllowsPublicRepositories,
+			RestrictedToWorkflows:    group.RestrictedToWorkflows != nil && *group.RestrictedToWorkflows,
+			SelectedWorkflows:        append([]string(nil), group.SelectedWorkflows...),
 		})
 	}
 	return groups, nil
 }
 
 func (c Client) ListOrgRunnerGroupRunners(ctx context.Context, org string, id int64) ([]Runner, error) {
-	var payload struct {
-		Runners []rawRunner `json:"runners"`
-	}
-	if err := c.requestJSON(ctx, http.MethodGet, fmt.Sprintf("/orgs/%s/actions/runner-groups/%d/runners", org, id), nil, &payload); err != nil {
+	return c.listRunners(ctx, fmt.Sprintf("/orgs/%s/actions/runner-groups/%d/runners", org, id))
+}
+
+func (c Client) listRunners(ctx context.Context, path string) ([]Runner, error) {
+	raw, err := listPages[rawRunner](ctx, c, path, "runners", false)
+	if err != nil {
 		return nil, err
 	}
-	return mapRunners(payload.Runners), nil
+	return mapRunners(raw), nil
 }
 
 func (c Client) CreateOrgRunnerGroup(ctx context.Context, org, name, visibility string) (RunnerGroup, error) {
@@ -248,7 +253,12 @@ func RunnerState(runner *Runner) state.GitHubStatus {
 func mapRunners(raw []rawRunner) []Runner {
 	runners := make([]Runner, 0, len(raw))
 	for _, runner := range raw {
+		labels := make([]string, 0, len(runner.Labels))
+		for _, label := range runner.Labels {
+			labels = append(labels, label.Name)
+		}
 		runners = append(runners, Runner{
+			Labels:        labels,
 			ID:            runner.ID,
 			Name:          runner.Name,
 			Status:        state.NormalizeGitHubStatus(strings.ToLower(runner.Status)),
@@ -260,96 +270,31 @@ func mapRunners(raw []rawRunner) []Runner {
 }
 
 func (c Client) requestJSON(ctx context.Context, method, path string, body any, out any) error {
-	token, err := c.resolveToken(ctx)
-	if err != nil {
-		return err
-	}
+	return c.requestJSONLinked(ctx, method, path, body, out, nil)
+}
 
-	var reader io.Reader
-	if body != nil {
-		buf := bytes.NewBuffer(nil)
-		if err := json.NewEncoder(buf).Encode(body); err != nil {
+func (c Client) requestJSONLinked(ctx context.Context, method, path string, body any, out any, link *string) error {
+	if c.initErr != nil {
+		return c.initErr
+	}
+	if c.transport == nil {
+		return ErrMissingToken
+	}
+	if c.legacy {
+		if err := c.CheckCurrent(c.transport.ref, CredentialIO{}); err != nil {
 			return err
 		}
-		reader = buf
 	}
-
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	data, err := c.transport.requestLinked(ctx, method, path, body, link)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("github api %s %s returned %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
-	}
-
+	defer clear(data)
 	if out == nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-
-	return json.NewDecoder(resp.Body).Decode(out)
-}
-
-func (c Client) resolveToken(ctx context.Context) (string, error) {
-	if token := strings.TrimSpace(os.Getenv(c.tokenEnv)); token != "" {
-		return token, nil
+	if err := json.Unmarshal(data, out); err != nil {
+		return errors.New("invalid github JSON response")
 	}
-
-	if c.tokenFile == "" {
-		return "", ErrMissingToken
-	}
-	if data, err := os.ReadFile(c.tokenFile); err == nil {
-		if token := c.parseTokenFile(string(data)); token != "" {
-			return token, nil
-		}
-	}
-	if c.runner != nil {
-		out, err := c.runner.Run(ctx, "cat", c.tokenFile)
-		if err == nil {
-			if token := c.parseTokenFile(string(out)); token != "" {
-				return token, nil
-			}
-		}
-	}
-	return "", ErrMissingToken
-}
-
-func (c Client) parseTokenFile(content string) string {
-	trimmed := strings.TrimSpace(content)
-	if trimmed == "" {
-		return ""
-	}
-	if !strings.Contains(trimmed, "\n") && !strings.Contains(trimmed, "=") {
-		return trimmed
-	}
-
-	for _, line := range strings.Split(trimmed, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		line = strings.TrimPrefix(line, "export ")
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		if strings.TrimSpace(key) != c.tokenEnv {
-			continue
-		}
-		return strings.Trim(strings.TrimSpace(value), `"'`)
-	}
-	return ""
+	return nil
 }

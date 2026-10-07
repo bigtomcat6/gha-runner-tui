@@ -153,7 +153,7 @@ func TestCreateOrgRegistrationTokenUsesOrganizationEndpoint(t *testing.T) {
 		},
 		response: &http.Response{
 			StatusCode: http.StatusCreated,
-			Body:       io.NopCloser(strings.NewReader(`{"token":"abc"}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"token":"abc","expires_at":"2099-01-01T00:00:00Z"}`)),
 			Header:     make(http.Header),
 		},
 	})

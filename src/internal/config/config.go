@@ -27,10 +27,11 @@ const (
 )
 
 type GlobalConfig struct {
-	GitHub  GitHubConfig  `yaml:"github"`
-	Paths   PathsConfig   `yaml:"paths"`
-	Systemd SystemdConfig `yaml:"systemd"`
-	Docker  DockerConfig  `yaml:"docker"`
+	Scheduler HostSchedulerConfig `yaml:"scheduler" json:"scheduler"`
+	GitHub    GitHubConfig        `yaml:"github"`
+	Paths     PathsConfig         `yaml:"paths"`
+	Systemd   SystemdConfig       `yaml:"systemd"`
+	Docker    DockerConfig        `yaml:"docker"`
 }
 
 type GitHubConfig struct {
@@ -61,6 +62,7 @@ type DockerConfig struct {
 
 func DefaultGlobalConfig() GlobalConfig {
 	return GlobalConfig{
+		Scheduler: HostSchedulerConfig{Mode: "disabled", PollIntervalSeconds: 20, IdleRunnerTTLSeconds: 180},
 		GitHub: GitHubConfig{
 			TokenEnv:   defaultTokenEnv,
 			EnvFile:    defaultEnvFile,
@@ -108,6 +110,15 @@ func LoadGlobalConfig(path string) (GlobalConfig, error) {
 }
 
 func (c *GlobalConfig) applyDefaults() {
+	if c.Scheduler.Mode == "" {
+		c.Scheduler.Mode = "disabled"
+	}
+	if c.Scheduler.PollIntervalSeconds == 0 {
+		c.Scheduler.PollIntervalSeconds = 20
+	}
+	if c.Scheduler.IdleRunnerTTLSeconds == 0 {
+		c.Scheduler.IdleRunnerTTLSeconds = 180
+	}
 	if c.GitHub.TokenEnv == "" {
 		c.GitHub.TokenEnv = defaultTokenEnv
 	}
