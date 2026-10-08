@@ -13,10 +13,39 @@ jobs:
     steps:
       - name: Observe probe window
         run: |
+          set -eu
           printf 'probe start\n'
           date -u
           uname -s -m
           test -S /var/run/docker.sock
+          command -v docker >/dev/null
+          security_options=$(docker --host unix:///var/run/docker.sock info --format '{{json .SecurityOptions}}')
+          case "$security_options" in
+            *'"name=rootless"'*) ;;
+            *) exit 1 ;;
+          esac
+          printf 'PERSONAL_ROOTLESS_VERIFIED\n'
+          sleep 300
+          printf 'probe end\n'
+          date -u
+  probe-b:
+    runs-on: [self-hosted, linux, x64, personal-gha-tui-serial]
+    timeout-minutes: 6
+    steps:
+      - name: Observe probe window
+        run: |
+          set -eu
+          printf 'probe start\n'
+          date -u
+          uname -s -m
+          test -S /var/run/docker.sock
+          command -v docker >/dev/null
+          security_options=$(docker --host unix:///var/run/docker.sock info --format '{{json .SecurityOptions}}')
+          case "$security_options" in
+            *'"name=rootless"'*) ;;
+            *) exit 1 ;;
+          esac
+          printf 'PERSONAL_ROOTLESS_VERIFIED\n'
           sleep 300
           printf 'probe end\n'
           date -u
