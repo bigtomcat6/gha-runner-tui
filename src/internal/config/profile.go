@@ -84,11 +84,12 @@ type ServiceConfig struct {
 }
 
 type RunnerConfig struct {
-	Ephemeral   bool     `yaml:"ephemeral"`
-	Environment string   `yaml:"environment,omitempty"`
-	NamePrefix  string   `yaml:"name_prefix"`
-	Workdir     string   `yaml:"workdir"`
-	Labels      []string `yaml:"labels"`
+	Ephemeral         bool     `yaml:"ephemeral"`
+	Environment       string   `yaml:"environment,omitempty"`
+	NamePrefix        string   `yaml:"name_prefix"`
+	Workdir           string   `yaml:"workdir"`
+	Labels            []string `yaml:"labels"`
+	WatchRepositories []string `yaml:"watch_repositories,omitempty"`
 }
 
 type DockerProfile struct {
@@ -103,11 +104,13 @@ type DockerProfile struct {
 }
 
 type LoopConfig struct {
-	IntervalSeconds   int    `yaml:"interval_seconds"`
-	BackoffSeconds    int    `yaml:"backoff_seconds"`
-	MaxBackoffSeconds int    `yaml:"max_backoff_seconds"`
-	StateFile         string `yaml:"state_file"`
-	LogDir            string `yaml:"log_dir"`
+	IntervalSeconds     int    `yaml:"interval_seconds"`
+	BackoffSeconds      int    `yaml:"backoff_seconds"`
+	MaxBackoffSeconds   int    `yaml:"max_backoff_seconds"`
+	PollIntervalSeconds int    `yaml:"poll_interval_seconds,omitempty"`
+	IdleTimeoutSeconds  int    `yaml:"idle_timeout_seconds,omitempty"`
+	StateFile           string `yaml:"state_file"`
+	LogDir              string `yaml:"log_dir"`
 }
 
 type ProfileLoadError struct {

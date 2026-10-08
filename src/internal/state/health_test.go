@@ -69,3 +69,58 @@ func TestResolveHealthFailedServiceIsUnhealthy(t *testing.T) {
 		t.Fatalf("expected unhealthy, got %q", health)
 	}
 }
+
+func TestResolveHealthWaitingHostWithNoContainerIsHealthy(t *testing.T) {
+	t.Parallel()
+
+	health := ResolveHealth(HealthInputs{
+		Systemd:      SystemdActive,
+		Loop:         LoopWaitingHost,
+		Container:    ContainerNone,
+		GitHub:       GitHubUnknown,
+		Busy:         BusyNA,
+		StatePresent: true,
+	})
+
+	if health != HealthHealthy {
+		t.Fatalf("expected healthy, got %q", health)
+	}
+}
+
+func TestResolveHealthFailedServiceBeatsWaitingHost(t *testing.T) {
+	t.Parallel()
+
+	health := ResolveHealth(HealthInputs{
+		Systemd:      SystemdFailed,
+		Loop:         LoopWaitingHost,
+		Container:    ContainerNone,
+		GitHub:       GitHubUnknown,
+		Busy:         BusyNA,
+		StatePresent: true,
+	})
+
+	if health != HealthUnhealthy {
+		t.Fatalf("expected unhealthy, got %q", health)
+	}
+}
+
+func TestNormalizeContainerStatus(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]ContainerStatus{
+		"created":    ContainerCreated,
+		"running":    ContainerRunning,
+		"restarting": ContainerRestarting,
+		"paused":     ContainerPaused,
+		"exited":     ContainerExited,
+		"dead":       ContainerDead,
+		"removing":   ContainerRemoving,
+		"":           ContainerNone,
+		"bogus":      ContainerUnknown,
+	}
+	for in, want := range cases {
+		if got := NormalizeContainerStatus(in); got != want {
+			t.Errorf("NormalizeContainerStatus(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,86 @@ import (
 )
 
 var ErrNoCurrentContainer = errors.New("no current container exists for this profile")
+var ErrProfileNotFound = errors.New("profile not found")
+var ErrInvalidCreateInput = errors.New("invalid create input")
+
+func (m RunnerManager) LookupProfile(name string) (config.Profile, error) {
+	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
+	if err != nil {
+		return config.Profile{}, err
+	}
+	service := m.Service
+	if m.SystemdUnitDir != "" {
+		service.LegacyServiceDir = m.SystemdUnitDir
+	}
+	profiles, profileErrors := service.loadProfiles(cfg)
+	for _, profile := range profiles {
+		if profile.Name == name {
+			return profile, nil
+		}
+	}
+	errs := []error{fmt.Errorf("%w: %q", ErrProfileNotFound, name)}
+	for _, profileErr := range profileErrors {
+		errs = append(errs, profileErr)
+	}
+	return config.Profile{}, errors.Join(errs...)
+}
+
+func (m RunnerManager) Migrate(ctx context.Context) ([]config.ProfileMigrationResult, error) {
+	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	results, accessErr := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir)
+	githubResults, githubErr := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{TokenEnv: cfg.GitHub.TokenEnv, EnvFile: cfg.GitHub.EnvFile})
+	results = append(results, githubResults...)
+	errs := []error{accessErr, githubErr}
+	for _, result := range results {
+		if result.Status == config.ProfileMigrationFailed {
+			errs = append(errs, fmt.Errorf("%s: %s", result.Path, result.Message))
+		}
+	}
+	return results, errors.Join(errs...)
+}
+
+func (m RunnerManager) ProfileSlotHolders(ctx context.Context, p config.Profile) ([]dockerpkg.ContainerInfo, error) {
+	if p.Name == "" {
+		return nil, errors.New("profile name is required")
+	}
+	containers, err := m.Docker.ListManaged(ctx, p.Name)
+	if err != nil {
+		return nil, err
+	}
+	holders := make([]dockerpkg.ContainerInfo, 0, len(containers))
+	for _, container := range containers {
+		if container.Profile == p.Name && dockerpkg.OccupiesSlot(container) {
+			holders = append(holders, container)
+		}
+	}
+	return holders, nil
+}
+
+func (m RunnerManager) ForceRemoveProfile(ctx context.Context, p config.Profile) ([]string, error) {
+	holders, err := m.ProfileSlotHolders(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	removed := make([]string, 0, len(holders))
+	for _, container := range holders {
+		target := container.ID
+		if target == "" {
+			target = container.Name
+		}
+		if target == "" {
+			return removed, errors.New("slot holder has no container ID or name")
+		}
+		if err := m.Docker.Remove(ctx, target, true); err != nil {
+			return removed, err
+		}
+		removed = append(removed, target)
+	}
+	return removed, nil
+}
 
 type GitHubAdminClient interface {
 	ListOrgRunnerGroups(ctx context.Context, org string) ([]gh.RunnerGroup, error)
@@ -33,17 +114,15 @@ type GitHubAdminClient interface {
 }
 
 type RunnerManager struct {
-	ConfigPath       string
-	SystemdUnitDir   string
-	LegacyEnvDir     string
-	LegacyTokenFile  string
-	LegacyLoopBinary string
-	Runner           command.Runner
-	Service          Service
-	Systemd          systemdpkg.Client
-	Docker           dockerpkg.Client
-	GitHub           gh.Client
-	GitHubAdmin      GitHubAdminClient
+	ConfigPath     string
+	SystemdUnitDir string
+	Runner         command.Runner
+	Service        Service
+	Systemd        systemdpkg.Client
+	Docker         dockerpkg.Client
+	GitHub         gh.Client
+	GitHubAdmin    GitHubAdminClient
+	openNewFile    func(string, int, os.FileMode) (*os.File, error)
 }
 
 type CreateProfileInput struct {
@@ -61,6 +140,90 @@ type CreateProfileInput struct {
 	CPUs                string
 	Memory              string
 	Ephemeral           bool
+	GitHubEnvFile       string
+	WatchRepositories   []string
+	NoStart             bool
+}
+
+func normalizeCreateInput(cfg config.GlobalConfig, input CreateProfileInput) (CreateProfileInput, error) {
+	if input.GitHubEnvFile == "" {
+		input.GitHubEnvFile = cfg.GitHub.EnvFile
+	}
+	for field, value := range map[string]string{
+		"scope": string(input.Scope), "name": input.Name, "repo.owner": input.RepoOwner, "repo.name": input.RepoName,
+		"org": input.Org, "environment": input.Environment, "docker_access": input.DockerAccess,
+		"docker.image": input.DockerImage, "service.name": input.ServiceName, "docker.container_name_prefix": input.ContainerNamePrefix,
+		"cpus": input.CPUs, "memory": input.Memory, "github.env_file": input.GitHubEnvFile,
+	} {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return input, fmt.Errorf("%w: %s must not contain CR, LF, or NUL", ErrInvalidCreateInput, field)
+		}
+	}
+	for _, values := range [][]string{input.RunnerLabels, input.WatchRepositories} {
+		for _, value := range values {
+			if strings.ContainsAny(value, "\r\n\x00") {
+				return input, fmt.Errorf("%w: labels/watch repositories must not contain CR, LF, or NUL", ErrInvalidCreateInput)
+			}
+		}
+	}
+	for field, value := range map[string]string{"docker.image": input.DockerImage, "cpus": input.CPUs, "memory": input.Memory} {
+		if strings.TrimSpace(value) == "" {
+			return input, fmt.Errorf("%w: %s is required", ErrInvalidCreateInput, field)
+		}
+	}
+	if len(input.RunnerLabels) == 0 {
+		return input, fmt.Errorf("%w: runner labels are required", ErrInvalidCreateInput)
+	}
+	for _, label := range input.RunnerLabels {
+		if strings.TrimSpace(label) == "" {
+			return input, fmt.Errorf("%w: runner labels must not be empty", ErrInvalidCreateInput)
+		}
+	}
+	switch strings.TrimSpace(input.DockerAccess) {
+	case "", "default", string(config.DockerAccessModeRootless), string(config.DockerAccessModeHostSocket):
+	default:
+		return input, fmt.Errorf("%w: unsupported docker access mode %q", ErrInvalidCreateInput, input.DockerAccess)
+	}
+	if input.Scope == "" {
+		input.Scope = config.TargetScopeRepository
+	}
+	var groupName string
+	switch input.Scope {
+	case config.TargetScopeRepository:
+		input.RepoOwner = strings.TrimSpace(input.RepoOwner)
+		input.RepoName = strings.TrimSpace(input.RepoName)
+	case config.TargetScopeOrganization:
+		names, err := config.DeriveOrganizationEnvironmentNames(input.Org, input.Environment, cfg.Paths.StateDir, cfg.Paths.LogDir)
+		if err != nil {
+			return input, fmt.Errorf("%w: %v", ErrInvalidCreateInput, err)
+		}
+		groupName = names.RunnerGroupName
+		if input.Name == "" {
+			input.Name = names.ProfileName
+		}
+	default:
+		return input, fmt.Errorf("%w: unsupported target.scope %q", ErrInvalidCreateInput, input.Scope)
+	}
+	if input.ServiceName == "" {
+		input.ServiceName = "gha-" + input.Name + ".service"
+	}
+	if input.ContainerNamePrefix == "" {
+		input.ContainerNamePrefix = "gha-" + input.Name
+	}
+	// Reuse the existing target and managed-name rules without adding loop-only validation.
+	profile := config.Profile{
+		Name: input.Name, Target: config.TargetConfig{Scope: input.Scope, Org: input.Org},
+		Repo:        config.RepoConfig{Owner: input.RepoOwner, Name: input.RepoName},
+		Service:     config.ServiceConfig{Name: input.ServiceName},
+		Docker:      config.DockerProfile{ContainerNamePrefix: input.ContainerNamePrefix},
+		Runner:      config.RunnerConfig{Environment: input.Environment},
+		RunnerGroup: config.RunnerGroupConfig{Name: groupName},
+	}
+	if err := profile.Validate(); err != nil {
+		return input, fmt.Errorf("%w: %v", ErrInvalidCreateInput, err)
+	}
+	input.Ephemeral = true
+	return input, nil
 }
 
 type resolvedDockerAccess struct {
@@ -74,20 +237,19 @@ func NewRunnerManager(configPath string, systemd systemdpkg.Client, docker docke
 		ConfigPath: configPath,
 		Systemd:    systemd,
 		Docker:     docker,
-		GitHub:     github,
+		GitHubForProfile: func(cfg config.GlobalConfig, p config.Profile) GitHubClient {
+			return github.ForProfile(cfg.GitHub, p.GitHub)
+		},
 	}
 	return RunnerManager{
-		ConfigPath:       configPath,
-		SystemdUnitDir:   "/etc/systemd/system",
-		LegacyEnvDir:     "/etc/gha-runner",
-		LegacyTokenFile:  "/etc/gha-runner/github_pat",
-		LegacyLoopBinary: "/usr/local/bin/gha-ephemeral-loop",
-		Runner:           nil,
-		Service:          service,
-		Systemd:          systemd,
-		Docker:           docker,
-		GitHub:           github,
-		GitHubAdmin:      github,
+		ConfigPath:     configPath,
+		SystemdUnitDir: "/etc/systemd/system",
+		Runner:         nil,
+		Service:        service,
+		Systemd:        systemd,
+		Docker:         docker,
+		GitHub:         github,
+		GitHubAdmin:    github,
 	}
 }
 
@@ -232,16 +394,10 @@ func (m RunnerManager) StartLoop(ctx context.Context, profile config.Profile) er
 }
 
 func (m RunnerManager) StopLoop(ctx context.Context, snapshot ProfileSnapshot) error {
-	if err := m.stopContainerIfRunning(ctx, snapshot); err != nil {
-		return err
-	}
 	return m.Systemd.Stop(ctx, snapshot.Profile.Service.Name)
 }
 
 func (m RunnerManager) RestartLoop(ctx context.Context, snapshot ProfileSnapshot) error {
-	if err := m.stopContainerIfRunning(ctx, snapshot); err != nil {
-		return err
-	}
 	return m.Systemd.Restart(ctx, snapshot.Profile.Service.Name)
 }
 
@@ -250,14 +406,18 @@ func (m RunnerManager) SystemdLogs(ctx context.Context, profile config.Profile, 
 }
 
 func (m RunnerManager) DockerLogs(ctx context.Context, snapshot ProfileSnapshot, tail int, follow bool) (string, error) {
-	container := snapshot.Container.Name
-	if container == "" {
-		container = snapshot.Loop.LastContainerName
+	container, err := m.Service.matchContainer(ctx, snapshot.Profile, snapshot.Loop)
+	if err != nil {
+		return "", err
 	}
-	if container == "" {
+	target := container.Name
+	if target == "" {
+		target = container.ID
+	}
+	if target == "" {
 		return "", ErrNoCurrentContainer
 	}
-	return m.Docker.Logs(ctx, container, tail, follow)
+	return m.Docker.Logs(ctx, target, tail, follow)
 }
 
 func (m RunnerManager) KillContainer(ctx context.Context, snapshot ProfileSnapshot) error {
@@ -284,28 +444,6 @@ func (m RunnerManager) KillContainer(ctx context.Context, snapshot ProfileSnapsh
 
 func (m RunnerManager) CleanupExited(ctx context.Context, profile config.Profile) ([]string, error) {
 	return m.Docker.CleanupExited(ctx, profile.Docker.ContainerNamePrefix)
-}
-
-func (m RunnerManager) stopContainerIfRunning(ctx context.Context, snapshot ProfileSnapshot) error {
-	containers, err := m.runningContainersForSnapshot(ctx, snapshot)
-	if err != nil {
-		return err
-	}
-	if len(containers) > 0 {
-		return m.killContainers(ctx, containers)
-	}
-
-	if snapshot.Container.State != state.ContainerRunning {
-		return nil
-	}
-	container := snapshot.Container.ID
-	if container == "" {
-		container = snapshot.Container.Name
-	}
-	if container == "" {
-		return nil
-	}
-	return m.Docker.Kill(ctx, container)
 }
 
 func (m RunnerManager) runningContainersForSnapshot(ctx context.Context, snapshot ProfileSnapshot) ([]dockerpkg.ContainerInfo, error) {
@@ -352,16 +490,24 @@ func (m RunnerManager) killContainers(ctx context.Context, containers []dockerpk
 	return nil
 }
 
-func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInput) error {
-	if input.Scope == config.TargetScopeOrganization {
-		return m.createOrganizationProfile(ctx, input)
-	}
-
-	if m.shouldUseLegacyCreate() {
-		return m.createLegacyProfile(ctx, input)
-	}
-
+func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInput) (err error) {
+	var created []string
+	defer func() {
+		if err == nil {
+			return
+		}
+		if len(created) > 0 {
+			err = fmt.Errorf("created files retained (%s); resolve these files explicitly before retrying: %w", strings.Join(created, ", "), err)
+		}
+		if errors.Is(err, os.ErrPermission) {
+			err = fmt.Errorf("%w; permission denied; run create with sudo (sudo gha-runner-tui create ...)", err)
+		}
+	}()
 	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
+	if err != nil {
+		return err
+	}
+	input, err = normalizeCreateInput(cfg, input)
 	if err != nil {
 		return err
 	}
@@ -379,7 +525,7 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 		},
 		GitHub: config.GitHubProfile{
 			TokenEnv: cfg.GitHub.TokenEnv,
-			EnvFile:  cfg.GitHub.EnvFile,
+			EnvFile:  input.GitHubEnvFile,
 		},
 		Service: config.ServiceConfig{
 			Name: input.ServiceName,
@@ -401,12 +547,25 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 			Env:                 dockerAccess.Env,
 		},
 		Loop: config.LoopConfig{
-			IntervalSeconds:   5,
-			BackoffSeconds:    30,
-			MaxBackoffSeconds: 300,
-			StateFile:         filepath.Join(cfg.Paths.StateDir, input.Name+".json"),
-			LogDir:            filepath.Join(cfg.Paths.LogDir, input.Name),
+			IntervalSeconds:     5,
+			BackoffSeconds:      30,
+			MaxBackoffSeconds:   300,
+			PollIntervalSeconds: 30,
+			IdleTimeoutSeconds:  180,
+			StateFile:           filepath.Join(cfg.Paths.StateDir, input.Name+".json"),
+			LogDir:              filepath.Join(cfg.Paths.LogDir, input.Name),
 		},
+	}
+	profile.Runner.WatchRepositories = input.WatchRepositories
+	if input.Scope == config.TargetScopeOrganization {
+		names, err := config.DeriveOrganizationEnvironmentNames(input.Org, input.Environment, cfg.Paths.StateDir, cfg.Paths.LogDir)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidCreateInput, err)
+		}
+		profile.Repo = config.RepoConfig{}
+		profile.Target = config.TargetConfig{Scope: config.TargetScopeOrganization, Org: input.Org}
+		profile.Runner.Environment = input.Environment
+		profile.RunnerGroup = config.RunnerGroupConfig{Name: names.RunnerGroupName, Create: true, Visibility: config.RunnerGroupVisibilityPrivate}
 	}
 
 	if err := profile.Validate(); err != nil {
@@ -432,27 +591,10 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 	profile.Loop.StateFile = stateFile
 	profile.Loop.LogDir = logDir
 
-	if err := m.ensureDir(ctx, cfg.Paths.ProfilesDir); err != nil {
-		return err
-	}
-	if err := m.ensureDir(ctx, cfg.Paths.StateDir); err != nil {
-		return err
-	}
-	if err := m.ensureDir(ctx, cfg.Paths.LogDir); err != nil {
-		return err
-	}
-	if err := m.ensureDir(ctx, m.SystemdUnitDir); err != nil {
-		return err
-	}
-
 	profileData, err := renderProfileYAML(profile)
 	if err != nil {
 		return err
 	}
-	if err := m.writeManagedFile(ctx, profilePath, profileData, 0o640); err != nil {
-		return err
-	}
-
 	serviceData, err := renderServiceFile(serviceTemplateData{
 		ProfileName:       profile.Name,
 		GitHubEnvFile:     profile.GitHub.EnvFile,
@@ -462,9 +604,26 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 	if err != nil {
 		return err
 	}
-	if err := m.writeManagedFile(ctx, servicePath, serviceData, 0o644); err != nil {
-		return err
+	for _, path := range []string{profilePath, servicePath} {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("refusing to create existing file %q: %w", path, os.ErrExist)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check new file %q: %w", path, err)
+		}
 	}
+	for _, dir := range []string{cfg.Paths.ProfilesDir, cfg.Paths.StateDir, cfg.Paths.LogDir, m.SystemdUnitDir} {
+		if err := m.ensureDir(ctx, dir); err != nil {
+			return fmt.Errorf("ensure directory %q: %w", dir, err)
+		}
+	}
+	if err := m.writeNewManagedFile(ctx, profilePath, profileData, 0o640); err != nil {
+		return fmt.Errorf("YAML creation: %w", err)
+	}
+	created = append(created, profilePath)
+	if err := m.writeNewManagedFile(ctx, servicePath, serviceData, 0o644); err != nil {
+		return fmt.Errorf("unit creation: %w", err)
+	}
+	created = append(created, servicePath)
 
 	if err := m.Systemd.DaemonReload(ctx); err != nil {
 		return err
@@ -472,131 +631,8 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 	if err := m.Systemd.Enable(ctx, profile.Service.Name); err != nil {
 		return err
 	}
-	return m.Systemd.Start(ctx, profile.Service.Name)
-}
-
-func (m RunnerManager) createOrganizationProfile(ctx context.Context, input CreateProfileInput) error {
-	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
-	if err != nil {
-		return err
-	}
-
-	dockerAccess, err := resolveDockerAccessForCreate(cfg, input.DockerAccess)
-	if err != nil {
-		return err
-	}
-
-	names, err := config.DeriveOrganizationEnvironmentNames(input.Org, input.Environment, cfg.Paths.StateDir, cfg.Paths.LogDir)
-	if err != nil {
-		return err
-	}
-
-	profile := config.Profile{
-		Name: names.ProfileName,
-		Target: config.TargetConfig{
-			Scope: config.TargetScopeOrganization,
-			Org:   input.Org,
-		},
-		GitHub: config.GitHubProfile{
-			TokenEnv: cfg.GitHub.TokenEnv,
-			EnvFile:  cfg.GitHub.EnvFile,
-		},
-		Service: config.ServiceConfig{
-			Name: names.ServiceName,
-		},
-		RunnerGroup: config.RunnerGroupConfig{
-			Name:       names.RunnerGroupName,
-			Create:     true,
-			Visibility: config.RunnerGroupVisibilityPrivate,
-		},
-		Runner: config.RunnerConfig{
-			Ephemeral:   input.Ephemeral,
-			Environment: input.Environment,
-			NamePrefix:  names.RunnerNamePrefix,
-			Workdir:     "/tmp/actions-runner",
-			Labels:      input.RunnerLabels,
-		},
-		Docker: config.DockerProfile{
-			AccessMode:          dockerAccess.Mode,
-			Image:               input.DockerImage,
-			ContainerNamePrefix: names.ContainerNamePrefix,
-			CPUs:                input.CPUs,
-			Memory:              input.Memory,
-			RemoveAfterExit:     true,
-			Volumes:             dockerAccess.Volumes,
-			Env:                 dockerAccess.Env,
-		},
-		Loop: config.LoopConfig{
-			IntervalSeconds:   5,
-			BackoffSeconds:    30,
-			MaxBackoffSeconds: 300,
-			StateFile:         names.StateFile,
-			LogDir:            names.LogDir,
-		},
-	}
-
-	if err := profile.Validate(); err != nil {
-		return err
-	}
-
-	stateFile, err := confineManagedPath(cfg.Paths.StateDir, profile.Loop.StateFile)
-	if err != nil {
-		return err
-	}
-	logDir, err := confineManagedPath(cfg.Paths.LogDir, profile.Loop.LogDir)
-	if err != nil {
-		return err
-	}
-	profilePath, err := confineJoin(cfg.Paths.ProfilesDir, profile.Name+".yaml")
-	if err != nil {
-		return err
-	}
-	servicePath, err := confineJoin(m.SystemdUnitDir, profile.Service.Name)
-	if err != nil {
-		return err
-	}
-	profile.Loop.StateFile = stateFile
-	profile.Loop.LogDir = logDir
-
-	if err := m.ensureDir(ctx, cfg.Paths.ProfilesDir); err != nil {
-		return err
-	}
-	if err := m.ensureDir(ctx, cfg.Paths.StateDir); err != nil {
-		return err
-	}
-	if err := m.ensureDir(ctx, cfg.Paths.LogDir); err != nil {
-		return err
-	}
-	if err := m.ensureDir(ctx, m.SystemdUnitDir); err != nil {
-		return err
-	}
-
-	profileData, err := renderProfileYAML(profile)
-	if err != nil {
-		return err
-	}
-	if err := m.writeManagedFile(ctx, profilePath, profileData, 0o640); err != nil {
-		return err
-	}
-
-	serviceData, err := renderServiceFile(serviceTemplateData{
-		ProfileName:       profile.Name,
-		GitHubEnvFile:     profile.GitHub.EnvFile,
-		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
-		ProfileConfigPath: profilePath,
-	})
-	if err != nil {
-		return err
-	}
-	if err := m.writeManagedFile(ctx, servicePath, serviceData, 0o644); err != nil {
-		return err
-	}
-
-	if err := m.Systemd.DaemonReload(ctx); err != nil {
-		return err
-	}
-	if err := m.Systemd.Enable(ctx, profile.Service.Name); err != nil {
-		return err
+	if input.NoStart {
+		return nil
 	}
 	return m.Systemd.Start(ctx, profile.Service.Name)
 }
@@ -722,90 +758,11 @@ func confineManagedPath(root, target string) (string, error) {
 	return cleanTarget, nil
 }
 
-func (m RunnerManager) shouldUseLegacyCreate() bool {
-	if m.LegacyEnvDir == "" || m.LegacyLoopBinary == "" {
-		return false
-	}
-	_, err := os.Stat(m.LegacyTokenFile)
-	return err == nil
-}
-
-func (m RunnerManager) createLegacyProfile(ctx context.Context, input CreateProfileInput) error {
-	profile := config.Profile{
-		Name: input.Name,
-		Repo: config.RepoConfig{
-			Owner: input.RepoOwner,
-			Name:  input.RepoName,
-		},
-		Service: config.ServiceConfig{
-			Name: input.ServiceName,
-		},
-		Runner: config.RunnerConfig{
-			Ephemeral:  input.Ephemeral,
-			NamePrefix: input.Name,
-		},
-		Docker: config.DockerProfile{
-			Image:               input.DockerImage,
-			ContainerNamePrefix: input.ContainerNamePrefix,
-		},
-	}
-	if err := profile.Validate(); err != nil {
-		return err
-	}
-
-	envPath, err := confineJoin(m.LegacyEnvDir, input.Name+".env")
-	if err != nil {
-		return err
-	}
-	servicePath, err := confineJoin(m.SystemdUnitDir, input.ServiceName)
-	if err != nil {
-		return err
-	}
-
-	if err := m.ensureDir(ctx, m.LegacyEnvDir); err != nil {
-		return err
-	}
-	if err := m.ensureDir(ctx, m.SystemdUnitDir); err != nil {
-		return err
-	}
-
-	envData := renderLegacyEnvFile(input)
-	if err := m.writeManagedFile(ctx, envPath, envData, 0o644); err != nil {
-		return err
-	}
-
-	serviceData, err := renderLegacyServiceFile(legacyServiceTemplateData{
-		ProfileName:     input.Name,
-		EnvironmentFile: envPath,
-		LoopBinaryPath:  m.LegacyLoopBinary,
-	})
-	if err != nil {
-		return err
-	}
-	if err := m.writeManagedFile(ctx, servicePath, serviceData, 0o644); err != nil {
-		return err
-	}
-
-	if err := m.Systemd.DaemonReload(ctx); err != nil {
-		return err
-	}
-	if err := m.Systemd.Enable(ctx, input.ServiceName); err != nil {
-		return err
-	}
-	return m.Systemd.Start(ctx, input.ServiceName)
-}
-
 type serviceTemplateData struct {
 	ProfileName       string
 	GitHubEnvFile     string
 	LoopBinaryPath    string
 	ProfileConfigPath string
-}
-
-type legacyServiceTemplateData struct {
-	ProfileName     string
-	EnvironmentFile string
-	LoopBinaryPath  string
 }
 
 func renderProfileYAML(profile config.Profile) ([]byte, error) {
@@ -830,35 +787,6 @@ func renderServiceFile(data serviceTemplateData) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func renderLegacyServiceFile(data legacyServiceTemplateData) ([]byte, error) {
-	raw, err := tmplpkg.Files.ReadFile("systemd.legacy.service.tmpl")
-	if err != nil {
-		return nil, err
-	}
-
-	tmpl, err := template.New("legacy-systemd-service").Parse(string(raw))
-	if err != nil {
-		return nil, err
-	}
-
-	buf := bytes.NewBuffer(nil)
-	if err := tmpl.Execute(buf, data); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func renderLegacyEnvFile(input CreateProfileInput) []byte {
-	lines := []string{
-		"REPO_OWNER=" + input.RepoOwner,
-		"REPO_NAME=" + input.RepoName,
-		"RUNNER_NAME=" + strings.TrimSuffix(input.ServiceName, ".service"),
-		"RUNNER_LABELS=" + strings.Join(input.RunnerLabels, ","),
-		"IMAGE=" + input.DockerImage,
-	}
-	return []byte(strings.Join(lines, "\n") + "\n")
-}
-
 func (m RunnerManager) ensureDir(ctx context.Context, path string) error {
 	if err := os.MkdirAll(path, 0o755); err == nil {
 		return nil
@@ -875,33 +803,28 @@ func (m RunnerManager) ensureDir(ctx context.Context, path string) error {
 	return err
 }
 
-func (m RunnerManager) writeManagedFile(ctx context.Context, path string, data []byte, perm os.FileMode) error {
-	if err := os.WriteFile(path, data, perm); err == nil {
-		return nil
-	} else if !os.IsPermission(err) {
-		return err
+func (m RunnerManager) writeNewManagedFile(_ context.Context, path string, data []byte, perm os.FileMode) error {
+	open := m.openNewFile
+	if open == nil {
+		open = os.OpenFile
 	}
-	if m.Runner == nil {
-		return os.WriteFile(path, data, perm)
-	}
-
-	tempFile, err := os.CreateTemp("", "gha-runner-tui-*")
+	f, err := open(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
-		return err
+		return fmt.Errorf("create %q: %w", path, err)
 	}
-	tempPath := tempFile.Name()
-	defer os.Remove(tempPath)
-	if _, err := tempFile.Write(data); err != nil {
-		tempFile.Close()
-		return err
+	err = f.Chmod(perm)
+	if err == nil {
+		var n int
+		n, err = f.Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
 	}
-	if err := tempFile.Close(); err != nil {
-		return err
+	closeErr := f.Close()
+	if err = errors.Join(err, closeErr); err != nil {
+		return fmt.Errorf("created %q; write/permissions/close failed; file retained: %w", path, err)
 	}
-
-	mode := fmt.Sprintf("%03o", perm.Perm())
-	_, err = m.Runner.Run(ctx, "install", "-m", mode, tempPath, path)
-	return err
+	return nil
 }
 
 func FormatCleanupResult(removed []string) string {

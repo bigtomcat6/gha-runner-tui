@@ -95,6 +95,12 @@ loop:
 	if profile.Runner.Environment != "swift" {
 		t.Fatalf("expected swift environment, got %q", profile.Runner.Environment)
 	}
+	if profile.Runner.Ephemeral {
+		t.Fatal("expected legacy organization profile to default ephemeral=false")
+	}
+	if len(profile.Runner.WatchRepositories) != 0 {
+		t.Fatalf("expected no watch repositories, got %v", profile.Runner.WatchRepositories)
+	}
 }
 
 func TestLoadProfileRejectsOrganizationProfileWithoutEnvironment(t *testing.T) {
