@@ -20,6 +20,7 @@ const (
 	LoopCleaning    LoopStatus = "cleaning"
 	LoopBackoff     LoopStatus = "backoff"
 	LoopFailed      LoopStatus = "failed"
+	LoopWaitingHost LoopStatus = "waiting-host"
 	LoopUnknown     LoopStatus = "unknown"
 )
 
@@ -96,7 +97,7 @@ func ParseLoopState(data []byte) (LoopState, error) {
 func NormalizeLoopStatus(value string) LoopStatus {
 	switch LoopStatus(value) {
 	case LoopDisabled, LoopStopped, LoopActive, LoopSleeping, LoopRegistering,
-		LoopStarting, LoopRunningJob, LoopCleaning, LoopBackoff, LoopFailed:
+		LoopStarting, LoopRunningJob, LoopCleaning, LoopBackoff, LoopFailed, LoopWaitingHost:
 		return LoopStatus(value)
 	default:
 		return LoopUnknown

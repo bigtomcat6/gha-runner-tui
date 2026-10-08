@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -30,32 +31,34 @@ type syncer interface {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "sync" {
-		opts, err := parseSyncArgs(os.Args[2:])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "sync failed: %v\n", err)
-			os.Exit(2)
-		}
-		manager := newManager(opts.configPath, "/etc/systemd/system")
-		if err := runSyncWith(context.Background(), opts, manager); err != nil {
-			fmt.Fprintf(os.Stderr, "sync failed: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Fprintln(os.Stdout, "runner groups synced")
-		return
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, launchTUI, newManager))
+}
+
+func run(args []string, stdout, stderr io.Writer, launchTUI func(string, string) error, makeManager func(string, string) app.RunnerManager) int {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return runCLI(context.Background(), args, stdout, stderr, makeManager)
 	}
+	fs := flag.NewFlagSet("gha-runner-tui", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	configPath := fs.String("config", defaultConfigPath, "Path to global config file")
+	unitDir := fs.String("systemd-unit-dir", defaultUnitDir, "Path to systemd unit directory used by create flow")
+	if err := fs.Parse(args); err != nil {
+		return writeArgumentError(stderr, err)
+	}
+	if fs.NArg() != 0 {
+		return writeArgumentError(stderr, fmt.Errorf("unexpected TUI arguments"))
+	}
+	if err := launchTUI(*configPath, *unitDir); err != nil {
+		return writeOperationError(stderr, fmt.Errorf("gha-runner-tui failed: %w", err))
+	}
+	return 0
+}
 
-	configPath := flag.String("config", "/etc/gha-runner-tui/config.yaml", "Path to global config file")
-	systemdUnitDir := flag.String("systemd-unit-dir", "/etc/systemd/system", "Path to systemd unit directory used by create flow")
-	flag.Parse()
-
-	manager := newManager(*configPath, *systemdUnitDir)
-
+func launchTUI(configPath, unitDir string) error {
+	manager := newManager(configPath, unitDir)
 	program := tea.NewProgram(tui.NewModel(manager), tea.WithAltScreen())
-	if _, err := program.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "gha-runner-tui failed: %v\n", err)
-		os.Exit(1)
-	}
+	_, err := program.Run()
+	return err
 }
 
 func newManager(configPath, systemdUnitDir string) app.RunnerManager {
@@ -65,7 +68,7 @@ func newManager(configPath, systemdUnitDir string) app.RunnerManager {
 		configPath,
 		systemd.NewClient(runner),
 		docker.NewClient(runner),
-		gh.NewClient(githubConfig.APIBaseURL, githubConfig.TokenEnv, githubConfig.EnvFile, runner, http.DefaultClient),
+		gh.NewGlobalClient(githubConfig.APIBaseURL, githubConfig.TokenEnv, githubConfig.EnvFile, runner, http.DefaultClient),
 	)
 	manager.Runner = runner
 	manager.SystemdUnitDir = systemdUnitDir

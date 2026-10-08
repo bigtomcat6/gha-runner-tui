@@ -3,12 +3,28 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"gha-runner-tui/internal/command"
 	"gha-runner-tui/internal/state"
+)
+
+const dockerHost = "unix:///var/run/docker.sock"
+
+const managedLabelFilter = "label=io.gha-runner-tui.managed=true"
+
+const managedListFormat = `{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Label "io.gha-runner-tui.profile"}}\t{{.Label "io.gha-runner-tui.runner"}}`
+
+var ErrContainerNotFound = errors.New("docker container not found")
+
+var (
+	errInspectUnavailable = errors.New("docker inspect failed")
+	errInspectMalformed   = errors.New("docker inspect returned invalid container data")
 )
 
 type Client struct {
@@ -21,14 +37,20 @@ type ContainerInfo struct {
 	Image      string
 	StatusText string
 	State      state.ContainerStatus
+	Profile    string
+	RunnerName string
 }
 
 type ContainerDetails struct {
-	ID    string
-	Name  string
-	Image string
-	State state.ContainerStatus
-	Env   map[string]string
+	ID        string
+	Name      string
+	Image     string
+	State     state.ContainerStatus
+	Env       map[string]string
+	Labels    map[string]string
+	CreatedAt time.Time
+	StartedAt time.Time
+	ExitCode  int
 }
 
 type RunSpec struct {
@@ -38,10 +60,28 @@ type RunSpec struct {
 	Memory  string
 	Volumes []string
 	Env     map[string]string
+	Labels  map[string]string
 }
 
 func NewClient(runner command.Runner) Client {
 	return Client{runner: runner}
+}
+
+// run funnels every docker invocation through the fixed host endpoint so the
+// caller's DOCKER_HOST environment cannot redirect slot bookkeeping.
+func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
+	return c.runner.Run(ctx, "docker", append([]string{"--host", dockerHost}, args...)...)
+}
+
+// OccupiesSlot reports whether a managed container can still occupy the
+// host-wide single-job slot. Unknown states fail closed and count as occupied.
+func OccupiesSlot(c ContainerInfo) bool {
+	switch c.State {
+	case state.ContainerExited, state.ContainerDead, state.ContainerRemoving:
+		return false
+	default:
+		return true
+	}
 }
 
 func (c Client) CurrentOrLatest(ctx context.Context, prefix string) (ContainerInfo, error) {
@@ -56,8 +96,8 @@ func (c Client) CurrentOrLatest(ctx context.Context, prefix string) (ContainerIn
 }
 
 func (c Client) ListByPrefix(ctx context.Context, prefix string) ([]ContainerInfo, error) {
-	out, err := c.runner.Run(ctx, "docker", "ps", "--all", "--filter", "name="+prefix, "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}")
-	if err != nil && strings.TrimSpace(string(out)) == "" {
+	out, err := c.run(ctx, "ps", "--all", "--filter", "name="+prefix, "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}")
+	if err != nil {
 		return nil, err
 	}
 
@@ -78,6 +118,63 @@ func (c Client) ListByPrefix(ctx context.Context, prefix string) ([]ContainerInf
 		containers = append(containers, container)
 	}
 	return containers, nil
+}
+
+// ListManaged returns managed containers by label. An empty profile queries
+// every managed container; a non-empty profile narrows by the profile label.
+func (c Client) ListManaged(ctx context.Context, profile string) ([]ContainerInfo, error) {
+	args := []string{"ps", "--all", "--filter", managedLabelFilter}
+	if profile != "" {
+		args = append(args, "--filter", "label=io.gha-runner-tui.profile="+profile)
+	}
+	args = append(args, "--format", managedListFormat)
+
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Split on newlines and skip blank rows individually: trimming the whole
+	// output would drop a trailing empty label column from the final row.
+	containers := make([]ContainerInfo, 0)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) != 6 {
+			return nil, errors.New("unexpected docker ps line")
+		}
+		if parts[3] == "" {
+			return nil, errors.New("docker ps returned empty container state")
+		}
+		containers = append(containers, ContainerInfo{
+			ID:         parts[0],
+			Name:       parts[1],
+			Image:      parts[2],
+			State:      state.NormalizeContainerStatus(parts[3]),
+			Profile:    parts[4],
+			RunnerName: parts[5],
+		})
+	}
+	return containers, nil
+}
+
+// SlotHolders lists every managed container that currently occupies the
+// host-wide single-job slot, failing closed on query errors.
+func (c Client) SlotHolders(ctx context.Context) ([]ContainerInfo, error) {
+	containers, err := c.ListManaged(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	holders := make([]ContainerInfo, 0, len(containers))
+	for _, container := range containers {
+		if OccupiesSlot(container) {
+			holders = append(holders, container)
+		}
+	}
+	return holders, nil
 }
 
 func ParseContainerLine(line string) (ContainerInfo, error) {
@@ -101,12 +198,11 @@ func (c Client) Logs(ctx context.Context, container string, tail int, follow boo
 		args = append(args, "-f")
 	}
 	args = append(args, container)
-	out, err := c.runner.Run(ctx, "docker", args...)
-	return string(out), err
+	return c.readLogsRedacted(ctx, container, args...)
 }
 
 func (c Client) Kill(ctx context.Context, container string) error {
-	_, err := c.runner.Run(ctx, "docker", "kill", container)
+	_, err := c.run(ctx, "kill", container)
 	return err
 }
 
@@ -120,7 +216,7 @@ func (c Client) CleanupExited(ctx context.Context, prefix string) ([]string, err
 		if container.State != state.ContainerExited && container.State != state.ContainerDead {
 			continue
 		}
-		if _, err := c.runner.Run(ctx, "docker", "rm", container.ID); err != nil {
+		if _, err := c.run(ctx, "rm", container.ID); err != nil {
 			return removed, err
 		}
 		removed = append(removed, container.Name)
@@ -129,27 +225,43 @@ func (c Client) CleanupExited(ctx context.Context, prefix string) ([]string, err
 }
 
 func (c Client) Inspect(ctx context.Context, idOrName string) (ContainerDetails, error) {
-	out, err := c.runner.Run(ctx, "docker", "inspect", idOrName)
+	out, err := c.run(ctx, "inspect", idOrName)
 	if err != nil {
-		return ContainerDetails{}, err
+		if strings.Contains(string(out), "No such object") {
+			return ContainerDetails{}, fmt.Errorf("%w: %s", ErrContainerNotFound, idOrName)
+		}
+		return ContainerDetails{}, errInspectUnavailable
 	}
 
 	var payload []struct {
-		ID     string `json:"Id"`
-		Name   string `json:"Name"`
-		Config struct {
-			Image string   `json:"Image"`
-			Env   []string `json:"Env"`
+		ID      string `json:"Id"`
+		Name    string `json:"Name"`
+		Created string `json:"Created"`
+		Config  struct {
+			Image  string            `json:"Image"`
+			Env    []string          `json:"Env"`
+			Labels map[string]string `json:"Labels"`
 		} `json:"Config"`
 		State struct {
-			Status string `json:"Status"`
+			Status    string `json:"Status"`
+			StartedAt string `json:"StartedAt"`
+			ExitCode  int    `json:"ExitCode"`
 		} `json:"State"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
-		return ContainerDetails{}, err
+		return ContainerDetails{}, errInspectMalformed
 	}
-	if len(payload) == 0 {
-		return ContainerDetails{}, fmt.Errorf("container %q not found", idOrName)
+	if len(payload) != 1 {
+		return ContainerDetails{}, errInspectMalformed
+	}
+
+	createdAt, err := time.Parse(time.RFC3339Nano, payload[0].Created)
+	if err != nil {
+		return ContainerDetails{}, errInspectMalformed
+	}
+	startedAt, err := time.Parse(time.RFC3339Nano, payload[0].State.StartedAt)
+	if err != nil {
+		return ContainerDetails{}, errInspectMalformed
 	}
 
 	env := map[string]string{}
@@ -161,16 +273,23 @@ func (c Client) Inspect(ctx context.Context, idOrName string) (ContainerDetails,
 	}
 
 	return ContainerDetails{
-		ID:    payload[0].ID,
-		Name:  strings.TrimPrefix(payload[0].Name, "/"),
-		Image: payload[0].Config.Image,
-		State: normalizeDockerStatus(payload[0].State.Status),
-		Env:   env,
+		ID:        payload[0].ID,
+		Name:      strings.TrimPrefix(payload[0].Name, "/"),
+		Image:     payload[0].Config.Image,
+		State:     state.NormalizeContainerStatus(payload[0].State.Status),
+		Env:       env,
+		Labels:    payload[0].Config.Labels,
+		CreatedAt: createdAt,
+		StartedAt: startedAt,
+		ExitCode:  payload[0].State.ExitCode,
 	}, nil
 }
 
 func (c Client) RunDetached(ctx context.Context, spec RunSpec) (string, error) {
-	args := []string{"run", "-d", "--name", spec.Name}
+	args := []string{"run", "-d", "--sig-proxy=false", "--name", spec.Name}
+	for _, key := range sortedKeys(spec.Labels) {
+		args = append(args, "--label", key+"="+spec.Labels[key])
+	}
 	if spec.CPUs != "" {
 		args = append(args, "--cpus", spec.CPUs)
 	}
@@ -180,17 +299,21 @@ func (c Client) RunDetached(ctx context.Context, spec RunSpec) (string, error) {
 	for _, volume := range spec.Volumes {
 		args = append(args, "-v", volume)
 	}
-	for key, value := range spec.Env {
-		args = append(args, "-e", fmt.Sprintf("%s=%s", key, value))
+	for _, key := range sortedKeys(spec.Env) {
+		args = append(args, "-e", key+"="+spec.Env[key])
 	}
 	args = append(args, spec.Image)
 
-	out, err := c.runner.Run(ctx, "docker", args...)
-	return strings.TrimSpace(string(out)), err
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		// Never surface args or output: they can carry the registration token.
+		return "", errors.New("docker run failed")
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func (c Client) Wait(ctx context.Context, container string) (int, error) {
-	out, err := c.runner.Run(ctx, "docker", "wait", container)
+	out, err := c.run(ctx, "wait", container)
 	if err != nil {
 		return 0, err
 	}
@@ -207,13 +330,73 @@ func (c Client) Remove(ctx context.Context, container string, force bool) error 
 		args = append(args, "-f")
 	}
 	args = append(args, container)
-	_, err := c.runner.Run(ctx, "docker", args...)
+	_, err := c.run(ctx, args...)
 	return err
 }
 
 func (c Client) ReadLogs(ctx context.Context, container string) (string, error) {
-	out, err := c.runner.Run(ctx, "docker", "logs", container)
-	return string(out), err
+	return c.readLogsRedacted(ctx, container, "logs", container)
+}
+
+// logTokens narrows an inspect call to Config.Env only, so log redaction does
+// not depend on full state/timestamp decoding succeeding. It never returns raw
+// output or underlying command text in its error.
+func (c Client) logTokens(ctx context.Context, container string) ([]string, error) {
+	unavailable := errors.New("cannot obtain container log redaction data")
+	out, err := c.run(ctx, "inspect", container)
+	if err != nil {
+		return nil, unavailable
+	}
+
+	var payload []struct {
+		Config *struct {
+			Env *[]string `json:"Env"`
+		} `json:"Config"`
+	}
+	if json.Unmarshal(out, &payload) != nil || len(payload) != 1 || payload[0].Config == nil || payload[0].Config.Env == nil {
+		return nil, unavailable
+	}
+
+	var tokens []string
+	for _, entry := range *payload[0].Config.Env {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			return nil, unavailable
+		}
+		if (key == "RUNNER_TOKEN" || key == "REG_TOKEN") && value != "" {
+			tokens = append(tokens, value)
+		}
+	}
+	sort.Slice(tokens, func(i, j int) bool { return len(tokens[i]) > len(tokens[j]) })
+	return tokens, nil
+}
+
+// readLogsRedacted is the only path that reads docker logs. It refuses to emit
+// logs unless the required token values were reliably decoded, then masks them.
+func (c Client) readLogsRedacted(ctx context.Context, container string, args ...string) (string, error) {
+	tokens, err := c.logTokens(ctx, container)
+	if err != nil {
+		return "", err
+	}
+
+	out, runErr := c.run(ctx, args...)
+	text := string(out)
+	for _, token := range tokens {
+		text = strings.ReplaceAll(text, token, "[REDACTED]")
+	}
+	if runErr != nil {
+		return text, errors.New("docker logs failed")
+	}
+	return text, nil
+}
+
+func sortedKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func normalizeDockerStatus(value string) state.ContainerStatus {

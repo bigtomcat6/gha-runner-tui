@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
 	"gha-runner-tui/internal/command"
+	"gha-runner-tui/internal/config"
 	"gha-runner-tui/internal/state"
 )
 
@@ -21,12 +24,42 @@ type HTTPDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
+// APIError is a typed, body-free GitHub HTTP error. It never carries the
+// response body so credentials accidentally echoed by the API cannot leak.
+type APIError struct {
+	Method     string
+	Path       string
+	StatusCode int
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("github api %s %s returned %d", e.Method, e.Path, e.StatusCode)
+}
+
+type Repository struct {
+	Owner string
+	Name  string
+}
+
+type Job struct {
+	ID     int64
+	Status string
+	Labels []string
+}
+
 type Client struct {
 	baseURL   string
 	tokenEnv  string
 	tokenFile string
 	runner    command.Runner
 	http      HTTPDoer
+
+	// allowMissingFileEnv is true only for the global client: it may fall back
+	// to the process environment when the configured file does not exist.
+	allowMissingFileEnv bool
+	// readFile is the credential file reader; defaults to os.ReadFile and is
+	// overridable in tests to simulate permission errors without chmod.
+	readFile func(string) ([]byte, error)
 }
 
 type Runner struct {
@@ -68,7 +101,40 @@ func NewClient(baseURL, tokenEnv, tokenFile string, runner command.Runner, httpC
 		tokenFile: tokenFile,
 		runner:    runner,
 		http:      httpClient,
+		readFile:  os.ReadFile,
 	}
+}
+
+// NewGlobalClient builds a client for the un-migrated/global configuration.
+// Unlike NewClient it is allowed to fall back to the process environment when
+// the configured token file does not exist.
+func NewGlobalClient(baseURL, tokenEnv, tokenFile string, runner command.Runner, httpClient HTTPDoer) Client {
+	c := NewClient(baseURL, tokenEnv, tokenFile, runner, httpClient)
+	c.allowMissingFileEnv = true
+	return c
+}
+
+// ForProfile derives a per-profile client. c.runner and c.http are preserved.
+// Profile credential files are strict: a missing/unreadable/empty file never
+// falls back to another identity. Only when the profile configures neither a
+// token file nor an env file does it defer to the global client.
+func (c Client) ForProfile(defaults config.GitHubConfig, p config.GitHubProfile) Client {
+	tokenEnv := p.TokenEnv
+	if tokenEnv == "" {
+		tokenEnv = defaults.TokenEnv
+	}
+	if p.TokenFile == "" && p.EnvFile == "" {
+		return NewGlobalClient(defaults.APIBaseURL, tokenEnv, defaults.EnvFile, c.runner, c.http)
+	}
+	tokenFile := p.TokenFile
+	if tokenFile == "" {
+		tokenFile = p.EnvFile
+	}
+	profile := NewClient(defaults.APIBaseURL, tokenEnv, tokenFile, c.runner, c.http)
+	if c.readFile != nil {
+		profile.readFile = c.readFile
+	}
+	return profile
 }
 
 func (c Client) ListRepoRunners(ctx context.Context, owner, repo string) ([]Runner, error) {
@@ -129,6 +195,105 @@ func (c Client) CreateOrgRemoveToken(ctx context.Context, org string) (string, e
 
 func (c Client) DeleteOrgRunner(ctx context.Context, org string, id int64) error {
 	return c.requestJSON(ctx, http.MethodDelete, fmt.Sprintf("/orgs/%s/actions/runners/%d", org, id), nil, nil)
+}
+
+// QueuedJobs returns queued jobs across repos whose labels are a case
+// insensitive subset of the requested labels. It scans both queued and
+// in_progress runs so a job that started between the two queries is still
+// seen, dedupes runs/jobs, and never follows pagination.
+func (c Client) QueuedJobs(ctx context.Context, repos []Repository, labels []string) ([]Job, error) {
+	allowed := map[string]bool{"self-hosted": true}
+	for _, label := range labels {
+		allowed[strings.ToLower(label)] = true
+	}
+
+	var out []Job
+	for _, repo := range repos {
+		seenRuns := map[int64]bool{}
+		seenJobs := map[int64]bool{}
+		for _, status := range []string{"queued", "in_progress"} {
+			runsQuery := url.Values{}
+			runsQuery.Set("status", status)
+			runsQuery.Set("per_page", "100")
+			runsPath := fmt.Sprintf("/repos/%s/%s/actions/runs?%s", repo.Owner, repo.Name, runsQuery.Encode())
+
+			var runsPayload struct {
+				WorkflowRuns []struct {
+					ID int64 `json:"id"`
+				} `json:"workflow_runs"`
+			}
+			if err := c.requestJSON(ctx, http.MethodGet, runsPath, nil, &runsPayload); err != nil {
+				return nil, err
+			}
+
+			for _, run := range runsPayload.WorkflowRuns {
+				if seenRuns[run.ID] {
+					continue
+				}
+				seenRuns[run.ID] = true
+
+				jobsQuery := url.Values{}
+				jobsQuery.Set("filter", "latest")
+				jobsQuery.Set("per_page", "100")
+				jobsPath := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?%s", repo.Owner, repo.Name, run.ID, jobsQuery.Encode())
+
+				var jobsPayload struct {
+					Jobs []struct {
+						ID     int64    `json:"id"`
+						Status string   `json:"status"`
+						Labels []string `json:"labels"`
+					} `json:"jobs"`
+				}
+				if err := c.requestJSON(ctx, http.MethodGet, jobsPath, nil, &jobsPayload); err != nil {
+					return nil, err
+				}
+
+				for _, job := range jobsPayload.Jobs {
+					if job.Status != "queued" || len(job.Labels) == 0 {
+						continue
+					}
+					matched := true
+					for _, label := range job.Labels {
+						if !allowed[strings.ToLower(label)] {
+							matched = false
+							break
+						}
+					}
+					if !matched || seenJobs[job.ID] {
+						continue
+					}
+					seenJobs[job.ID] = true
+					out = append(out, Job{ID: job.ID, Status: job.Status, Labels: job.Labels})
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// FindRunner looks up a runner by exact name for a resolved target. It uses
+// the name query parameter and never falls back to prefix matching.
+func (c Client) FindRunner(ctx context.Context, target config.ResolvedTarget, name string) (*Runner, error) {
+	path := fmt.Sprintf("/repos/%s/%s/actions/runners", target.Owner, target.Repo)
+	if target.Scope == config.TargetScopeOrganization {
+		path = fmt.Sprintf("/orgs/%s/actions/runners", target.OrgSlug)
+	}
+	query := url.Values{}
+	query.Set("name", name)
+
+	var payload struct {
+		Runners []rawRunner `json:"runners"`
+	}
+	if err := c.requestJSON(ctx, http.MethodGet, path+"?"+query.Encode(), nil, &payload); err != nil {
+		return nil, err
+	}
+	for _, runner := range mapRunners(payload.Runners) {
+		if runner.Name == name {
+			copy := runner
+			return &copy, nil
+		}
+	}
+	return nil, nil
 }
 
 func (c Client) ListOrgRunnerGroups(ctx context.Context, org string) ([]RunnerGroup, error) {
@@ -290,9 +455,8 @@ func (c Client) requestJSON(ctx context.Context, method, path string, body any, 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= http.StatusBadRequest {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("github api %s %s returned %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	if resp.StatusCode >= http.StatusBadRequest || (method == http.MethodDelete && resp.StatusCode != http.StatusNoContent) {
+		return &APIError{Method: method, Path: path, StatusCode: resp.StatusCode}
 	}
 
 	if out == nil {
@@ -304,27 +468,52 @@ func (c Client) requestJSON(ctx context.Context, method, path string, body any, 
 }
 
 func (c Client) resolveToken(ctx context.Context) (string, error) {
-	if token := strings.TrimSpace(os.Getenv(c.tokenEnv)); token != "" {
+	if c.tokenFile == "" {
+		if token := strings.TrimSpace(os.Getenv(c.tokenEnv)); token != "" {
+			return token, nil
+		}
+		return "", ErrMissingToken
+	}
+
+	data, readErr := c.readTokenFile()
+	if readErr == nil {
+		token := c.parseTokenFile(string(data))
+		if token == "" {
+			return "", fmt.Errorf("github token file %q did not contain %s", c.tokenFile, c.tokenEnv)
+		}
 		return token, nil
 	}
 
-	if c.tokenFile == "" {
+	// Only the global client may fall back to the process environment, and
+	// only when the file genuinely does not exist. Any other failure
+	// (permission, IO) must not silently switch identity.
+	if c.allowMissingFileEnv && errors.Is(readErr, fs.ErrNotExist) {
+		if token := strings.TrimSpace(os.Getenv(c.tokenEnv)); token != "" {
+			return token, nil
+		}
 		return "", ErrMissingToken
 	}
-	if data, err := os.ReadFile(c.tokenFile); err == nil {
-		if token := c.parseTokenFile(string(data)); token != "" {
+
+	if c.runner != nil {
+		out, err := c.runner.Run(ctx, "sudo", "-n", "cat", c.tokenFile)
+		if err == nil {
+			token := c.parseTokenFile(string(out))
+			if token == "" {
+				return "", fmt.Errorf("github token file %q did not contain %s", c.tokenFile, c.tokenEnv)
+			}
 			return token, nil
 		}
 	}
-	if c.runner != nil {
-		out, err := c.runner.Run(ctx, "cat", c.tokenFile)
-		if err == nil {
-			if token := c.parseTokenFile(string(out)); token != "" {
-				return token, nil
-			}
-		}
+	// Safe error: only the path and failure category, never file contents or
+	// command output.
+	return "", fmt.Errorf("github token file %q is not readable: %w", c.tokenFile, readErr)
+}
+
+func (c Client) readTokenFile() ([]byte, error) {
+	if c.readFile != nil {
+		return c.readFile(c.tokenFile)
 	}
-	return "", ErrMissingToken
+	return os.ReadFile(c.tokenFile)
 }
 
 func (c Client) parseTokenFile(content string) string {
@@ -332,7 +521,7 @@ func (c Client) parseTokenFile(content string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if !strings.Contains(trimmed, "\n") && !strings.Contains(trimmed, "=") {
+	if !strings.ContainsAny(trimmed, "= \t\r\n") && !strings.HasPrefix(trimmed, "#") {
 		return trimmed
 	}
 

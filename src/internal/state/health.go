@@ -12,12 +12,15 @@ const (
 type ContainerStatus string
 
 const (
-	ContainerNone    ContainerStatus = "none"
-	ContainerCreated ContainerStatus = "created"
-	ContainerRunning ContainerStatus = "running"
-	ContainerExited  ContainerStatus = "exited"
-	ContainerDead    ContainerStatus = "dead"
-	ContainerUnknown ContainerStatus = "unknown"
+	ContainerNone       ContainerStatus = "none"
+	ContainerCreated    ContainerStatus = "created"
+	ContainerRunning    ContainerStatus = "running"
+	ContainerRestarting ContainerStatus = "restarting"
+	ContainerPaused     ContainerStatus = "paused"
+	ContainerExited     ContainerStatus = "exited"
+	ContainerDead       ContainerStatus = "dead"
+	ContainerRemoving   ContainerStatus = "removing"
+	ContainerUnknown    ContainerStatus = "unknown"
 )
 
 type GitHubStatus string
@@ -77,10 +80,16 @@ func NormalizeContainerStatus(value string) ContainerStatus {
 		return ContainerCreated
 	case "running":
 		return ContainerRunning
+	case "restarting":
+		return ContainerRestarting
+	case "paused":
+		return ContainerPaused
 	case "exited":
 		return ContainerExited
 	case "dead":
 		return ContainerDead
+	case "removing":
+		return ContainerRemoving
 	case "", "none":
 		return ContainerNone
 	default:
@@ -104,6 +113,10 @@ func NormalizeGitHubStatus(value string) GitHubStatus {
 func ResolveHealth(in HealthInputs) CombinedHealth {
 	if in.Systemd == SystemdFailed || in.Loop == LoopFailed {
 		return HealthUnhealthy
+	}
+
+	if in.Loop == LoopWaitingHost && in.Container == ContainerNone {
+		return HealthHealthy
 	}
 
 	if in.GitHub == GitHubGone && in.Container == ContainerExited && in.LastExitCode != nil && *in.LastExitCode != 0 {

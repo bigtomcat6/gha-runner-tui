@@ -20,6 +20,8 @@ type SystemdClient interface {
 }
 
 type DockerClient interface {
+	ListManaged(ctx context.Context, profile string) ([]dockerpkg.ContainerInfo, error)
+	SlotHolders(ctx context.Context) ([]dockerpkg.ContainerInfo, error)
 	CurrentOrLatest(ctx context.Context, prefix string) (dockerpkg.ContainerInfo, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]dockerpkg.ContainerInfo, error)
 	Inspect(ctx context.Context, idOrName string) (dockerpkg.ContainerDetails, error)
@@ -45,6 +47,8 @@ type ProfileSnapshot struct {
 }
 
 type Dashboard struct {
+	SlotHolders       []dockerpkg.ContainerInfo
+	SlotError         *string
 	Config            config.GlobalConfig
 	Profiles          []ProfileSnapshot
 	ProfileErrors     []config.ProfileLoadError
@@ -52,10 +56,11 @@ type Dashboard struct {
 }
 
 type Service struct {
-	ConfigPath string
-	Systemd    SystemdClient
-	Docker     DockerClient
-	GitHub     GitHubClient
+	LegacyServiceDir string
+	ConfigPath       string
+	Systemd          SystemdClient
+	Docker           DockerClient
+	GitHubForProfile func(config.GlobalConfig, config.Profile) GitHubClient
 }
 
 func (s Service) LoadDashboard(ctx context.Context) (Dashboard, error) {
@@ -64,50 +69,55 @@ func (s Service) LoadDashboard(ctx context.Context) (Dashboard, error) {
 		return Dashboard{}, err
 	}
 
-	migrationResults, err := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir)
-	if err != nil {
-		return Dashboard{}, err
-	}
-	githubMigrationResults, err := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{
-		TokenEnv: cfg.GitHub.TokenEnv,
-		EnvFile:  cfg.GitHub.EnvFile,
-	})
-	if err != nil {
-		return Dashboard{}, err
-	}
-	migrationResults = append(migrationResults, githubMigrationResults...)
-
-	profiles, profileErrors, err := config.LoadProfiles(cfg.Paths.ProfilesDir)
-	if err != nil {
-		return Dashboard{}, err
-	}
-	if len(profiles) == 0 {
-		legacyProfiles, legacyErrors, legacyErr := config.DiscoverLegacyProfiles("")
-		if legacyErr != nil {
-			return Dashboard{}, legacyErr
+	profiles, profileErrors := s.loadProfiles(cfg)
+	dashboard := Dashboard{Config: cfg, ProfileErrors: profileErrors}
+	if s.Docker == nil {
+		message := "docker client is not configured"
+		dashboard.SlotError = &message
+	} else {
+		holders, slotErr := s.Docker.SlotHolders(ctx)
+		if slotErr != nil {
+			message := slotErr.Error()
+			dashboard.SlotError = &message
+		} else {
+			dashboard.SlotHolders = holders
 		}
-		profiles = legacyProfiles
-		profileErrors = append(profileErrors, legacyErrors...)
 	}
 
 	snapshots := make([]ProfileSnapshot, 0, len(profiles))
 	for _, profile := range profiles {
-		snapshots = append(snapshots, s.loadProfile(ctx, profile))
+		snapshots = append(snapshots, s.loadProfile(ctx, cfg, profile))
 	}
 
 	sort.Slice(snapshots, func(i, j int) bool {
 		return snapshots[i].Profile.Name < snapshots[j].Profile.Name
 	})
 
-	return Dashboard{
-		Config:            cfg,
-		Profiles:          snapshots,
-		ProfileErrors:     profileErrors,
-		MigrationWarnings: migrationWarnings(migrationResults),
-	}, nil
+	dashboard.Profiles = snapshots
+	return dashboard, nil
 }
 
-func (s Service) loadProfile(ctx context.Context, profile config.Profile) ProfileSnapshot {
+func (s Service) loadProfiles(cfg config.GlobalConfig) ([]config.Profile, []config.ProfileLoadError) {
+	profiles, profileErrors, err := config.LoadProfiles(cfg.Paths.ProfilesDir)
+	if err != nil {
+		profileErrors = append(profileErrors, config.ProfileLoadError{Path: cfg.Paths.ProfilesDir, Err: err})
+	}
+	if len(profiles) == 0 {
+		legacyProfiles, legacyErrors, legacyErr := config.DiscoverLegacyProfiles(s.LegacyServiceDir)
+		profiles = legacyProfiles
+		profileErrors = append(profileErrors, legacyErrors...)
+		if legacyErr != nil {
+			path := s.LegacyServiceDir
+			if path == "" {
+				path = "/etc/systemd/system"
+			}
+			profileErrors = append(profileErrors, config.ProfileLoadError{Path: path, Err: legacyErr})
+		}
+	}
+	return profiles, profileErrors
+}
+
+func (s Service) loadProfile(ctx context.Context, cfg config.GlobalConfig, profile config.Profile) ProfileSnapshot {
 	snapshot := ProfileSnapshot{
 		Profile: profile,
 		Container: dockerpkg.ContainerInfo{
@@ -149,7 +159,14 @@ func (s Service) loadProfile(ctx context.Context, profile config.Profile) Profil
 		}
 	}
 
-	if s.GitHub != nil {
+	var github GitHubClient
+	if s.GitHubForProfile != nil {
+		github = s.GitHubForProfile(cfg, profile)
+	}
+	if github == nil {
+		snapshot.Errors = append(snapshot.Errors, "github: profile client is not configured")
+	}
+	if github != nil {
 		target, targetErr := profile.ResolveTarget()
 		if targetErr != nil {
 			snapshot.Errors = append(snapshot.Errors, "config: "+targetErr.Error())
@@ -162,9 +179,9 @@ func (s Service) loadProfile(ctx context.Context, profile config.Profile) Profil
 			)
 			switch target.Scope {
 			case config.TargetScopeOrganization:
-				runners, err = s.GitHub.ListOrgRunners(ctx, target.OrgSlug)
+				runners, err = github.ListOrgRunners(ctx, target.OrgSlug)
 			default:
-				runners, err = s.GitHub.ListRepoRunners(ctx, target.Owner, target.Repo)
+				runners, err = github.ListRepoRunners(ctx, target.Owner, target.Repo)
 			}
 			if err != nil {
 				snapshot.Errors = append(snapshot.Errors, "github: "+err.Error())
@@ -172,6 +189,9 @@ func (s Service) loadProfile(ctx context.Context, profile config.Profile) Profil
 				snapshot.BusyState = state.BusyUnknown
 			} else {
 				exactRunnerName := snapshot.Loop.LastRunnerName
+				if snapshot.Container.RunnerName != "" {
+					exactRunnerName = snapshot.Container.RunnerName
+				}
 				if exactRunnerName == "" {
 					exactRunnerName = profile.Runner.NamePrefix
 				}
@@ -223,17 +243,6 @@ func (p ProfileSnapshot) ErrorSummary() string {
 	return strings.Join(p.Errors, "; ")
 }
 
-func migrationWarnings(results []config.ProfileMigrationResult) []string {
-	warnings := make([]string, 0)
-	for _, result := range results {
-		switch result.Status {
-		case config.ProfileMigrationSkipped, config.ProfileMigrationFailed:
-			warnings = append(warnings, fmt.Sprintf("%s: %s", result.Path, result.Message))
-		}
-	}
-	return warnings
-}
-
 func (s Service) matchContainer(ctx context.Context, profile config.Profile, loopState state.LoopState) (dockerpkg.ContainerInfo, error) {
 	container, _, err := s.matchContainers(ctx, profile, loopState)
 	return container, err
@@ -242,6 +251,19 @@ func (s Service) matchContainer(ctx context.Context, profile config.Profile, loo
 func (s Service) matchContainers(ctx context.Context, profile config.Profile, loopState state.LoopState) (dockerpkg.ContainerInfo, []dockerpkg.ContainerInfo, error) {
 	if s.Docker == nil {
 		return dockerpkg.ContainerInfo{State: state.ContainerNone}, nil, nil
+	}
+	managed, err := s.Docker.ListManaged(ctx, profile.Name)
+	if err != nil {
+		return dockerpkg.ContainerInfo{State: state.ContainerNone}, nil, err
+	}
+	matches := make([]dockerpkg.ContainerInfo, 0, len(managed))
+	for _, container := range managed {
+		if container.Profile == profile.Name {
+			matches = append(matches, container)
+		}
+	}
+	if len(matches) > 0 {
+		return preferContainer(matches, loopState.LastContainerName), matches, nil
 	}
 
 	expectedRunnerName := loopState.LastRunnerName
@@ -254,7 +276,7 @@ func (s Service) matchContainers(ctx context.Context, profile config.Profile, lo
 			return dockerpkg.ContainerInfo{State: state.ContainerNone}, nil, nil
 		}
 		details, err := s.Docker.Inspect(ctx, loopState.LastContainerName)
-		if err != nil {
+		if err != nil || (details.ID == "" && details.Name == "") || belongsToOtherProfile(details, profile.Name) {
 			return dockerpkg.ContainerInfo{State: state.ContainerNone}, nil, nil
 		}
 		container := containerFromDetails(details)
@@ -270,7 +292,7 @@ func (s Service) matchContainers(ctx context.Context, profile config.Profile, lo
 			return dockerpkg.ContainerInfo{State: state.ContainerNone}, nil, nil
 		}
 		details, inspectErr := s.Docker.Inspect(ctx, loopState.LastContainerName)
-		if inspectErr != nil {
+		if inspectErr != nil || (details.ID == "" && details.Name == "") || belongsToOtherProfile(details, profile.Name) {
 			return dockerpkg.ContainerInfo{State: state.ContainerNone}, nil, nil
 		}
 		container := containerFromDetails(details)
@@ -279,12 +301,14 @@ func (s Service) matchContainers(ctx context.Context, profile config.Profile, lo
 
 	matched := make([]dockerpkg.ContainerInfo, 0, len(containers))
 	imageMatches := make([]dockerpkg.ContainerInfo, 0, len(containers))
+	eligible := make([]dockerpkg.ContainerInfo, 0, len(containers))
 	for _, container := range containers {
 		details, err := s.Docker.Inspect(ctx, container.Name)
-		if err != nil {
+		if err != nil || belongsToOtherProfile(details, profile.Name) {
 			continue
 		}
 		container = mergeContainerDetails(container, details)
+		eligible = append(eligible, container)
 		if expectedRunnerName != "" && details.Env["RUNNER_NAME"] == expectedRunnerName {
 			matched = append(matched, container)
 			continue
@@ -302,8 +326,16 @@ func (s Service) matchContainers(ctx context.Context, profile config.Profile, lo
 	case len(imageMatches) > 0:
 		return preferContainer(imageMatches, loopState.LastContainerName), imageMatches, nil
 	default:
-		return containers[0], []dockerpkg.ContainerInfo{containers[0]}, nil
+		if len(eligible) == 0 {
+			return dockerpkg.ContainerInfo{State: state.ContainerNone}, nil, nil
+		}
+		container := preferContainer(eligible, loopState.LastContainerName)
+		return container, []dockerpkg.ContainerInfo{container}, nil
 	}
+}
+
+func belongsToOtherProfile(details dockerpkg.ContainerDetails, profile string) bool {
+	return details.Labels["io.gha-runner-tui.managed"] == "true" && details.Labels["io.gha-runner-tui.profile"] != profile
 }
 
 func mergeContainerDetails(container dockerpkg.ContainerInfo, details dockerpkg.ContainerDetails) dockerpkg.ContainerInfo {

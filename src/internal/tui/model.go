@@ -72,6 +72,12 @@ type confirmState struct {
 	profile string
 }
 
+const (
+	gracefulLoopNotice      = "停止后不再接新 job；正在运行的 job 会继续跑完"
+	stopLoopConfirmation    = gracefulLoopNotice + "\n\nStop the loop service? Service stopped does not mean the job has finished or the slot is free."
+	restartLoopConfirmation = gracefulLoopNotice + "\n\nRestart the loop service and adopt any retained container?"
+)
+
 type createField struct {
 	label string
 	input textinput.Model
@@ -171,6 +177,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.errorMessage = msg.err.Error()
 			m.logContent = ""
+			m.logViewport.SetContent("")
 		} else {
 			m.errorMessage = ""
 			m.logTitle = msg.title
@@ -186,6 +193,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case actionDoneMsg:
 		if msg.err != nil {
 			m.errorMessage = msg.err.Error()
+			m.statusMessage = ""
 			return m, nil
 		}
 		m.errorMessage = ""
@@ -295,7 +303,7 @@ func (m Model) updateDashboard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if snapshot := m.currentSnapshot(); snapshot != nil {
 			m.confirm = &confirmState{
 				title:   "Stop loop service",
-				body:    "Stop the selected loop service?",
+				body:    stopLoopConfirmation,
 				action:  actionStop,
 				profile: snapshot.Profile.Name,
 			}
@@ -304,13 +312,9 @@ func (m Model) updateDashboard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "R":
 		if snapshot := m.currentSnapshot(); snapshot != nil {
-			body := "Restart the selected loop service?"
-			if snapshot.BusyState == "yes" {
-				body = "This runner appears busy. Restarting may interrupt the current GitHub Actions job.\n\nRestart anyway?"
-			}
 			m.confirm = &confirmState{
 				title:   "Restart loop service",
-				body:    body,
+				body:    restartLoopConfirmation,
 				action:  actionRestart,
 				profile: snapshot.Profile.Name,
 			}
@@ -361,20 +365,16 @@ func (m Model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "x":
 		m.confirm = &confirmState{
 			title:   "Stop loop service",
-			body:    "Stop this loop service?",
+			body:    stopLoopConfirmation,
 			action:  actionStop,
 			profile: snapshot.Profile.Name,
 		}
 		m.screen = screenConfirm
 		return m, nil
 	case "R":
-		body := "Restart this loop service?"
-		if snapshot.BusyState == "yes" {
-			body = "This runner appears busy. Restarting may interrupt the current GitHub Actions job.\n\nRestart anyway?"
-		}
 		m.confirm = &confirmState{
 			title:   "Restart loop service",
-			body:    body,
+			body:    restartLoopConfirmation,
 			action:  actionRestart,
 			profile: snapshot.Profile.Name,
 		}
@@ -446,7 +446,7 @@ func (m Model) updateCreate(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.screen = screenDashboard
 		return m, nil
-	case "ctrl+c", "q":
+	case "ctrl+c":
 		return m, tea.Quit
 	case "tab", "shift+tab", "up", "down":
 		if msg.String() == "up" || msg.String() == "shift+tab" {
@@ -622,7 +622,8 @@ func (m Model) viewCreate() string {
 		}
 		lines = append(lines, fmt.Sprintf("%-22s %s", label+":", field.input.View()))
 	}
-	lines = append(lines, "", "[tab] next  [shift+tab] previous  [ctrl+s] create  [esc] cancel")
+	lines = append(lines, "", "Organization profiles: manually add runner.watch_repositories to YAML before starting the loop successfully.",
+		"[tab] next  [shift+tab] previous  [ctrl+s] create  [esc] cancel  [ctrl+c] quit (q is input)")
 	return strings.Join(lines, "\n")
 }
 
@@ -669,6 +670,8 @@ func (m Model) viewHelp() string {
 		"",
 		"Create:",
 		"  ctrl+s write profile and service unit, then enable/start it",
+		"  q ordinary input; ctrl+c quit; esc cancel",
+		"  organization: manually add runner.watch_repositories to YAML before starting successfully",
 	}
 	return strings.Join(lines, "\n")
 }
@@ -750,8 +753,8 @@ func newCreateFields() []createField {
 		{label: "Docker image", placeholder: "ghcr.io/example/actions-runner:latest"},
 		{label: "Service name", placeholder: "gha-remind-me-swift.service"},
 		{label: "Container prefix", placeholder: "gha-remind-me-swift"},
-		{label: "CPU limit", value: "2"},
-		{label: "Memory limit", value: "4g"},
+		{label: "CPU limit"},
+		{label: "Memory limit"},
 		{label: "Ephemeral", value: "true"},
 	}
 
@@ -787,11 +790,14 @@ func (m Model) readCreateInput() (app.CreateProfileInput, error) {
 	}
 
 	ephemeral, err := parseBool(values["Ephemeral"])
-	if err != nil {
-		return app.CreateProfileInput{}, fmt.Errorf("ephemeral must be true or false")
+	if err != nil || !ephemeral {
+		return app.CreateProfileInput{}, fmt.Errorf("ephemeral must be true")
 	}
 
 	labels := splitCSV(values["Runner labels"])
+	if values["CPU limit"] == "" || values["Memory limit"] == "" || len(labels) == 0 {
+		return app.CreateProfileInput{}, fmt.Errorf("CPU limit, memory limit, and runner labels are required")
+	}
 	input := app.CreateProfileInput{
 		Scope:               config.TargetScope(strings.TrimSpace(values["Target scope"])),
 		Org:                 values["Organization"],
