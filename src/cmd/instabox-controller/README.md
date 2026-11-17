@@ -177,24 +177,32 @@ copies on separate hosts.
 For the current run, the effective deadline is
 
 ```
-runStartedAt + min(maxRunMinutes, 120 minutes)
+min(runStartedAt + maxRunMinutes, anchor + 120 minutes)
+anchor = runStartedAt + floor((now - runStartedAt) / 15 minutes) * 15 minutes
 ```
 
-so platform max-run growth never moves the delivered deadline past the first
-two hours of the run. The controller does not trust a missing/invalid
-`runStartedAt` or `maxRunMinutes`: such a machine is not budget-ready and is
+(`maxRunMinutes: -1` has no platform end.) `anchor` never exceeds the trusted
+current time. A platform budget of 120 minutes or less is therefore used
+unchanged: a 120-minute run is still only ready in its first 20 minutes. A
+larger platform budget keeps a rolling deadline: the effective deadline is
+constant inside each 15-minute bucket, the file changes at most once per
+bucket, and it never claims more than 120 minutes from a trusted observation.
+The controller does not trust a missing/invalid `runStartedAt` (including any
+future value) or `maxRunMinutes`: such a machine is not budget-ready and is
 never guessed at. A delivered deadline is considered ready only when the fresh
 GET leaves at least 100 minutes (the guard's admission floor) and at most 120
 minutes.
 
 Delivery happens for a new run, a changed effective deadline, or an earlier
-write whose result was not confirmed. Once the same run and deadline are
-confirmed, further polls do not deliver again; the controller keeps polling
-with `GET` only and does not run a periodic exec keepalive. A write is an
-atomic remote replace followed by an exact readback on the same transport
-(one SSH connection, or one exec result), then a second GET checks that machine
-identity, run and deadline did not change. An unknown write is read first
-before any replacement; an unconfirmed result is never counted as ready.
+write whose result was not confirmed. Once the same run and effective deadline
+are confirmed in a bucket, further polls do not deliver again; the controller
+keeps polling with `GET` only and does not run a periodic exec keepalive. A
+write is an atomic remote replace followed by an exact readback on the same
+transport (one SSH connection, or one exec result), then a second GET checks
+that machine identity, run and effective deadline did not change. A post-write
+GET that lands in a new 15-minute bucket is unknown, not ready; the next round
+recomputes and delivers it. An unknown write is read first before any
+replacement; an unconfirmed result is never counted as ready.
 
 With `api-exec`, the request blocks until the command exits and the result must
 be a complete documented `ExecResult` with `exitCode` 0 and `timedOut`,
@@ -257,10 +265,11 @@ fail-closed guarantee**:
   machine not ready, but a queued job can be assigned between checks.
 - Delivering the deadline over SSH or exec is itself activity and can postpone
   the machine's idle auto-pause. It does not extend a platform max-run budget.
-- Reusing an old run's deadline file is conservative when the platform starts
-  every run at 120 minutes and the controller never delivers beyond the first
-  two hours. It cannot cover the platform shortening a run, an earlier
-  unrelated pause/stop, host clock anomalies, or an operator editing the file.
+- Reusing an old run's deadline file is conservative when every new run has at
+  least 120 minutes: each delivery is at most 120 minutes past the observation
+  that produced it, and a later run starts at or after that observation. It
+  cannot cover the platform shortening a run below that, an earlier unrelated
+  pause/stop, host clock anomalies, or an operator editing the file.
 - A wake decision relies on `autoSuspendedAt`, `cooldownUntil` and machine
   state; anything the API cannot distinguish is skipped, which can leave no
   standby awake.

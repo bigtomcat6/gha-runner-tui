@@ -19,10 +19,13 @@ import (
 )
 
 const (
-	// hardRunCap is the controller's own ceiling: the platform may grow
-	// maxRunMinutes during a free-plan run, but the delivered deadline never
-	// moves past the initial two hours of the run.
+	// hardRunCap is the controller's own ceiling: the delivered deadline never
+	// moves more than two hours past a trusted observation. A platform budget
+	// larger than this keeps rolling forward in stable 15-minute buckets.
 	hardRunCap = 120 * time.Minute
+	// budgetAnchorQuantum is the 15-minute interval between rolling deadline
+	// updates. Within one interval the computed deadline is constant.
+	budgetAnchorQuantum = 15 * time.Minute
 	// admissionFloor mirrors the loop's session deadline floor (90 minutes of
 	// work plus a 10 minute buffer).
 	admissionFloor = 100 * time.Minute
@@ -252,9 +255,14 @@ func (b budget) deadlineKey() string {
 	return b.Deadline.UTC().Format(time.RFC3339)
 }
 
-// computeBudget caps a run at runStartedAt + min(maxRunMinutes, 120 minutes).
-// A missing or untrusted start or max-run value makes the machine not ready:
-// the controller never guesses a longer budget.
+// computeBudget derives the effective deadline for the current run. The
+// platform's deadline is runStartedAt + maxRunMinutes; the controller caps the
+// effective deadline at anchor + 120 minutes, where anchor is the start of the
+// current 15-minute interval measured from runStartedAt. anchor never exceeds
+// the trusted observation, so a delivered deadline is never more than 120
+// minutes ahead and is stable inside one interval. A platform deadline at or
+// below the cap is used unchanged. A missing or untrusted start or max-run
+// value makes the machine not ready: the controller never guesses a budget.
 func computeBudget(m Machine, now time.Time) (budget, error) {
 	if m.State != "running" {
 		return budget{}, fmt.Errorf("machine is %s, not running", m.State)
@@ -272,26 +280,32 @@ func computeBudget(m Machine, now time.Time) (budget, error) {
 	if err != nil {
 		return budget{}, errors.New("machine runStartedAt is not a valid time")
 	}
-	if started.After(now.Add(2 * time.Minute)) {
+	if started.After(now) {
 		return budget{}, errors.New("machine runStartedAt is in the future")
 	}
 	if m.MaxRunMinutes == nil {
 		return budget{}, errors.New("machine has no maxRunMinutes")
 	}
-	limit := hardRunCap
-	switch max := *m.MaxRunMinutes; {
-	case max < -1:
+	max := *m.MaxRunMinutes
+	if max < -1 {
 		return budget{}, errors.New("machine maxRunMinutes is invalid")
-	case max == -1:
-		// Unlimited on the platform; the local hard cap still applies.
-	case max == 0:
-		limit = 0
-	case max < 120:
-		limit = time.Duration(max) * time.Minute
+	}
+	anchor := started.Add(now.Sub(started).Truncate(budgetAnchorQuantum))
+	deadline := anchor.Add(hardRunCap)
+	if max >= 0 {
+		// Compare in minutes before multiplying so an implausibly large
+		// maxRunMinutes cannot overflow a duration. A platform deadline beyond
+		// the anchored cap cannot change the effective one.
+		if capMinutes := int(deadline.Sub(started) / time.Minute); max <= capMinutes {
+			platformEnd := started.Add(time.Duration(max) * time.Minute)
+			if platformEnd.Before(deadline) {
+				deadline = platformEnd
+			}
+		}
 	}
 	return budget{
 		RunStartedAt: started.UTC(),
-		Deadline:     started.Add(limit).UTC().Truncate(time.Second),
+		Deadline:     deadline.UTC().Truncate(time.Second),
 	}, nil
 }
 
