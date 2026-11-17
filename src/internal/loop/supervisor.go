@@ -21,18 +21,21 @@ import (
 )
 
 type Supervisor struct {
-	ProfilePath string
-	Docker      dockerpkg.Client
-	GitHub      gh.Client
+	ProfilePath    string
+	HostPolicyPath string // Optional override of the shared host capacity policy path.
+	Docker         dockerpkg.Client
+	GitHub         gh.Client
 
 	// Now and Sleep are injectable for deterministic tests. A nil Now uses
 	// time.Now; a nil Sleep uses a context-aware timer.
-	Now         func() time.Time
-	Sleep       func(context.Context, time.Duration) error
-	TryLock     func() (unlock func() error, acquired bool, err error)
-	Jitter      func(time.Duration) time.Duration
-	Stderr      io.Writer // nil uses os.Stderr for journal-visible diagnostics
-	skippedJobs map[int64]time.Time
+	Now             func() time.Time
+	Sleep           func(context.Context, time.Duration) error
+	TryLock         func() (unlock func() error, acquired bool, err error)
+	Jitter          func(time.Duration) time.Duration
+	Stderr          io.Writer // nil uses os.Stderr for journal-visible diagnostics
+	skippedJobs     map[int64]time.Time
+	delayedJobs     map[int64]time.Time
+	admissionPolicy state.AdmissionPolicy
 	// restartCount counts actual RunDetached attempts in this process, not polls
 	// or completed jobs. Adoption and draining never change it.
 	restartCount int
@@ -87,6 +90,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 	s.defaults()
 	s.skippedJobs = make(map[int64]time.Time)
+	s.delayedJobs = nil
+	s.admissionPolicy = state.AdmissionPolicy{}
 	s.stopDeadline = time.Time{}
 	backoff := max(profile.Loop.BackoffSeconds, 1)
 	maxBackoff := max(profile.Loop.MaxBackoffSeconds, backoff)
@@ -173,6 +178,14 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	if err := s.sessionDeadlineAdmission(p); err != nil {
 		return result, err
 	}
+	policy, err := s.loadAdmission(p)
+	if err != nil {
+		return result, err
+	}
+	if policy.Mode == state.AdmissionPaused {
+		result.state = state.LoopPaused
+		return result, nil
+	}
 	repos := make([]gh.Repository, 0, len(settings.watch))
 	for _, slug := range settings.watch {
 		owner, repo, _ := splitOwnerRepo(slug)
@@ -182,6 +195,7 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	jobs, err := s.GitHub.QueuedJobs(queryCtx, repos, p.Runner.Labels)
 	cancelQuery()
 	if err != nil {
+		s.delayedJobs = nil
 		return result, err
 	}
 	for id, until := range s.skippedJobs {
@@ -195,7 +209,12 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 			candidates = append(candidates, job.ID)
 		}
 	}
+	hadCandidates := len(candidates) != 0
+	candidates = s.admissionCandidates(candidates, policy)
 	if len(candidates) == 0 {
+		if hadCandidates {
+			result.state = state.LoopWaitingDelay
+		}
 		return result, nil
 	}
 	if ctx.Err() != nil {
@@ -209,14 +228,25 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 		result.state = state.LoopWaitingHost
 		return result, nil
 	}
+	unlock = releaseOnce(unlock)
 	defer func() { err = errors.Join(err, unlock()) }()
+	capacity, err := s.hostCapacityForLaunch()
+	if err != nil {
+		return result, err
+	}
 	queryCtx, cancelQuery = context.WithTimeout(ctx, waitSubcallTimeout)
 	holders, err := s.Docker.SlotHolders(queryCtx)
 	cancelQuery()
 	if err != nil {
 		return result, err
 	}
-	if len(holders) != 0 {
+	unknown := false
+	for _, holder := range holders {
+		if holder.State == state.ContainerUnknown {
+			unknown = true
+		}
+	}
+	if unknown || len(holders) >= capacity {
 		result.state = state.LoopWaitingHost
 		return result, nil
 	}
@@ -227,6 +257,12 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	// job queries ran. Refuse before registering or consuming a token.
 	if err := s.sessionDeadlineAdmission(p); err != nil {
 		return result, err
+	}
+	// Likewise, a local pause or delay switch during job queries must prevent
+	// a new runner launch.
+	if next, checkErr := s.recheckAdmission(p, policy); checkErr != nil || next != "" {
+		result.state = next
+		return result, checkErr
 	}
 	result.state = state.LoopRegistering
 	if err := s.writeCycle(p, result, nil); err != nil {
@@ -242,6 +278,10 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	// immediately before committing a runner name and container run.
 	if err := s.sessionDeadlineAdmission(p); err != nil {
 		return result, err
+	}
+	if next, checkErr := s.recheckAdmission(p, policy); checkErr != nil || next != "" {
+		result.state = next
+		return result, checkErr
 	}
 	stamp := s.now().UTC().Format("20060102-150405")
 	runnerPrefix := p.Runner.NamePrefix
@@ -265,6 +305,7 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 		return result, ctx.Err()
 	}
 	s.restartCount++
+	s.delayedJobs = nil
 	result.containerID, err = s.Docker.RunDetached(runCtx, spec)
 	cancelRun()
 	if ctx.Err() != nil {
@@ -290,6 +331,13 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	result.state = state.LoopRunningJob
 	if writeErr := s.writeCycle(p, result, nil); writeErr != nil {
 		return result, writeErr
+	}
+	// A successful Docker run has made this reservation visible to SlotHolders.
+	// Ambiguous launch failures retain the lock until their lifecycle is resolved.
+	if capacity > 1 && err == nil {
+		if unlockErr := unlock(); unlockErr != nil {
+			return result, unlockErr
+		}
 	}
 	wr, waitErr := s.waitContainer(ctx, p, c, settings.idle)
 	if waitErr != nil {
@@ -375,7 +423,7 @@ func (s *Supervisor) writeCycle(p config.Profile, result cycleResult, cycleErr e
 	record := stateRecord{Profile: p.Name, Repo: targetSlug(p), State: string(result.state), Health: "running",
 		LastTransitionAt: s.now().UTC().Format(time.RFC3339), LastRunnerName: result.runnerName,
 		LastContainerID: result.containerID, LastContainerName: result.containerName, LastExitCode: result.exitCode, RestartCount: s.restartCount}
-	if result.state == state.LoopSleeping {
+	if result.state == state.LoopSleeping || result.state == state.LoopPaused || result.state == state.LoopWaitingDelay {
 		record.Health = "healthy"
 	}
 	if cycleErr != nil {
@@ -528,6 +576,7 @@ func (s *Supervisor) adoptManaged(ctx context.Context, p config.Profile, setting
 				return lockErr
 			}
 			if acquired {
+				unlock = releaseOnce(unlock)
 				err = func() (err error) {
 					defer func() { err = errors.Join(err, unlock()) }()
 					_, inspectErr := s.inspectContainer(ctx, c.Name, stopping)
@@ -537,6 +586,16 @@ func (s *Supervisor) adoptManaged(ctx context.Context, p config.Profile, setting
 					result := cycleResult{runnerName: c.RunnerName, containerID: c.ID, containerName: c.Name, state: state.LoopRunningJob}
 					if err := s.writeCycle(p, result, nil); err != nil {
 						return err
+					}
+					capacity, policyErr := s.hostCapacity()
+					if policyErr != nil {
+						return policyErr
+					}
+					// Existing containers already count toward the host limit.
+					if capacity > 1 && inspectErr == nil {
+						if err := unlock(); err != nil {
+							return err
+						}
 					}
 					wr, err := s.waitContainer(ctx, p, c, settings.idle)
 					if err != nil {
@@ -912,6 +971,10 @@ func setRawIfAbsent(fields map[string]json.RawMessage, key string, value any) {
 // authorizes killing or removing a container. seen is intentionally local: a
 // taken-over container is never assumed to have registered before.
 func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dockerpkg.ContainerInfo, idle time.Duration) (waitResult, error) {
+	// A runner launched after a delayed grace period stays eligible. A runner
+	// admitted under an older policy (or adopted without that evidence) must
+	// drain when switching to delayed mode, so an idle runner cannot bypass it.
+	admittedPolicy := s.admissionPolicy
 	target, err := p.ResolveTarget()
 	if err != nil {
 		return waitResult{}, err
@@ -927,6 +990,7 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 	createdRetried := false
 	stopping := false
 	deadlineWithdrawalNotified := false
+	withdrawNotified := false
 	var lastGitHub time.Time
 	var lastDeadline time.Time
 
@@ -974,6 +1038,12 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 			createdRetried = false
 		}
 
+		policy, policyErr := state.LoadAdmissionPolicy(p.Loop.StateFile)
+		paused := policyErr != nil || policy.Mode == state.AdmissionPaused
+		withdraw := paused || (policy.Mode == state.AdmissionDelayed && policy != admittedPolicy)
+		if policyErr != nil {
+			s.noteWaitIssue(p, c, "admission policy unreadable; new admission paused; container retained")
+		}
 		// A DELETE-based removal is only ever authorized from a trustworthy,
 		// non-created observation. Inspect errors, created containers, and
 		// unknown states never reach GitHub, so a stray busy=false 204 cannot
@@ -986,6 +1056,8 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 		case !trustedObservation:
 			checkGitHub = false
 		case stopping:
+			checkGitHub = true
+		case withdraw:
 			checkGitHub = true
 		case idleReached:
 			if lastGitHub.IsZero() || s.now().Sub(lastGitHub) >= waitGitHubInterval {
@@ -1024,7 +1096,7 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 						if deadlineReached {
 							s.noteWaitIssue(p, c, "session deadline reached; idle runner withdrawn")
 						}
-						return waitResult{forceRemove: true, idleExpired: !stopping && !deadlineReached}, nil
+						return waitResult{forceRemove: true, idleExpired: !stopping && !deadlineReached && !withdraw}, nil
 					}
 					var api *gh.APIError
 					if errors.As(derr, &api) && api.StatusCode == 422 {
@@ -1054,6 +1126,15 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 					if !deadlineWithdrawalNotified {
 						s.noteWaitIssue(p, c, "session deadline reached; runner missing; container retained (withdrawal incomplete; may accept work)")
 						deadlineWithdrawalNotified = true
+					}
+				} else if withdraw {
+					// The same two-miss shortcut is unsafe during an admission
+					// withdrawal: only a current idle observation plus DELETE
+					// 204 may remove this container.
+					missing = 0
+					if !withdrawNotified {
+						s.noteWaitIssue(p, c, "admission withdrawal pending; runner missing; container retained")
+						withdrawNotified = true
 					}
 				} else {
 					missing++

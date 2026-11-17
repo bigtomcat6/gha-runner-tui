@@ -46,7 +46,7 @@ func cycleServer(t *testing.T, f *cycleHTTP) *httptest.Server {
 		q := r.URL.Query()
 		switch {
 		case r.Method == "GET" && r.URL.Path == "/repos/me/app/actions/runs":
-			if len(q) != 2 || q.Get("per_page") != "100" || (q.Get("status") != "queued" && q.Get("status") != "in_progress") {
+			if len(q) != 2 || q.Get("per_page") != "100" || (q.Get("status") != "queued" && q.Get("status") != "in_progress" && q.Get("status") != "pending") {
 				t.Errorf("runs query: %s", r.URL)
 			}
 			if f.runsCode != 0 {

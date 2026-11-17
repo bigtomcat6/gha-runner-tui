@@ -10,18 +10,20 @@ import (
 type LoopStatus string
 
 const (
-	LoopDisabled    LoopStatus = "disabled"
-	LoopStopped     LoopStatus = "stopped"
-	LoopActive      LoopStatus = "active"
-	LoopSleeping    LoopStatus = "sleeping"
-	LoopRegistering LoopStatus = "registering"
-	LoopStarting    LoopStatus = "starting"
-	LoopRunningJob  LoopStatus = "running-job"
-	LoopCleaning    LoopStatus = "cleaning"
-	LoopBackoff     LoopStatus = "backoff"
-	LoopFailed      LoopStatus = "failed"
-	LoopWaitingHost LoopStatus = "waiting-host"
-	LoopUnknown     LoopStatus = "unknown"
+	LoopDisabled     LoopStatus = "disabled"
+	LoopStopped      LoopStatus = "stopped"
+	LoopActive       LoopStatus = "active"
+	LoopSleeping     LoopStatus = "sleeping"
+	LoopRegistering  LoopStatus = "registering"
+	LoopStarting     LoopStatus = "starting"
+	LoopRunningJob   LoopStatus = "running-job"
+	LoopCleaning     LoopStatus = "cleaning"
+	LoopBackoff      LoopStatus = "backoff"
+	LoopFailed       LoopStatus = "failed"
+	LoopWaitingHost  LoopStatus = "waiting-host"
+	LoopPaused       LoopStatus = "paused"
+	LoopWaitingDelay LoopStatus = "waiting-delay"
+	LoopUnknown      LoopStatus = "unknown"
 )
 
 type LoopState struct {
@@ -97,7 +99,7 @@ func ParseLoopState(data []byte) (LoopState, error) {
 func NormalizeLoopStatus(value string) LoopStatus {
 	switch LoopStatus(value) {
 	case LoopDisabled, LoopStopped, LoopActive, LoopSleeping, LoopRegistering,
-		LoopStarting, LoopRunningJob, LoopCleaning, LoopBackoff, LoopFailed, LoopWaitingHost:
+		LoopStarting, LoopRunningJob, LoopCleaning, LoopBackoff, LoopFailed, LoopWaitingHost, LoopPaused, LoopWaitingDelay:
 		return LoopStatus(value)
 	default:
 		return LoopUnknown

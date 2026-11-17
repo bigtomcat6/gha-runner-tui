@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -81,6 +82,7 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 	tail := 200
 	input := app.CreateProfileInput{Scope: config.TargetScopeRepository, Ephemeral: true}
 	var scope, labels, watch string
+	admission := state.DefaultAdmissionPolicy()
 	wantArgs := 0
 	switch cmd {
 	case "status":
@@ -94,6 +96,8 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 	case "stop":
 		wantArgs = 1
 		fs.BoolVar(&force, "force", false, "Remove slot holders; running jobs will fail")
+	case "mode":
+		fs.IntVar(&admission.DelaySeconds, "delay-seconds", 60, "Fallback grace period (mode 2 only)")
 	case "create":
 		fs.StringVar(&scope, "scope", "repository", "repository or organization")
 		fs.StringVar(&input.RepoOwner, "owner", "", "Repository owner")
@@ -118,10 +122,33 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 	if err := parseInterspersed(fs, args[1:]); err != nil {
 		return writeArgumentError(stderr, err)
 	}
-	if fs.NArg() != wantArgs {
+	if cmd == "mode" {
+		if fs.NArg() != 1 && fs.NArg() != 2 {
+			return writeArgumentError(stderr, errors.New("usage: mode PROFILE [0|1|2] [--delay-seconds N]"))
+		}
+		delaySet := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "delay-seconds" {
+				delaySet = true
+			}
+		})
+		if fs.NArg() == 2 {
+			mode, err := strconv.Atoi(fs.Arg(1))
+			if err != nil {
+				return writeArgumentError(stderr, errors.New("mode must be 0, 1, or 2"))
+			}
+			admission.Mode = state.AdmissionMode(mode)
+			if err := admission.Validate(); err != nil {
+				return writeArgumentError(stderr, err)
+			}
+		}
+		if delaySet && (fs.NArg() != 2 || admission.Mode != state.AdmissionDelayed) {
+			return writeArgumentError(stderr, errors.New("--delay-seconds requires mode 2"))
+		}
+	} else if fs.NArg() != wantArgs {
 		return writeArgumentError(stderr, fmt.Errorf("%s requires %d positional argument(s)", cmd, wantArgs))
 	}
-	if wantArgs == 1 && strings.TrimSpace(fs.Arg(0)) == "" {
+	if (wantArgs == 1 || cmd == "mode") && strings.TrimSpace(fs.Arg(0)) == "" {
 		return writeArgumentError(stderr, errors.New("profile name is required"))
 	}
 	if tail < 0 {
@@ -174,6 +201,18 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 	}
 	snapshot := app.ProfileSnapshot{Profile: p}
 	switch cmd {
+	case "mode":
+		if fs.NArg() == 2 {
+			if err := state.SaveAdmissionPolicy(p.Loop.StateFile, admission); err != nil {
+				return writeOperationError(stderr, fmt.Errorf("set mode (run with sudo if permission is denied): %w", err))
+			}
+		} else {
+			admission, err = state.LoadAdmissionPolicy(p.Loop.StateFile)
+			if err != nil {
+				return writeOperationError(stderr, err)
+			}
+		}
+		return writeCLIText(stdout, stderr, fmt.Sprintf("profile %s: mode=%d delay=%ds (0=paused, 1=normal, 2=delayed)\n", p.Name, admission.Mode, admission.DelaySeconds))
 	case "start":
 		err = m.StartLoop(ctx, p)
 	case "restart":
@@ -343,8 +382,9 @@ func writeStatus(w io.Writer, d app.Dashboard, jsonOutput bool) error {
 			State     state.ContainerStatus `json:"state"`
 		}
 		type profileDTO struct {
-			Name    string `json:"name"`
-			Service struct {
+			Name      string                 `json:"name"`
+			Admission *state.AdmissionPolicy `json:"admission,omitempty"`
+			Service   struct {
 				Active  state.SystemdStatus `json:"active"`
 				Enabled bool                `json:"enabled"`
 			} `json:"service"`
@@ -378,7 +418,7 @@ func writeStatus(w io.Writer, d app.Dashboard, jsonOutput bool) error {
 			output.SlotHolders = append(output.SlotHolders, slotDTO{c.Profile, c.Name, c.RunnerName, c.State})
 		}
 		for _, p := range d.Profiles {
-			item := profileDTO{Name: p.Profile.Name, Health: p.Health, Errors: append([]string{}, p.Errors...)}
+			item := profileDTO{Name: p.Profile.Name, Admission: p.Admission, Health: p.Health, Errors: append([]string{}, p.Errors...)}
 			item.Service.Active, item.Service.Enabled = p.Service.Active, p.Service.Enabled
 			item.Loop.State, item.Loop.LastError = p.DisplayLoopState, p.Loop.LastError
 			if !p.Loop.LastTransitionAt.IsZero() {
@@ -409,7 +449,7 @@ func writeStatus(w io.Writer, d app.Dashboard, jsonOutput bool) error {
 	case len(d.SlotHolders) == 0:
 		text.WriteString("SLOT: free\n")
 	case len(d.SlotHolders) > 1:
-		text.WriteString("SLOT: WARNING multiple slot holders\n")
+		fmt.Fprintf(&text, "SLOT: %d occupied\n", len(d.SlotHolders))
 	}
 	for _, c := range d.SlotHolders {
 		prefix := "  "
@@ -419,13 +459,20 @@ func writeStatus(w io.Writer, d app.Dashboard, jsonOutput bool) error {
 		fmt.Fprintf(&text, "%s%s %s (container %s, runner %s)\n", prefix, c.Profile, c.State, c.Name, c.RunnerName)
 	}
 	table := tabwriter.NewWriter(&text, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(table, "PROFILE\tSERVICE\tLOOP\tCONTAINER\tGITHUB\tBUSY\tHEALTH")
+	fmt.Fprintln(table, "PROFILE\tMODE\tSERVICE\tLOOP\tCONTAINER\tGITHUB\tBUSY\tHEALTH")
 	for _, p := range d.Profiles {
 		enabled := "disabled"
 		if p.Service.Enabled {
 			enabled = "enabled"
 		}
-		fmt.Fprintf(table, "%s\t%s/%s\t%s\t%s\t%s\t%s\t%s\n", p.Profile.Name, p.Service.Active, enabled, p.DisplayLoopState, p.Container.State, p.GitHubState, p.BusyState, p.Health)
+		mode := "unknown"
+		if p.Admission != nil {
+			mode = strconv.Itoa(int(p.Admission.Mode))
+			if p.Admission.Mode == state.AdmissionDelayed {
+				mode += fmt.Sprintf("/%ds", p.Admission.DelaySeconds)
+			}
+		}
+		fmt.Fprintf(table, "%s\t%s\t%s/%s\t%s\t%s\t%s\t%s\t%s\n", p.Profile.Name, mode, p.Service.Active, enabled, p.DisplayLoopState, p.Container.State, p.GitHubState, p.BusyState, p.Health)
 	}
 	if err := table.Flush(); err != nil {
 		return err
