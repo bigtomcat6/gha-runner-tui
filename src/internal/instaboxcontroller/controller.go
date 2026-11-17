@@ -40,6 +40,12 @@ const (
 	// DefaultAPIKeyEnv is the environment variable used by a machine that does
 	// not name its own apiKeyEnv, preserving old single-account configs.
 	DefaultAPIKeyEnv = "INSTABOX_API_KEY"
+
+	// DeliverySSH is the default remote transport: one batch-mode ssh command.
+	DeliverySSH = "ssh"
+	// DeliveryAPIExec uses the machine's own account client and the documented
+	// synchronous exec route instead of an SSH identity.
+	DeliveryAPIExec = "api-exec"
 )
 
 var (
@@ -63,9 +69,12 @@ type Config struct {
 // MachineConfig describes one machine and the absolute deadline file on it.
 // APIKeyEnv optionally names the environment variable holding the API key for
 // this machine's Instabox account; nil keeps the legacy INSTABOX_API_KEY.
+// DeliveryTransport defaults to "ssh"; "api-exec" uses the documented exec
+// route through this machine's own account client and needs no SSH identity.
 type MachineConfig struct {
 	MachineID       string  `json:"machineId"`
 	DeadlinePath    string  `json:"deadlinePath"`
+	Delivery        string  `json:"deliveryTransport,omitempty"`
 	SSHHost         string  `json:"sshHost"`
 	SSHUser         string  `json:"sshUser"`
 	SSHPort         int     `json:"sshPort"`
@@ -74,27 +83,36 @@ type MachineConfig struct {
 }
 
 // UnmarshalJSON accepts apiKeyEnv only as a string name. A present but null
-// field is rejected instead of silently falling back to the global key.
+// field is rejected instead of silently falling back to the global key; the
+// delivery transport is rejected the same way instead of defaulting to SSH.
 func (m *MachineConfig) UnmarshalJSON(data []byte) error {
 	type plain MachineConfig
 	wrapped := struct {
 		*plain
-		APIKeyEnv json.RawMessage `json:"apiKeyEnv"`
+		APIKeyEnv         json.RawMessage `json:"apiKeyEnv"`
+		DeliveryTransport json.RawMessage `json:"deliveryTransport"`
 	}{plain: (*plain)(m)}
 	m.APIKeyEnv = nil
+	m.Delivery = ""
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&wrapped); err != nil {
 		return err
 	}
-	if len(wrapped.APIKeyEnv) == 0 {
-		return nil
+	if len(wrapped.APIKeyEnv) > 0 {
+		var name string
+		if err := json.Unmarshal(wrapped.APIKeyEnv, &name); err != nil {
+			return errors.New("apiKeyEnv must be a string environment variable name")
+		}
+		m.APIKeyEnv = &name
 	}
-	var name string
-	if err := json.Unmarshal(wrapped.APIKeyEnv, &name); err != nil {
-		return errors.New("apiKeyEnv must be a string environment variable name")
+	if len(wrapped.DeliveryTransport) > 0 {
+		var transport string
+		if err := json.Unmarshal(wrapped.DeliveryTransport, &transport); err != nil || transport == "" {
+			return errors.New("deliveryTransport must be \"ssh\" or \"api-exec\"")
+		}
+		m.Delivery = transport
 	}
-	m.APIKeyEnv = &name
 	return nil
 }
 
@@ -169,6 +187,16 @@ func (m *MachineConfig) Validate() error {
 	}
 	if !validLocalPath(m.DeadlinePath) {
 		return errors.New("deadlinePath must be absolute, clean and use safe characters")
+	}
+	switch m.Delivery {
+	case "", DeliverySSH:
+		m.Delivery = DeliverySSH
+	case DeliveryAPIExec:
+		// The documented exec route logs in as the sandbox's login user; no
+		// local SSH identity, host or port is consulted or required.
+		return nil
+	default:
+		return errors.New("deliveryTransport must be \"ssh\" or \"api-exec\"")
 	}
 	if !sshHostPattern.MatchString(m.SSHHost) {
 		return errors.New("sshHost must be a literal hostname or IPv4 address")
@@ -526,8 +554,9 @@ func (c *Controller) ensureDelivery(ctx context.Context, mc MachineConfig, machi
 		c.logf("machine %s: deadline %s for this run is not delivered (remote writes disabled)", mc.MachineID, budget.Deadline.Format(time.RFC3339))
 		return false, nil
 	}
-	if c.Writer == nil {
-		return false, errors.New("remote deadline writer is not configured")
+	writer, err := c.deliveryWriter(mc)
+	if err != nil {
+		return false, err
 	}
 
 	content := deadlinePayload(budget.Deadline)
@@ -539,14 +568,14 @@ func (c *Controller) ensureDelivery(ctx context.Context, mc MachineConfig, machi
 		AttemptedAt:  now,
 	}
 	c.state.Deliveries[key] = entry
-	// The pending record lands before SSH: a crash can only cause a read-first
-	// confirmation next time, never a blind overwrite.
+	// The pending record lands before the remote write: a crash can only cause
+	// a read-first confirmation next time, never a blind overwrite.
 	if err := c.saveState(); err != nil {
 		return false, fmt.Errorf("deadline delivery state could not be saved: %w", err)
 	}
 
 	if verify {
-		got, err := c.Writer.ReadDeadline(ctx, target)
+		got, err := writer.ReadDeadline(ctx, target)
 		if err != nil {
 			return false, fmt.Errorf("remote deadline remains unconfirmed: %w", err)
 		}
@@ -562,7 +591,7 @@ func (c *Controller) ensureDelivery(ctx context.Context, mc MachineConfig, machi
 		// Different content is a known state; the atomic replace below is safe.
 	}
 
-	got, err := c.Writer.WriteDeadline(ctx, target, content)
+	got, err := writer.WriteDeadline(ctx, target, content)
 	if err != nil {
 		return false, fmt.Errorf("remote deadline write failed and remains unconfirmed: %w", err)
 	}
@@ -882,8 +911,11 @@ func (l *lockHandle) release() {
 	_ = l.file.Close()
 }
 
-// RemoteTarget is one validated remote deadline location.
+// RemoteTarget is one validated remote deadline location. For api-exec only
+// MachineID, Path and Delivery are used; SSHHost/User/Port are ignored.
 type RemoteTarget struct {
+	Delivery     string
+	MachineID    string
 	Host         string
 	User         string
 	Port         int
@@ -893,6 +925,8 @@ type RemoteTarget struct {
 
 func remoteTarget(m MachineConfig) RemoteTarget {
 	return RemoteTarget{
+		Delivery:     m.Delivery,
+		MachineID:    m.MachineID,
 		Host:         m.SSHHost,
 		User:         m.SSHUser,
 		Port:         m.SSHPort,
@@ -902,6 +936,11 @@ func remoteTarget(m MachineConfig) RemoteTarget {
 }
 
 func (t RemoteTarget) key() string {
+	// The SSH key format is kept verbatim so existing confirmed state is not
+	// rewritten after an upgrade.
+	if t.Delivery == DeliveryAPIExec {
+		return strings.Join([]string{"api-exec", t.MachineID, t.Path}, "|")
+	}
 	return strings.Join([]string{
 		t.Host,
 		t.User,
@@ -914,6 +953,15 @@ func (t RemoteTarget) key() string {
 // validateRemoteTarget re-checks parameters at use time, so a manually built
 // RemoteTarget cannot smuggle options or shell metacharacters.
 func validateRemoteTarget(t RemoteTarget) error {
+	if !validLocalPath(t.Path) {
+		return errors.New("refusing remote write: unsafe deadline path")
+	}
+	if t.Delivery == DeliveryAPIExec {
+		if !machineIDPattern.MatchString(t.MachineID) {
+			return errors.New("refusing api-exec: unsafe machine ID")
+		}
+		return nil
+	}
 	if !sshHostPattern.MatchString(t.Host) {
 		return errors.New("refusing SSH: unsafe host")
 	}
@@ -926,13 +974,13 @@ func validateRemoteTarget(t RemoteTarget) error {
 	if t.IdentityFile != "" && !validLocalPath(t.IdentityFile) {
 		return errors.New("refusing SSH: unsafe identity file")
 	}
-	if !validLocalPath(t.Path) {
-		return errors.New("refusing SSH: unsafe deadline path")
-	}
 	return nil
 }
 
 func sshArgs(target RemoteTarget, script string) ([]string, error) {
+	if target.Delivery == DeliveryAPIExec {
+		return nil, errors.New("refusing SSH: api-exec target")
+	}
 	if err := validateRemoteTarget(target); err != nil {
 		return nil, err
 	}
@@ -956,6 +1004,67 @@ func sshArgs(target RemoteTarget, script string) ([]string, error) {
 type DeadlineWriter interface {
 	ReadDeadline(ctx context.Context, target RemoteTarget) (string, error)
 	WriteDeadline(ctx context.Context, target RemoteTarget, content string) (string, error)
+}
+
+// deliveryWriter picks the transport recorded in the machine's config. Only
+// an api-exec machine uses its own account client; every other machine keeps
+// the injected SSH writer and its previous behavior.
+func (c *Controller) deliveryWriter(mc MachineConfig) (DeadlineWriter, error) {
+	if mc.Delivery == DeliveryAPIExec {
+		api, err := c.apiFor(mc.MachineID)
+		if err != nil {
+			return nil, err
+		}
+		return &apiExecWriter{api: api}, nil
+	}
+	if c.Writer == nil {
+		return nil, errors.New("remote deadline writer is not configured")
+	}
+	return c.Writer, nil
+}
+
+// apiExecWriter runs the same read and atomic write shell bodies used over
+// SSH, through POST /v1/machines/{id}/exec. The API key stays in the HTTP
+// header; the remote command never receives it.
+type apiExecWriter struct {
+	api MachineAPI
+}
+
+func (w *apiExecWriter) ReadDeadline(ctx context.Context, target RemoteTarget) (string, error) {
+	if target.Delivery != DeliveryAPIExec {
+		return "", errors.New("api-exec writer was given a non-api-exec target")
+	}
+	if err := validateRemoteTarget(target); err != nil {
+		return "", err
+	}
+	result, err := w.api.ExecCommand(ctx, target.MachineID, readScript(target))
+	if err != nil {
+		return "", err
+	}
+	if !result.ExecOK() {
+		// Matches the SSH reader: a non-zero `cat` (absent or unreadable) is
+		// unconfirmed, so it never authorizes a replacement.
+		return "", errors.New("api-exec read did not complete successfully")
+	}
+	return result.Stdout, nil
+}
+
+func (w *apiExecWriter) WriteDeadline(ctx context.Context, target RemoteTarget, content string) (string, error) {
+	if target.Delivery != DeliveryAPIExec {
+		return "", errors.New("api-exec writer was given a non-api-exec target")
+	}
+	script, err := writeScript(target, content)
+	if err != nil {
+		return "", err
+	}
+	result, err := w.api.ExecCommand(ctx, target.MachineID, script)
+	if err != nil {
+		return "", err
+	}
+	if !result.ExecOK() {
+		return "", errors.New("api-exec write did not complete successfully")
+	}
+	return result.Stdout, nil
 }
 
 // SSHWriter runs one batch-mode SSH command with a bounded timeout. Host key
@@ -990,7 +1099,7 @@ func writeScript(target RemoteTarget, content string) (string, error) {
 		return "", err
 	}
 	if !validLocalPath(target.Path) || strings.HasSuffix(target.Path, "/") {
-		return "", errors.New("refusing SSH: unsafe deadline path")
+		return "", errors.New("refusing remote write: unsafe deadline path")
 	}
 	// Create an exclusive random file in the target's own directory. A fixed
 	// temp name could already be a symlink, and the shell redirect would

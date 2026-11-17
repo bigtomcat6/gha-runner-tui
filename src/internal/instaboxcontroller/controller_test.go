@@ -3,6 +3,8 @@ package instaboxcontroller
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -85,11 +87,15 @@ func suspendedMachine(id string, autoSuspendedAt time.Time) Machine {
 func stringPtr(value string) *string { return &value }
 
 type fakeAPI struct {
-	getFunc  func(context.Context, string) (Machine, error)
-	wakeFunc func(context.Context, string) (Machine, error)
-	gets     int
-	wakes    int
-	wakeIDs  []string
+	getFunc      func(context.Context, string) (Machine, error)
+	wakeFunc     func(context.Context, string) (Machine, error)
+	execFunc     func(context.Context, string, string) (ExecResult, error)
+	gets         int
+	wakes        int
+	execs        int
+	wakeIDs      []string
+	execIDs      []string
+	execCommands []string
 }
 
 func (f *fakeAPI) GetMachine(ctx context.Context, id string) (Machine, error) {
@@ -107,6 +113,16 @@ func (f *fakeAPI) WakeMachine(ctx context.Context, id string) (Machine, error) {
 		return Machine{}, errors.New("unexpected wake")
 	}
 	return f.wakeFunc(ctx, id)
+}
+
+func (f *fakeAPI) ExecCommand(ctx context.Context, id, command string) (ExecResult, error) {
+	f.execs++
+	f.execIDs = append(f.execIDs, id)
+	f.execCommands = append(f.execCommands, command)
+	if f.execFunc == nil {
+		return ExecResult{}, errors.New("unexpected exec")
+	}
+	return f.execFunc(ctx, id, command)
 }
 
 type fakeWriter struct {
@@ -1333,6 +1349,20 @@ func TestSSHArgumentsAndScriptsAreSafe(t *testing.T) {
 	if got := shellQuote("a'b"); got != `'a'\''b'` {
 		t.Fatalf("shellQuote = %q", got)
 	}
+
+	// An api-exec target must never be turned into an SSH invocation.
+	apiTarget := RemoteTarget{Delivery: DeliveryAPIExec, MachineID: testMachineA, Path: "/data/x.json"}
+	if _, err := sshArgs(apiTarget, "true"); err == nil {
+		t.Fatal("an api-exec target was accepted by sshArgs")
+	}
+	// The api-exec path must still reject unsafe paths and IDs before any request.
+	unsafe := RemoteTarget{Delivery: DeliveryAPIExec, MachineID: testMachineA, Path: "/data/../x.json"}
+	if _, err := writeScript(unsafe, content); err == nil {
+		t.Fatal("unsafe api-exec path got a write script")
+	}
+	if _, err := writeScript(RemoteTarget{Delivery: DeliveryAPIExec, MachineID: "m_bad", Path: "/data/x.json"}, content); err == nil {
+		t.Fatal("unsafe api-exec machine ID got a write script")
+	}
 }
 
 func TestWriteScriptDoesNotFollowExistingSymlinks(t *testing.T) {
@@ -1718,5 +1748,600 @@ func TestLoadConfigRejectsNullOrNonStringAPIKeyEnv(t *testing.T) {
 	}
 	if _, err := LoadConfig(writeConfigFile(t, wrap(`["INSTABOX_S1_API_KEY"]`))); err == nil {
 		t.Fatal("apiKeyEnv must be a string, not an array")
+	}
+}
+
+func TestLoadConfigAcceptsAPIExecWithoutSSHIdentity(t *testing.T) {
+	raw := `{"stateDir":"/var/lib/instabox-controller","machines":[{"machineId":"` + testMachineA + `","deliveryTransport":"api-exec","deadlinePath":"/data/gha-runner-tui/session-deadline.json"}]}`
+	cfg, err := LoadConfig(writeConfigFile(t, raw))
+	if err != nil {
+		t.Fatalf("api-exec without SSH fields should be valid: %v", err)
+	}
+	m := cfg.Machines[0]
+	if m.Delivery != DeliveryAPIExec {
+		t.Fatalf("delivery = %q", m.Delivery)
+	}
+	if m.SSHHost != "" || m.SSHUser != "" || m.SSHIdentityFile != "" {
+		t.Fatalf("api-exec invented SSH settings: %+v", m)
+	}
+
+	withSSH := `{"stateDir":"/var/lib/instabox-controller","machines":[{"machineId":"` + testMachineA + `","deadlinePath":"/data/gha-runner-tui/session-deadline.json","sshHost":"runner.example.net","sshUser":"dev"}]}`
+	cfg, err = LoadConfig(writeConfigFile(t, withSSH))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Machines[0].Delivery != DeliverySSH {
+		t.Fatalf("legacy config did not default to ssh: %q", cfg.Machines[0].Delivery)
+	}
+	if cfg.Machines[0].SSHPort != 22 {
+		t.Fatalf("legacy ssh port = %d", cfg.Machines[0].SSHPort)
+	}
+}
+
+func TestLoadConfigRejectsUnknownOrNullDeliveryTransport(t *testing.T) {
+	wrap := func(value string) string {
+		return `{"stateDir":"/var/lib/instabox-controller","machines":[{"machineId":"` + testMachineA + `","deliveryTransport":` + value + `,"deadlinePath":"/data/gha-runner-tui/session-deadline.json"}]}`
+	}
+	for _, value := range []string{`"telnet"`, `"API-EXEC"`, `""`, `null`, `123`, `{}`, `[]`} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := LoadConfig(writeConfigFile(t, wrap(value))); err == nil {
+				t.Fatalf("deliveryTransport %s was accepted", value)
+			}
+		})
+	}
+}
+
+// apiExecFake is a small in-memory remote file plus a fake exec endpoint. It
+// answers the same read/write scripts the real adapter sends.
+type apiExecFake struct {
+	*fakeAPI
+	mu      sync.Mutex
+	content map[string]string
+	readErr error
+}
+
+func newAPIExecFake() *apiExecFake {
+	f := &apiExecFake{content: map[string]string{}}
+	f.fakeAPI = &fakeAPI{execFunc: func(ctx context.Context, id, command string) (ExecResult, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		path, err := quotedPath(command)
+		if err != nil {
+			return ExecResult{}, err
+		}
+		if strings.HasPrefix(command, "cat -- ") {
+			if f.readErr != nil {
+				return ExecResult{}, f.readErr
+			}
+			value, ok := f.content[path]
+			if !ok {
+				return ExecResult{ExitCode: 1}, nil
+			}
+			return ExecResult{Stdout: value, ExitCode: 0}, nil
+		}
+		f.content[path] = decodeWriteBody(command)
+		return ExecResult{Stdout: f.content[path], ExitCode: 0}, nil
+	}}
+	return f
+}
+
+func quotedPath(command string) (string, error) {
+	// The scripts carry the deadline path as a leading single-quoted argument.
+	for _, marker := range []string{"cat -- '", "mktemp '"} {
+		if index := strings.Index(command, marker); index >= 0 {
+			rest := command[index+len(marker):]
+			end := strings.Index(rest, "'")
+			if end >= 0 {
+				path := rest[:end]
+				if marker == "mktemp '" {
+					path = filepath.Dir(path)
+				}
+				return path, nil
+			}
+		}
+	}
+	return "", errors.New("script has no quoted path")
+}
+
+func decodeWriteBody(command string) string {
+	index := strings.Index(command, "printf %s '")
+	if index < 0 {
+		return ""
+	}
+	rest := command[index+len("printf %s '"):]
+	end := strings.Index(rest, "'")
+	if end < 0 {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(rest[:end])
+	if err != nil {
+		return ""
+	}
+	return string(decoded)
+}
+
+func TestAPIExecDeliveryUsesTheMachineAccountAndNoSSHIdentity(t *testing.T) {
+	cfg := Config{StateDir: t.TempDir()}
+	m := testMachineConfig(testMachineA)
+	m.Delivery = DeliveryAPIExec
+	m.SSHHost = ""
+	m.SSHUser = ""
+	m.SSHPort = 0
+	m.DeadlinePath = "/data/gha-runner-tui/session-deadline.json"
+	cfg.Machines = []MachineConfig{m}
+	cfg.EnableRemoteWrite = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	now := testNow
+	remote := newAPIExecFake()
+	remote.getFunc = func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, now, 120), nil
+	}
+	sshWriter := &fakeWriter{}
+	controller := newController(cfg, remote, sshWriter, func() time.Time { return now }, &bytes.Buffer{})
+	defer controller.Close()
+
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// One write script; the post-confirmation check is a GET, and no SSH
+	// writer is used.
+	if remote.execs != 1 || sshWriter.writes != 0 || sshWriter.reads != 0 {
+		t.Fatalf("execs=%d ssh writes=%d reads=%d", remote.execs, sshWriter.writes, sshWriter.reads)
+	}
+	if len(remote.execIDs) != 1 || remote.execIDs[0] != testMachineA {
+		t.Fatalf("exec machine IDs = %v", remote.execIDs)
+	}
+	want := deadlinePayload(now.Add(120 * time.Minute))
+	if got := remote.content[m.DeadlinePath]; got != want {
+		t.Fatalf("remote content = %q, want %q", got, want)
+	}
+	for _, command := range remote.execCommands {
+		if strings.Contains(command, "ibk_") || strings.Contains(command, "X-API-Key") {
+			t.Fatalf("the command carried the API key: %q", command)
+		}
+	}
+	if !strings.Contains(remote.execCommands[0], ".instabox-controller.XXXXXX") || !strings.Contains(remote.execCommands[0], "mv -f --") {
+		t.Fatalf("write did not reuse the atomic random-temp script: %q", remote.execCommands[0])
+	}
+	if !strings.Contains(remote.execCommands[0], shellQuote(m.DeadlinePath)) {
+		t.Fatalf("write did not shell-quote the configured path: %q", remote.execCommands[0])
+	}
+	entry := readStateFile(t, cfg.StateDir).Deliveries[testMachineA]
+	if entry.Status != "confirmed" || entry.Target != remoteTarget(m).key() {
+		t.Fatalf("delivery state = %+v", entry)
+	}
+
+	// A second round with the same run is polling only: no exec at all.
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if remote.execs != 1 {
+		t.Fatalf("steady-state round executed %d commands", remote.execs-1)
+	}
+}
+
+func TestAPIExecEachMachineKeepsItsOwnKeyAndEndpoint(t *testing.T) {
+	type request struct {
+		path, key, command string
+	}
+	var mu sync.Mutex
+	var requestsA, requestsB []request
+	makeServer := func(requests *[]request, machineID string, content string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			var body struct {
+				Cmd string `json:"cmd"`
+			}
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &body)
+			*requests = append(*requests, request{r.URL.Path, r.Header.Get("X-API-Key"), body.Cmd})
+			if !strings.HasSuffix(r.URL.Path, "/exec") {
+				started := testNow.Format(time.RFC3339)
+				maxRun := 120
+				id := strings.TrimPrefix(r.URL.Path, "/v1/machines/")
+				doc := map[string]any{
+					"id": id, "state": "running", "desiredState": "running",
+					"runtime":      map[string]any{"ready": true},
+					"runStartedAt": started, "maxRunMinutes": maxRun,
+				}
+				data, _ := json.Marshal(doc)
+				io.WriteString(w, string(data))
+				return
+			}
+			if r.URL.Path != "/v1/machines/"+machineID+"/exec" {
+				t.Errorf("machine %s exec went to %s", machineID, r.URL.Path)
+			}
+			// The write script's readback is the deadline payload, so the
+			// per-account POSTs are distinguishable but both confirm.
+			stdout := content
+			if strings.HasPrefix(body.Cmd, "cat -- ") {
+				stdout = content
+			}
+			payload, _ := json.Marshal(map[string]any{
+				"stdout": stdout, "stderr": "", "exitCode": 0,
+				"timedOut": false, "truncated": false,
+			})
+			io.WriteString(w, string(payload))
+		}))
+	}
+	serverA := makeServer(&requestsA, testMachineA, deadlinePayload(testNow.Add(120*time.Minute)))
+	defer serverA.Close()
+	serverB := makeServer(&requestsB, testMachineB, deadlinePayload(testNow.Add(120*time.Minute)))
+	defer serverB.Close()
+
+	cfg := Config{StateDir: t.TempDir(), EnableRemoteWrite: true}
+	for _, id := range []string{testMachineA, testMachineB} {
+		m := testMachineConfig(id)
+		m.Delivery = DeliveryAPIExec
+		m.SSHHost = ""
+		m.SSHUser = ""
+		m.SSHPort = 0
+		cfg.Machines = append(cfg.Machines, m)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	apis := map[string]MachineAPI{
+		testMachineA: newAPIClient(serverA.URL, "ibk_account_s1", serverA.Client()),
+		testMachineB: newAPIClient(serverB.URL, "ibk_account_s2", serverB.Client()),
+	}
+	controller := newMultiController(cfg, apis, &fakeWriter{}, func() time.Time { return testNow }, &bytes.Buffer{})
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, tc := range []struct {
+		name     string
+		requests []request
+		key      string
+		path     string
+	}{
+		{name: "s1", requests: requestsA, key: "ibk_account_s1", path: "/v1/machines/" + testMachineA},
+		{name: "s2", requests: requestsB, key: "ibk_account_s2", path: "/v1/machines/" + testMachineB},
+	} {
+		// Initial GET, one exec write, and the post-confirmation GET.
+		if len(tc.requests) != 3 {
+			t.Fatalf("%s requests = %+v", tc.name, tc.requests)
+		}
+		if tc.requests[0].path != tc.path || tc.requests[1].path != tc.path+"/exec" || tc.requests[2].path != tc.path {
+			t.Fatalf("%s request paths = %+v", tc.name, tc.requests)
+		}
+		for _, req := range tc.requests {
+			if req.key != tc.key {
+				t.Fatalf("%s used key %q", tc.name, req.key)
+			}
+			if strings.Contains(req.command, "ibk_") || strings.Contains(req.command, "X-API-Key") {
+				t.Fatalf("%s command carried the key", tc.name)
+			}
+		}
+	}
+}
+
+func TestAPIExecStillRequiresEnableAndDryRun(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		enable bool
+		dryRun bool
+	}{
+		{name: "default off"},
+		{name: "dry run", enable: true, dryRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{StateDir: t.TempDir(), EnableRemoteWrite: tc.enable}
+			m := testMachineConfig(testMachineA)
+			m.Delivery = DeliveryAPIExec
+			m.SSHHost, m.SSHUser, m.SSHPort = "", "", 0
+			cfg.Machines = []MachineConfig{m}
+			if err := cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			now := testNow
+			api := newAPIExecFake()
+			api.getFunc = func(ctx context.Context, id string) (Machine, error) {
+				return runningMachine(testMachineA, now, 120), nil
+			}
+			sshWriter := &fakeWriter{}
+			controller := newController(cfg, api, sshWriter, func() time.Time { return now }, &bytes.Buffer{})
+			controller.DryRun = tc.dryRun
+			defer controller.Close()
+			if err := controller.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if api.execs != 0 || sshWriter.writes != 0 || sshWriter.reads != 0 {
+				t.Fatalf("execs=%d ssh writes=%d reads=%d, want none", api.execs, sshWriter.writes, sshWriter.reads)
+			}
+		})
+	}
+}
+
+func TestAPIExecUnknownWriteIsOnlyResolvedAfterReadback(t *testing.T) {
+	cfg := Config{StateDir: t.TempDir(), EnableRemoteWrite: true}
+	m := testMachineConfig(testMachineA)
+	m.Delivery = DeliveryAPIExec
+	m.SSHHost, m.SSHUser, m.SSHPort = "", "", 0
+	m.DeadlinePath = "/data/gha-runner-tui/session-deadline.json"
+	cfg.Machines = []MachineConfig{m}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	now := testNow
+	expected := deadlinePayload(now.Add(120 * time.Minute))
+	remote := newAPIExecFake()
+	remote.getFunc = func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, now, 120), nil
+	}
+	// The first write lands but the answer is lost.
+	realExec := remote.fakeAPI.execFunc
+	var lostOnce sync.Once
+	remote.fakeAPI.execFunc = func(ctx context.Context, id, command string) (ExecResult, error) {
+		result, err := realExec(ctx, id, command)
+		if err == nil && strings.HasPrefix(command, "umask 077") {
+			var skip bool
+			lostOnce.Do(func() { skip = true })
+			if skip {
+				return ExecResult{}, errors.New("instabox API request failed")
+			}
+		}
+		return result, err
+	}
+
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, remote, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("expected the unknown write to be reported")
+	}
+	if remote.execs != 1 || !strings.Contains(logBuffer.String(), "budget-ready=false") {
+		t.Fatalf("execs=%d log=%s", remote.execs, logBuffer.String())
+	}
+	if entry := readStateFile(t, cfg.StateDir).Deliveries[testMachineA]; entry.Status != "pending" {
+		t.Fatalf("state = %+v", entry)
+	}
+
+	// Next round reads first; identical content confirms without a rewrite,
+	// and the post-confirmation GET still runs.
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := remote.content[m.DeadlinePath]; got != expected {
+		t.Fatalf("content = %q", got)
+	}
+	if remote.execs != 2 {
+		t.Fatalf("execs = %d, want one readback and no second write (1 lost write + 1 read)", remote.execs)
+	}
+	if !strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("matching readback was not confirmed: %s", logBuffer.String())
+	}
+	if calls := remote.gets; calls != 3 {
+		t.Fatalf("GET calls = %d, want initial + post-confirmation", calls)
+	}
+}
+
+func seedPendingDelivery(t *testing.T, controller *Controller, m MachineConfig, now time.Time) {
+	t.Helper()
+	if err := controller.ensureReady(); err != nil {
+		t.Fatal(err)
+	}
+	controller.state.Deliveries[m.MachineID] = deliveryState{
+		Target:       remoteTarget(m).key(),
+		RunStartedAt: now.Format(time.RFC3339Nano),
+		Deadline:     now.Add(120 * time.Minute).Format(time.RFC3339),
+		Status:       "pending",
+		AttemptedAt:  now,
+	}
+	if err := controller.saveState(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAPIExecChangedRunAfterReadbackIsNotReady(t *testing.T) {
+	cfg := Config{StateDir: t.TempDir(), EnableRemoteWrite: true}
+	m := testMachineConfig(testMachineA)
+	m.Delivery = DeliveryAPIExec
+	m.SSHHost, m.SSHUser, m.SSHPort = "", "", 0
+	m.DeadlinePath = "/data/gha-runner-tui/session-deadline.json"
+	cfg.Machines = []MachineConfig{m}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	now := testNow
+	expected := deadlinePayload(now.Add(120 * time.Minute))
+	remote := newAPIExecFake()
+	remote.content[m.DeadlinePath] = expected
+	getCalls := 0
+	remote.getFunc = func(ctx context.Context, id string) (Machine, error) {
+		getCalls++
+		if getCalls >= 2 {
+			// A new run started while the readback was confirming the old one.
+			return runningMachine(testMachineA, now.Add(time.Minute), 120), nil
+		}
+		return runningMachine(testMachineA, now, 120), nil
+	}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, remote, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+	seedPendingDelivery(t, controller, m, now)
+
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("a changed run after the confirmation readback must be reported")
+	}
+	if remote.execs != 1 {
+		t.Fatalf("execs = %d, want only the readback", remote.execs)
+	}
+	if getCalls != 2 {
+		t.Fatalf("GET calls = %d, want initial + post-confirmation", getCalls)
+	}
+	if strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("changed run reported ready: %s", logBuffer.String())
+	}
+}
+
+func TestAPIExecReadbackFailureKeepsPendingAndDoesNotRewrite(t *testing.T) {
+	cfg := Config{StateDir: t.TempDir(), EnableRemoteWrite: true}
+	m := testMachineConfig(testMachineA)
+	m.Delivery = DeliveryAPIExec
+	m.SSHHost, m.SSHUser, m.SSHPort = "", "", 0
+	m.DeadlinePath = "/data/gha-runner-tui/session-deadline.json"
+	cfg.Machines = []MachineConfig{m}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	now := testNow
+	expected := deadlinePayload(now.Add(120 * time.Minute))
+	remote := newAPIExecFake()
+	remote.content[m.DeadlinePath] = expected
+	remote.readErr = errors.New("instabox API request failed")
+	remote.getFunc = func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, now, 120), nil
+	}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, remote, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+	seedPendingDelivery(t, controller, m, now)
+
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("expected the unconfirmed readback to be reported")
+	}
+	// Only the read was attempted: no blind rewrite after the failed read.
+	if remote.execs != 1 || !strings.HasPrefix(remote.execCommands[0], "cat -- ") {
+		t.Fatalf("execs=%d commands=%v", remote.execs, remote.execCommands)
+	}
+	if entry := readStateFile(t, cfg.StateDir).Deliveries[testMachineA]; entry.Status != "pending" {
+		t.Fatalf("read failure changed state: %+v", entry)
+	}
+	if strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("read failure reported ready: %s", logBuffer.String())
+	}
+}
+
+func TestAPIExecNonzeroExitIsNeverAConfirmedReadback(t *testing.T) {
+	cfg := Config{StateDir: t.TempDir(), EnableRemoteWrite: true}
+	m := testMachineConfig(testMachineA)
+	m.Delivery = DeliveryAPIExec
+	m.SSHHost, m.SSHUser, m.SSHPort = "", "", 0
+	m.DeadlinePath = "/data/gha-runner-tui/session-deadline.json"
+	cfg.Machines = []MachineConfig{m}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	now := testNow
+	remote := newAPIExecFake()
+	remote.getFunc = func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, now, 120), nil
+	}
+	// The readback's cat fails and prints nothing.
+	remote.execFunc = func(ctx context.Context, id, command string) (ExecResult, error) {
+		return ExecResult{ExitCode: 1}, nil
+	}
+	remote.readErr = nil
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, remote, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("a failed write must be reported")
+	}
+	if strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("nonzero exit reported ready: %s", logBuffer.String())
+	}
+	if entry := readStateFile(t, cfg.StateDir).Deliveries[testMachineA]; entry.Status != "pending" {
+		t.Fatalf("state = %+v", entry)
+	}
+}
+
+func TestAPIExecPermissionDeniedStaysBlockedWithoutSudoOrLeak(t *testing.T) {
+	cfg := Config{StateDir: t.TempDir(), EnableRemoteWrite: true}
+	m := testMachineConfig(testMachineA)
+	m.Delivery = DeliveryAPIExec
+	m.SSHHost, m.SSHUser, m.SSHPort = "", "", 0
+	m.DeadlinePath = "/data/gha-runner-tui/session-deadline.json"
+	cfg.Machines = []MachineConfig{m}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	now := testNow
+	remote := newAPIExecFake()
+	remote.getFunc = func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, now, 120), nil
+	}
+	// The login user cannot create the temp file in the target directory.
+	remote.execFunc = func(ctx context.Context, id, command string) (ExecResult, error) {
+		return ExecResult{Stderr: "mktemp: Permission denied " + m.DeadlinePath, ExitCode: 1}, nil
+	}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, remote, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("a blocked write must be reported")
+	}
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "did not complete successfully") {
+		t.Fatalf("logs = %s", logs)
+	}
+	// stderr is not copied into logs, and nothing escalates to sudo.
+	if strings.Contains(logs, "Permission denied") {
+		t.Fatalf("remote stderr was logged: %s", logs)
+	}
+	for _, command := range remote.execCommands {
+		if strings.Contains(command, "sudo") || strings.Contains(command, "root") {
+			t.Fatalf("command escalated privileges: %q", command)
+		}
+	}
+	if entry := readStateFile(t, cfg.StateDir).Deliveries[testMachineA]; entry.Status != "pending" {
+		t.Fatalf("blocked write must stay unconfirmed: %+v", entry)
+	}
+	if strings.Contains(logs, "budget-ready=true") {
+		t.Fatalf("blocked write reported ready: %s", logs)
+	}
+}
+
+func TestAPIExec403FailsWithoutFallbackToSSH(t *testing.T) {
+	cfg := Config{StateDir: t.TempDir(), EnableRemoteWrite: true}
+	m := testMachineConfig(testMachineA)
+	m.Delivery = DeliveryAPIExec
+	m.SSHHost, m.SSHUser, m.SSHPort = "", "", 0
+	m.DeadlinePath = "/data/gha-runner-tui/session-deadline.json"
+	cfg.Machines = []MachineConfig{m}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	now := testNow
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/exec") {
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `{"error":{"code":"missing_scope","message":"ibk_secret_value","requiredScopes":["machines:write"]}}`)
+			return
+		}
+		started := testNow.Format(time.RFC3339)
+		maxRun := 120
+		io.WriteString(w, `{"id":"`+testMachineA+`","state":"running","desiredState":"running","runtime":{"ready":true},"runStartedAt":"`+started+`","maxRunMinutes":`+fmt.Sprint(maxRun)+`}`)
+	}))
+	defer server.Close()
+	sshWriter := &fakeWriter{}
+	logBuffer := &bytes.Buffer{}
+	controller := newMultiController(cfg, map[string]MachineAPI{
+		testMachineA: newAPIClient(server.URL, "ibk_secret_value", server.Client()),
+	}, sshWriter, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("expected the refused exec to be reported")
+	}
+	if sshWriter.writes != 0 || sshWriter.reads != 0 {
+		t.Fatalf("403 fell back to SSH: writes=%d reads=%d", sshWriter.writes, sshWriter.reads)
+	}
+	if strings.Contains(logBuffer.String(), "ibk_secret_value") {
+		t.Fatalf("logs leaked the key: %s", logBuffer.String())
+	}
+	if !strings.Contains(logBuffer.String(), "missing_scope") {
+		t.Fatalf("logs = %s", logBuffer.String())
+	}
+	if entry := readStateFile(t, cfg.StateDir).Deliveries[testMachineA]; entry.Status != "pending" {
+		t.Fatalf("refused write must stay unconfirmed: %+v", entry)
 	}
 }
