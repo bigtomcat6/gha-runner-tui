@@ -198,9 +198,9 @@ func (c Client) DeleteOrgRunner(ctx context.Context, org string, id int64) error
 }
 
 // QueuedJobs returns queued jobs across repos whose labels are a case
-// insensitive subset of the requested labels. It scans both queued and
-// in_progress runs so a job that started between the two queries is still
-// seen, dedupes runs/jobs, and never follows pagination.
+// insensitive subset of the requested labels. A queued job can belong to a
+// pending run, so scan pending as well as queued and in_progress runs. Deduping
+// handles runs that change status between queries. Pagination is not followed.
 func (c Client) QueuedJobs(ctx context.Context, repos []Repository, labels []string) ([]Job, error) {
 	allowed := map[string]bool{"self-hosted": true}
 	for _, label := range labels {
@@ -211,7 +211,7 @@ func (c Client) QueuedJobs(ctx context.Context, repos []Repository, labels []str
 	for _, repo := range repos {
 		seenRuns := map[int64]bool{}
 		seenJobs := map[int64]bool{}
-		for _, status := range []string{"queued", "in_progress"} {
+		for _, status := range []string{"queued", "in_progress", "pending"} {
 			runsQuery := url.Values{}
 			runsQuery.Set("status", status)
 			runsQuery.Set("per_page", "100")

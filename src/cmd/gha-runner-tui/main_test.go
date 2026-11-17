@@ -476,7 +476,7 @@ func TestWriteStatusStrictDTOAndText(t *testing.T) {
 		want    string
 	}{
 		{nil, nil, "SLOT: free"}, {d.SlotHolders, nil, "SLOT: p created"},
-		{append(append([]docker.ContainerInfo{}, d.SlotHolders...), docker.ContainerInfo{Profile: "q", Name: "cq", State: state.ContainerRunning}), nil, "SLOT: WARNING"},
+		{append(append([]docker.ContainerInfo{}, d.SlotHolders...), docker.ContainerInfo{Profile: "q", Name: "cq", State: state.ContainerRunning}), nil, "SLOT: 2 occupied"},
 		{nil, &slotError, "SLOT: unknown"},
 	} {
 		out.Reset()
@@ -741,7 +741,7 @@ func TestCLIStatusSlotsThroughRealManager(t *testing.T) {
 	}{
 		{"", "SLOT: free", 0},
 		{"id\tgha-p-created\timage\tcreated\tp\tp-r\n", "SLOT: p created", 1},
-		{"id\tgha-p-created\timage\tcreated\tp\tp-r\nother\tgha-q-running\timage\trunning\tq\tq-r\n", "SLOT: WARNING", 2},
+		{"id\tgha-p-created\timage\tcreated\tp\tp-r\nother\tgha-q-running\timage\trunning\tq\tq-r\n", "SLOT: 2 occupied", 2},
 	} {
 		f := newCLIFixture(t)
 		f.profile(t, "q")

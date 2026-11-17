@@ -342,7 +342,39 @@ func TestDeleteOrgRunnerGroupUsesGroupIDEndpoint(t *testing.T) {
 	}
 }
 
-func TestQueuedJobsIncludesInProgressAndMatchesSubset(t *testing.T) {
+func TestQueuedJobsFindsQueuedJobInPendingRun(t *testing.T) {
+	t.Setenv("TEST_PENDING_QUEUE_TOKEN", "fake-queue-token")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/me/app/actions/runs":
+			if r.URL.Query().Get("status") == "pending" {
+				fmt.Fprint(w, `{"workflow_runs":[{"id":40724398104,"status":"pending"}]}`)
+			} else {
+				fmt.Fprint(w, `{"workflow_runs":[]}`)
+			}
+		case "/repos/me/app/actions/runs/40724398104/jobs":
+			fmt.Fprint(w, `{"jobs":[
+				{"id":122943623366,"status":"queued","labels":["self-hosted","linux","x64"]},
+				{"id":2,"status":"in_progress","labels":["self-hosted","linux","x64"]},
+				{"id":3,"status":"queued","labels":["self-hosted","windows","x64"]},
+				{"id":4,"status":"queued","labels":[]}]}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "TEST_PENDING_QUEUE_TOKEN", "", nil, srv.Client())
+	jobs, err := c.QueuedJobs(context.Background(), []Repository{{Owner: "me", Name: "app"}}, []string{"self-hosted", "linux", "x64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != 122943623366 {
+		t.Fatalf("queued job in pending run was not found: %v", jobs)
+	}
+}
+
+func TestQueuedJobsScansAllRunnableStatusesAndDeduplicates(t *testing.T) {
 	t.Setenv("TEST_QUEUE_TOKEN", "fake-queue-token")
 	seen := map[string]int{}
 	var mu sync.Mutex
@@ -356,7 +388,7 @@ func TestQueuedJobsIncludesInProgressAndMatchesSubset(t *testing.T) {
 		switch r.URL.Path {
 		case "/repos/me/app/actions/runs":
 			status := r.URL.Query().Get("status")
-			if status != "queued" && status != "in_progress" {
+			if status != "queued" && status != "in_progress" && status != "pending" {
 				t.Errorf("status: %s", status)
 			}
 			mu.Lock()
@@ -364,6 +396,9 @@ func TestQueuedJobsIncludesInProgressAndMatchesSubset(t *testing.T) {
 			mu.Unlock()
 			fmt.Fprint(w, `{"workflow_runs":[{"id":10}]}`)
 		case "/repos/me/app/actions/runs/10/jobs":
+			mu.Lock()
+			seen["jobs"]++
+			mu.Unlock()
 			if r.URL.Query().Get("filter") != "latest" {
 				t.Error("filter")
 			}
@@ -385,7 +420,7 @@ func TestQueuedJobsIncludesInProgressAndMatchesSubset(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(jobs) != 1 || jobs[0].ID != 1 || seen["queued"] != 1 || seen["in_progress"] != 1 {
+	if len(jobs) != 1 || jobs[0].ID != 1 || seen["queued"] != 1 || seen["in_progress"] != 1 || seen["pending"] != 1 || seen["jobs"] != 1 {
 		t.Fatalf("jobs=%v, requests=%v", jobs, seen)
 	}
 }
@@ -909,7 +944,7 @@ func TestQueuedJobsBoundaryLabels(t *testing.T) {
 		switch r.URL.Path {
 		case "/repos/me/app/actions/runs":
 			status := r.URL.Query().Get("status")
-			if status != "queued" && status != "in_progress" {
+			if status != "queued" && status != "in_progress" && status != "pending" {
 				t.Errorf("status: %s", status)
 			}
 			runs++
@@ -937,7 +972,7 @@ func TestQueuedJobsBoundaryLabels(t *testing.T) {
 	if len(got) != 1 || got[0].ID != 1 {
 		t.Fatalf("jobs=%v", got)
 	}
-	if runs != 2 || jobs != 1 {
+	if runs != 3 || jobs != 1 {
 		t.Fatalf("runs=%d jobs=%d", runs, jobs)
 	}
 }

@@ -115,7 +115,7 @@ func ResolveHealth(in HealthInputs) CombinedHealth {
 		return HealthUnhealthy
 	}
 
-	if in.Loop == LoopWaitingHost && in.Container == ContainerNone {
+	if (in.Loop == LoopWaitingHost || in.Loop == LoopPaused || in.Loop == LoopWaitingDelay) && in.Container == ContainerNone {
 		return HealthHealthy
 	}
 

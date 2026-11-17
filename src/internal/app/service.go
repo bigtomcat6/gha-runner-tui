@@ -34,6 +34,7 @@ type GitHubClient interface {
 
 type ProfileSnapshot struct {
 	Profile          config.Profile
+	Admission        *state.AdmissionPolicy
 	Service          systemdpkg.ServiceStatus
 	Loop             state.LoopState
 	LoopPresent      bool
@@ -127,6 +128,12 @@ func (s Service) loadProfile(ctx context.Context, cfg config.GlobalConfig, profi
 		BusyState:   state.BusyUnknown,
 	}
 	var matchedContainers []dockerpkg.ContainerInfo
+	admission, admissionErr := state.LoadAdmissionPolicy(profile.Loop.StateFile)
+	if admissionErr != nil {
+		snapshot.Errors = append(snapshot.Errors, "admission: "+admissionErr.Error())
+	} else {
+		snapshot.Admission = &admission
+	}
 
 	serviceStatus, err := s.Systemd.Status(ctx, profile.Service.Name)
 	if err != nil {
