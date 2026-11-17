@@ -24,7 +24,7 @@ const (
 )
 
 // errNoAPIKey keeps an unauthenticated controller from sending any request.
-var errNoAPIKey = errors.New("INSTABOX_API_KEY is required")
+var errNoAPIKey = errors.New("an Instabox API key is required")
 
 // APIError is a non-2xx answer. It carries only the status and the documented
 // error code, never the raw response body or request headers.

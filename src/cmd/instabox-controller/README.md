@@ -36,8 +36,10 @@ moment.
 ## Configuration
 
 The controller reads one JSON file (`--config`). There is deliberately no API
-base URL and no key field: the key comes only from `INSTABOX_API_KEY`, and the
-API host is fixed to `https://api.instabox.sh`.
+base URL and no raw key field: each machine may name the environment variable
+that holds the key for **its** Instabox account, and the API host is fixed to
+`https://api.instabox.sh`. A machine without `apiKeyEnv` keeps the legacy
+single-account behavior and reads `INSTABOX_API_KEY`.
 
 ```json
 {
@@ -48,6 +50,7 @@ API host is fixed to `https://api.instabox.sh`.
   "machines": [
     {
       "machineId": "REPLACE_WITH_MACHINE_ID",
+      "apiKeyEnv": "INSTABOX_S1_API_KEY",
       "deadlinePath": "/var/lib/gha-runner-tui/state/session-deadline.json",
       "sshHost": "REPLACE_WITH_SSH_HOST",
       "sshUser": "REPLACE_WITH_SSH_USER",
@@ -56,6 +59,7 @@ API host is fixed to `https://api.instabox.sh`.
     },
     {
       "machineId": "REPLACE_WITH_OTHER_MACHINE_ID",
+      "apiKeyEnv": "INSTABOX_S2_API_KEY",
       "deadlinePath": "/var/lib/gha-runner-tui/state/session-deadline.json",
       "sshHost": "REPLACE_WITH_OTHER_SSH_HOST",
       "sshUser": "REPLACE_WITH_SSH_USER",
@@ -65,9 +69,32 @@ API host is fixed to `https://api.instabox.sh`.
 }
 ```
 
+The matching `EnvironmentFile` (for example
+`/etc/instabox-controller/credentials.env`, created by you with mode `0600`)
+holds the values; the variable names are the only key-related text in the JSON
+file:
+
+```dotenv
+INSTABOX_S1_API_KEY=REPLACE_WITH_S1_ACCOUNT_KEY
+INSTABOX_S2_API_KEY=REPLACE_WITH_S2_ACCOUNT_KEY
+```
+
+- Each key is used only for the machines that name its variable. A machine's
+  GET, wake and post-write check always use that machine's own account key.
+  Two machines may reference the same variable when they really share one
+  account; the legacy global `INSTABOX_API_KEY` is still supported for a
+  single-account config.
+- Key scope is per account: polling needs `machines:read`, enabling wake needs
+  `machines:write` (which includes read). One key must not be reused across
+  two different Instabox accounts; give each account its own variable.
 - Machine IDs and SSH details are site-specific; none are built in. `machineId`
   must be the machine's real `m_...` ID (names are not accepted, so the
-  controller can compare identities from responses).
+  controller can compare identities from responses). Two accounts may use
+  identical display names; IDs are still the identity.
+- `apiKeyEnv` is an environment variable **name**. A value that is not a valid
+  name is rejected at startup, and a missing or blank value fails closed
+  before any network, SSH or state activity. An explicit `apiKeyEnv` never
+  falls back to `INSTABOX_API_KEY` or another machine's key.
 - `deadlinePath` must be the same **absolute** file configured as
   `loop.session_deadline_file` on that machine, and that file must be updated
   by this controller only.
@@ -76,17 +103,25 @@ API host is fixed to `https://api.instabox.sh`.
 - `sshIdentityFile` is optional; omit it to use the agent/default key.
 - `stateDir` holds the single-instance lock and the small deduplication state.
   It is created with mode `0700`; state is written atomically with mode `0600`.
+  It is shared by all configured accounts; keys, names and quotas stay
+  independent per account, and the state keys remain machine IDs.
 
 `pollIntervalSeconds` defaults to 30 and accepts 10–3600.
 
 ## Enabling writes and wake
 
-1. Put the key in `INSTABOX_API_KEY` in the controller's environment
-   (for example a systemd `EnvironmentFile` that you create yourself). It is
-   never read from the config file and never logged.
-2. Scope: polling needs `machines:read`. Enabling wake needs `machines:write`
-   (which includes read). Instabox has no wake-only scope.
-3. First run a preflight round; this makes GETs but no SSH and no wake:
+1. Put each account's key in the variable named by its machines'
+   `apiKeyEnv` (for example a systemd `EnvironmentFile` that you create
+   yourself), or keep `INSTABOX_API_KEY` for a legacy single-account config.
+   Keys are never read from the JSON config file and never logged.
+2. Scope per account: polling needs `machines:read`, enabling wake needs
+   `machines:write` (which includes read). Instabox has no wake-only scope.
+   A different account needs its own key; never point two accounts at one key.
+3. First run a preflight round; this makes GETs but no SSH and no wake.
+   With split accounts, each key performs only the GETs for its own machines.
+   Set the variables the config names, for example by exporting the contents
+   of the file you created above in the same shell (`set -a; . ./credentials.env; set +a`),
+   or keep a single legacy key inline:
 
    ```bash
    INSTABOX_API_KEY=... ./instabox-controller --config controller.json --once --dry-run
@@ -98,11 +133,12 @@ API host is fixed to `https://api.instabox.sh`.
    deadline file. Set `enableWake: true` separately to allow one standby wake.
    `--dry-run` on the command line always overrides both to off.
 
-Run continuously without `--once` for the normal loop. Missing
-`INSTABOX_API_KEY` exits with status 2 before any config-dependent network or
-SSH activity. A second instance on the same `stateDir` fails closed while the
-first holds the lock. Run exactly one controller on one always-on host: the
-lock is local and cannot coordinate copies on separate hosts.
+Run continuously without `--once` for the normal loop. Any configured machine
+whose key variable is missing, blank or not a valid name exits with status 2
+before any state directory, lock, network or SSH activity. A second instance on
+the same `stateDir` fails closed while the first holds the lock. Run exactly one
+controller on one always-on host: the lock is local and cannot coordinate
+copies on separate hosts.
 
 ## Deadline policy
 
