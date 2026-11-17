@@ -109,6 +109,7 @@ type LoopConfig struct {
 	MaxBackoffSeconds   int    `yaml:"max_backoff_seconds"`
 	PollIntervalSeconds int    `yaml:"poll_interval_seconds,omitempty"`
 	IdleTimeoutSeconds  int    `yaml:"idle_timeout_seconds,omitempty"`
+	SessionDeadlineFile string `yaml:"session_deadline_file,omitempty"`
 	StateFile           string `yaml:"state_file"`
 	LogDir              string `yaml:"log_dir"`
 }

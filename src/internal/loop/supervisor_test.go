@@ -847,6 +847,9 @@ func writeLoopProfile(t *testing.T, p config.Profile) string {
 	watch, _ := json.Marshal(p.Runner.WatchRepositories)
 	path := filepath.Join(t.TempDir(), "profile.yaml")
 	text := fmt.Sprintf("name: %s\nrepo: {owner: me, name: app}\nservice: {name: gha-p.service}\nrunner:\n  ephemeral: %t\n  name_prefix: p\n  labels: [linux]\n  watch_repositories: %s\ndocker:\n  image: runner:test\n  container_name_prefix: gha-p\n  remove_after_exit: true\nloop:\n  state_file: %s\n  log_dir: %s\n  backoff_seconds: 1\n  max_backoff_seconds: 4\n  interval_seconds: 999\n", p.Name, p.Runner.Ephemeral, watch, p.Loop.StateFile, p.Loop.LogDir)
+	if p.Loop.SessionDeadlineFile != "" {
+		text += fmt.Sprintf("  session_deadline_file: %s\n", p.Loop.SessionDeadlineFile)
+	}
 	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
 		t.Fatal(err)
 	}
