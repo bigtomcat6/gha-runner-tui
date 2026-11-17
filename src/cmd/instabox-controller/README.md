@@ -6,13 +6,17 @@ absolute `session-deadline.json` aligned with that machine's real run budget,
 and can optionally wake one idle-suspended standby.
 
 It is **not a read-only status tool**. Deadline delivery is a write to each
-machine over SSH, and enabling wake sends `POST /v1/machines/{id}/wake`. Both
-are disabled in the configuration below until you explicitly enable them.
+machine, either over SSH (the default) or, opt-in per machine, through the
+documented synchronous `POST /v1/machines/{id}/exec` route with that machine's
+own API key. Enabling wake sends `POST /v1/machines/{id}/wake`. Both writes and
+wake are disabled in the configuration below until you explicitly enable them.
 
 The intended deployment host is a **constantly online Linux machine** (the
 `tokyo-s2` SSH host in the current setup). It can be built and tested on macOS,
-but a laptop that suspends cannot poll reliably. This repository does not
-install a systemd unit, launchd job or any remote service.
+but a laptop that suspends cannot poll reliably. With `api-exec` it needs
+outbound HTTPS and the account keys, but no SSH identity or route to the
+machines; the default `ssh` transport still needs the matching SSH access. This
+repository does not install a systemd unit, launchd job or any remote service.
 
 ## Build and test (from `src`)
 
@@ -41,6 +45,13 @@ that holds the key for **its** Instabox account, and the API host is fixed to
 `https://api.instabox.sh`. A machine without `apiKeyEnv` keeps the legacy
 single-account behavior and reads `INSTABOX_API_KEY`.
 
+A machine's `deliveryTransport` is `"ssh"` (the default) or `"api-exec"`. With
+`"api-exec"`, `sshHost`, `sshUser`, `sshPort` and `sshIdentityFile` are not
+required and are ignored: the controller sends a bounded `bash -lc` command
+through `POST /v1/machines/{id}/exec` using that machine's own account client.
+Omit `deliveryTransport` to keep the SSH behavior and then set `sshHost` and
+`sshUser` (optionally `sshPort` and `sshIdentityFile`).
+
 ```json
 {
   "pollIntervalSeconds": 30,
@@ -51,19 +62,14 @@ single-account behavior and reads `INSTABOX_API_KEY`.
     {
       "machineId": "REPLACE_WITH_MACHINE_ID",
       "apiKeyEnv": "INSTABOX_S1_API_KEY",
-      "deadlinePath": "/var/lib/gha-runner-tui/state/session-deadline.json",
-      "sshHost": "REPLACE_WITH_SSH_HOST",
-      "sshUser": "REPLACE_WITH_SSH_USER",
-      "sshPort": 22,
-      "sshIdentityFile": "/home/deploy/.ssh/id_ed25519"
+      "deliveryTransport": "api-exec",
+      "deadlinePath": "/data/gha-runner-tui/session-deadline.json"
     },
     {
       "machineId": "REPLACE_WITH_OTHER_MACHINE_ID",
       "apiKeyEnv": "INSTABOX_S2_API_KEY",
-      "deadlinePath": "/var/lib/gha-runner-tui/state/session-deadline.json",
-      "sshHost": "REPLACE_WITH_OTHER_SSH_HOST",
-      "sshUser": "REPLACE_WITH_SSH_USER",
-      "sshPort": 22
+      "deliveryTransport": "api-exec",
+      "deadlinePath": "/data/gha-runner-tui/session-deadline.json"
     }
   ]
 }
@@ -80,24 +86,40 @@ INSTABOX_S2_API_KEY=REPLACE_WITH_S2_ACCOUNT_KEY
 ```
 
 - Each key is used only for the machines that name its variable. A machine's
-  GET, wake and post-write check always use that machine's own account key.
-  Two machines may reference the same variable when they really share one
+  GET, wake, exec and post-write check always use that machine's own account
+  key. Two machines may reference the same variable when they really share one
   account; the legacy global `INSTABOX_API_KEY` is still supported for a
   single-account config.
-- Key scope is per account: polling needs `machines:read`, enabling wake needs
-  `machines:write` (which includes read). One key must not be reused across
-  two different Instabox accounts; give each account its own variable.
+- Key scope is per account: polling needs `machines:read`; enabling wake or
+  `api-exec` needs `machines:write` (which includes read). The key is sent only
+  in the `X-API-Key` HTTP header to `https://api.instabox.sh`; it is never part of
+  an exec command and never reaches the machine. One key must not be reused
+  across two different Instabox accounts; give each account its own variable.
+- A `403 missing_scope` on an exec is reported as a bounded, non-sensitive
+  failure. It is never retried with another account's key and never falls back
+  to SSH.
 - Machine IDs and SSH details are site-specific; none are built in. `machineId`
   must be the machine's real `m_...` ID (names are not accepted, so the
   controller can compare identities from responses). Two accounts may use
   identical display names; IDs are still the identity.
+- `deliveryTransport` accepts only `"ssh"` or `"api-exec"`; missing means
+  `"ssh"`, and `null`, an empty string or any other value is rejected at
+  startup. With `api-exec`, the remote command runs as the machine's login user
+  (`dev`, HOME `/data/home`) and the machine must be `running`; a non-running
+  machine is a plain `409 machine_not_running` and is never treated as success.
 - `apiKeyEnv` is an environment variable **name**. A value that is not a valid
   name is rejected at startup, and a missing or blank value fails closed
   before any network, SSH or state activity. An explicit `apiKeyEnv` never
   falls back to `INSTABOX_API_KEY` or another machine's key.
 - `deadlinePath` must be the same **absolute** file configured as
   `loop.session_deadline_file` on that machine, and that file must be updated
-  by this controller only.
+  by this controller only. For `api-exec` it must be writable by the login user
+  (`dev`); the controller never uses `sudo` and never defaults to a root-only
+  path. Its parent directory must already exist and be writable by `dev`,
+  because the atomic replacement creates its random temporary file there; the
+  controller does not create directories. A permission failure is reported as
+  an unconfirmed delivery. For the planned deployment, use a dedicated
+  user-writable directory such as `/data/gha-runner-tui/session-deadline.json`.
 - `sshHost` is a literal hostname or IPv4 address. An `~/.ssh/config` alias is
   allowed because it matches the same character set, and `ssh` resolves it.
 - `sshIdentityFile` is optional; omit it to use the agent/default key.
@@ -114,11 +136,13 @@ INSTABOX_S2_API_KEY=REPLACE_WITH_S2_ACCOUNT_KEY
    `apiKeyEnv` (for example a systemd `EnvironmentFile` that you create
    yourself), or keep `INSTABOX_API_KEY` for a legacy single-account config.
    Keys are never read from the JSON config file and never logged.
-2. Scope per account: polling needs `machines:read`, enabling wake needs
-   `machines:write` (which includes read). Instabox has no wake-only scope.
-   A different account needs its own key; never point two accounts at one key.
-3. First run a preflight round; this makes GETs but no SSH and no wake.
-   With split accounts, each key performs only the GETs for its own machines.
+2. Scope per account: polling needs `machines:read`; enabling wake or
+   `deliveryTransport: "api-exec"` needs `machines:write` (which includes
+   read). Instabox has no wake-only scope. A different account needs its own
+   key; never point two accounts at one key.
+3. First run a preflight round; this makes GETs but no SSH, no exec and no
+   wake. With split accounts, each key performs only the GETs for its own
+   machines.
    Let systemd read the `EnvironmentFile` you created above; never source or
    `eval` it in a shell (its values are data, and keys may contain `$` or
    backticks that must stay literal):
@@ -165,15 +189,37 @@ minutes.
 
 Delivery happens for a new run, a changed effective deadline, or an earlier
 write whose result was not confirmed. Once the same run and deadline are
-confirmed, further polls do not SSH again. A write is an atomic remote replace
-followed by an exact readback on the same SSH connection, then a second GET
-checks that machine identity, run and deadline did not change. An unknown
-write is read first before any replacement; an unconfirmed result is never
-counted as ready.
+confirmed, further polls do not deliver again; the controller keeps polling
+with `GET` only and does not run a periodic exec keepalive. A write is an
+atomic remote replace followed by an exact readback on the same transport
+(one SSH connection, or one exec result), then a second GET checks that machine
+identity, run and deadline did not change. An unknown write is read first
+before any replacement; an unconfirmed result is never counted as ready.
 
-SSH access is batch-mode with connect/session timeouts and normal host-key
-checking (never disabled). Paths, hosts, users and ports are validated and
-shell-quoted; an invalid value refuses SSH.
+With `api-exec`, the request blocks until the command exits and the result must
+be a complete documented `ExecResult` with `exitCode` 0 and `timedOut`,
+`truncated`, `invalidUtf8` all false. A non-zero exit, a server-side timeout, a
+truncated or binary readback, an incomplete document, an HTTP timeout or an
+HTTP error all count as **unknown**, never as success; a body that arrives
+after an HTTP 200 as the documented error envelope is reported as that error.
+The request carries only `cmd`, `timeoutSeconds` and `noHistory`; paths are
+shell-quoted with the same random-temporary-file replace script used over SSH.
+
+SSH access (when `deliveryTransport` is `ssh`) is batch-mode with
+connect/session timeouts and normal host-key checking (never disabled). Paths,
+hosts, users and ports are validated and shell-quoted; an invalid value refuses
+SSH. Both transports re-check the target parameters before building a command.
+
+### Official contract
+
+- `POST /v1/machines/{id}/exec`: <https://instabox.sh/docs/api-reference/connections/run-a-command-in-the-sandbox-and-return-its-output>
+- `GET /v1/machines/{id}`: <https://instabox.sh/docs/api-reference/machines/get-a-sandbox>
+- Authentication and scopes: <https://instabox.sh/docs/api-reference/introduction>
+
+The exec route runs `bash -lc` as the machine's login user (`dev`, HOME
+`/data/home`), needs the machine `running`, and returns the synchronous
+`ExecResult` in the same response. It is not idempotent, so the controller
+never retries a write blindly; it reads the file back first.
 
 ## Wake policy (opt-in)
 
@@ -209,8 +255,8 @@ fail-closed guarantee**:
   assignment and runner deregistration.
 - The controller is only as fresh as its last poll; a failed GET makes the
   machine not ready, but a queued job can be assigned between checks.
-- Delivering the deadline over SSH is itself activity and can postpone the
-  machine's idle auto-pause. It does not extend a platform max-run budget.
+- Delivering the deadline over SSH or exec is itself activity and can postpone
+  the machine's idle auto-pause. It does not extend a platform max-run budget.
 - Reusing an old run's deadline file is conservative when the platform starts
   every run at 120 minutes and the controller never delivers beyond the first
   two hours. It cannot cover the platform shortening a run, an earlier

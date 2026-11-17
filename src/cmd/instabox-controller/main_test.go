@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -24,6 +25,8 @@ type fakeAPI struct {
 	machines map[string]instaboxcontroller.Machine
 	getErr   error
 	wakeErr  error
+	execFunc func(context.Context, string, string) (instaboxcontroller.ExecResult, error)
+	execs    int
 	gets     int
 	wakes    int
 	wakeIDs  []string
@@ -44,6 +47,14 @@ func (f *fakeAPI) WakeMachine(ctx context.Context, id string) (instaboxcontrolle
 		return instaboxcontroller.Machine{}, f.wakeErr
 	}
 	return instaboxcontroller.Machine{}, nil
+}
+
+func (f *fakeAPI) ExecCommand(ctx context.Context, id, command string) (instaboxcontroller.ExecResult, error) {
+	f.execs++
+	if f.execFunc != nil {
+		return f.execFunc(ctx, id, command)
+	}
+	return instaboxcontroller.ExecResult{}, errors.New("unexpected exec")
 }
 
 type fakeWriter struct {
@@ -424,5 +435,155 @@ func TestSameKeyEnvForTwoMachinesSharesOneClient(t *testing.T) {
 	}
 	if api.gets != 2 {
 		t.Fatalf("gets = %d", api.gets)
+	}
+}
+
+func endpointPath(command string) (string, bool) {
+	for _, marker := range []string{"cat -- '", "mktemp '"} {
+		if index := strings.Index(command, marker); index >= 0 {
+			rest := command[index+len(marker):]
+			if end := strings.Index(rest, "'"); end >= 0 {
+				path := rest[:end]
+				if marker == "mktemp '" {
+					path = filepath.Dir(path)
+				}
+				return path, true
+			}
+		}
+	}
+	return "", false
+}
+
+func endpointWriteBody(command string) string {
+	index := strings.Index(command, "printf %s '")
+	if index < 0 {
+		return ""
+	}
+	rest := command[index+len("printf %s '"):]
+	end := strings.Index(rest, "'")
+	if end < 0 {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(rest[:end])
+	if err != nil {
+		return ""
+	}
+	return string(decoded)
+}
+
+func apiExecAnswer(store map[string]string) func(context.Context, string, string) (instaboxcontroller.ExecResult, error) {
+	return func(ctx context.Context, id, command string) (instaboxcontroller.ExecResult, error) {
+		path, ok := endpointPath(command)
+		if !ok {
+			return instaboxcontroller.ExecResult{}, errors.New("unexpected command")
+		}
+		if strings.HasPrefix(command, "cat -- ") {
+			value, exists := store[path]
+			if !exists {
+				return instaboxcontroller.ExecResult{ExitCode: 1}, nil
+			}
+			return instaboxcontroller.ExecResult{Stdout: value, ExitCode: 0}, nil
+		}
+		store[path] = endpointWriteBody(command)
+		return instaboxcontroller.ExecResult{Stdout: store[path], ExitCode: 0}, nil
+	}
+}
+
+func TestAPIExecConfigUsesPerMachineClientAndNeedsNoSSH(t *testing.T) {
+	sharedContentA := map[string]string{}
+	sharedContentB := map[string]string{}
+	stateDir := filepath.Join(t.TempDir(), "state")
+	configPath := writeConfig(t, stateDir, true, false,
+		map[string]any{
+			"machineId":         testMachineA,
+			"apiKeyEnv":         "INSTABOX_S1_API_KEY",
+			"deliveryTransport": "api-exec",
+			"deadlinePath":      "/data/gha-runner-tui/session-deadline.json",
+		},
+		map[string]any{
+			"machineId":         testMachineB,
+			"apiKeyEnv":         "INSTABOX_S2_API_KEY",
+			"deliveryTransport": "api-exec",
+			"deadlinePath":      "/data/gha-runner-tui/session-deadline.json",
+		},
+	)
+	now := time.Now()
+	apiA := &fakeAPI{key: "ibk_account_s1", machines: map[string]instaboxcontroller.Machine{testMachineA: runningMachine(testMachineA, now)}}
+	apiA.execFunc = apiExecAnswer(sharedContentA)
+	apiB := &fakeAPI{key: "ibk_account_s2", machines: map[string]instaboxcontroller.Machine{testMachineB: runningMachine(testMachineB, now)}}
+	apiB.execFunc = apiExecAnswer(sharedContentB)
+	created := map[string]int{}
+	sshWriterCalls := 0
+	code := run([]string{"--config", configPath, "--once"}, &bytes.Buffer{}, &bytes.Buffer{}, dependencies{
+		getenv: func(name string) string {
+			switch name {
+			case "INSTABOX_S1_API_KEY":
+				return apiA.key
+			case "INSTABOX_S2_API_KEY":
+				return apiB.key
+			default:
+				return ""
+			}
+		},
+		newAPI: func(key string) (instaboxcontroller.MachineAPI, error) {
+			created[key]++
+			if key == apiA.key {
+				return apiA, nil
+			}
+			return apiB, nil
+		},
+		newWriter: func() instaboxcontroller.DeadlineWriter {
+			sshWriterCalls++
+			return &fakeWriter{}
+		},
+	})
+	if code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	if len(created) != 2 || created[apiA.key] != 1 || created[apiB.key] != 1 {
+		t.Fatalf("clients = %v", created)
+	}
+	if apiA.gets != 2 || apiB.gets != 2 {
+		t.Fatalf("GETs A=%d B=%d", apiA.gets, apiB.gets)
+	}
+	if apiA.execs != 1 || apiB.execs != 1 {
+		t.Fatalf("execs A=%d B=%d, want one write each", apiA.execs, apiB.execs)
+	}
+	if len(sharedContentA) != 1 || len(sharedContentB) != 1 {
+		t.Fatalf("remote content A=%v B=%v", sharedContentA, sharedContentB)
+	}
+	if sshWriterCalls != 1 {
+		// The SSH writer is still constructed once at startup by the existing
+		// dependency, but api-exec never calls it.
+		t.Fatalf("writer construction calls = %d", sshWriterCalls)
+	}
+}
+
+func TestAPIExecDryRunStillMakesNoExec(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	configPath := writeConfig(t, stateDir, true, false,
+		map[string]any{
+			"machineId":         testMachineA,
+			"apiKeyEnv":         "INSTABOX_S1_API_KEY",
+			"deliveryTransport": "api-exec",
+			"deadlinePath":      "/data/gha-runner-tui/session-deadline.json",
+		},
+	)
+	api := &fakeAPI{key: "ibk_account_s1", machines: map[string]instaboxcontroller.Machine{testMachineA: runningMachine(testMachineA, time.Now())}}
+	code := run([]string{"--config", configPath, "--once", "--dry-run"}, &bytes.Buffer{}, &bytes.Buffer{}, dependencies{
+		getenv: func(name string) string {
+			if name == "INSTABOX_S1_API_KEY" {
+				return api.key
+			}
+			return ""
+		},
+		newAPI:    func(string) (instaboxcontroller.MachineAPI, error) { return api, nil },
+		newWriter: func() instaboxcontroller.DeadlineWriter { return &fakeWriter{} },
+	})
+	if code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	if api.execs != 0 {
+		t.Fatalf("dry run executed %d commands", api.execs)
 	}
 }

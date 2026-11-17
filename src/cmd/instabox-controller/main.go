@@ -56,8 +56,8 @@ func run(args []string, stdout, stderr io.Writer, deps dependencies) int {
 
 	// The plain config is read first so each machine's apiKeyEnv name is known.
 	// It contains no key values. Every machine credential is then resolved and
-	// validated before any state directory, lock file, network request or SSH
-	// connection exists.
+	// validated before any state directory, lock file, network request, SSH
+	// connection or exec request exists.
 	cfg, err := instaboxcontroller.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "instabox-controller config: %v\n", err)
@@ -65,7 +65,7 @@ func run(args []string, stdout, stderr io.Writer, deps dependencies) int {
 	}
 	secrets, err := resolveCredentials(cfg, deps.getenv)
 	if err != nil {
-		fmt.Fprintf(stderr, "instabox-controller credentials: %v; no network or SSH request was made\n", err)
+		fmt.Fprintf(stderr, "instabox-controller credentials: %v; no network, SSH or exec request was made\n", err)
 		return 2
 	}
 

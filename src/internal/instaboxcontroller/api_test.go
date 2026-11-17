@@ -220,3 +220,192 @@ func TestMachineJSONFieldsRoundTrip(t *testing.T) {
 		t.Fatalf("cooldownUntil = %v", machine.CooldownUntil)
 	}
 }
+
+// execJSON is the documented 200 result shape.
+func execJSON(stdout, stderr string, exitCode int, timedOut, truncated bool) string {
+	data, _ := json.Marshal(map[string]any{
+		"stdout": stdout, "stderr": stderr, "exitCode": exitCode,
+		"timedOut": timedOut, "truncated": truncated,
+	})
+	return string(data)
+}
+
+func TestAPIExecSendsTheDocumentedRequestAndParsesTheResult(t *testing.T) {
+	var method, path, key, contentType, accept string
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		key, contentType, accept = r.Header.Get("X-API-Key"), r.Header.Get("Content-Type"), r.Header.Get("Accept")
+		raw, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Errorf("request body is not JSON: %v", err)
+		}
+		if strings.Contains(string(raw), "ibk_secret_value") {
+			t.Errorf("the API key was sent in the body")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, execJSON("payload\n", "", 0, false, false))
+	}))
+	defer server.Close()
+
+	client := newAPIClient(server.URL, "ibk_secret_value", server.Client())
+	result, err := client.ExecCommand(context.Background(), testMachineID, "cat -- '/data/x'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodPost || path != "/v1/machines/"+testMachineID+"/exec" {
+		t.Fatalf("request was %s %s", method, path)
+	}
+	if key != "ibk_secret_value" || contentType != "application/json" || accept != "application/json" {
+		t.Fatalf("key=%q content-type=%q accept=%q", key, contentType, accept)
+	}
+	if got := body["cmd"]; got != "cat -- '/data/x'" {
+		t.Fatalf("cmd = %v", got)
+	}
+	if got := body["timeoutSeconds"]; got != float64(execCommandSeconds) {
+		t.Fatalf("timeoutSeconds = %v", got)
+	}
+	if got := body["noHistory"]; got != true {
+		t.Fatalf("noHistory = %v", got)
+	}
+	// Only documented fields; no stdin, envs or secret material.
+	for field := range body {
+		switch field {
+		case "cmd", "timeoutSeconds", "noHistory":
+		default:
+			t.Fatalf("unexpected request field %q", field)
+		}
+	}
+	if result.Stdout != "payload\n" || result.ExitCode != 0 || !result.ExecOK() {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestAPIExecNonzeroAndTimeoutAreResultsNotSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantExit int
+		timedOut bool
+	}{
+		{name: "nonzero exit", body: execJSON("", "denied", 1, false, false), wantExit: 1},
+		{name: "timed out", body: execJSON("", "", 124, true, false), wantExit: 124, timedOut: true},
+		{name: "truncated output", body: execJSON("x", "", 0, false, true)},
+		{name: "invalid utf8 output", body: `{"stdout":"x","stderr":"","exitCode":0,"timedOut":false,"truncated":false,"invalidUtf8":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			result, err := newAPIClient(server.URL, "ibk_example", server.Client()).ExecCommand(context.Background(), testMachineID, "true")
+			if err != nil {
+				t.Fatalf("a non-zero exit or timeout is a 200 result, not an error: %v", err)
+			}
+			if result.ExitCode != tc.wantExit || result.TimedOut != tc.timedOut || result.ExecOK() {
+				t.Fatalf("result = %+v", result)
+			}
+		})
+	}
+}
+
+func TestAPIExecRejectsIncompleteOrErrorDocuments(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		body       string
+		wantCode   string
+		wantStatus int
+	}{
+		{name: "missing exit code", body: `{"stdout":"x","stderr":"","timedOut":false,"truncated":false}`},
+		{name: "missing stdout", body: `{"stderr":"","exitCode":0,"timedOut":false,"truncated":false}`},
+		{name: "empty body", body: ``},
+		{name: "html body", body: `<html>ibk_secret_value</html>`},
+		{name: "after 200 error envelope", body: `{"error":{"code":"host_unavailable","retryable":false},"status":503}`, wantCode: "host_unavailable", wantStatus: 503},
+		{name: "forbidden scope", status: 403, body: `{"error":{"code":"missing_scope","message":"ibk_secret_value","requiredScopes":["machines:write"]}}`, wantCode: "missing_scope", wantStatus: 403},
+		{name: "not running", status: 409, body: `{"error":{"code":"machine_not_running"}}`, wantCode: "machine_not_running", wantStatus: 409},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status := tc.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			result, err := newAPIClient(server.URL, "ibk_secret_value", server.Client()).ExecCommand(context.Background(), testMachineID, "true")
+			if err == nil {
+				t.Fatalf("incomplete answer was accepted as success: %+v", result)
+			}
+			if strings.Contains(err.Error(), "ibk_secret_value") || strings.Contains(err.Error(), "<html>") {
+				t.Fatalf("error leaked the response body or key: %v", err)
+			}
+			if tc.wantCode != "" {
+				var apiErr *APIError
+				if !errors.As(err, &apiErr) || apiErr.Status != tc.wantStatus || apiErr.Code != tc.wantCode {
+					t.Fatalf("error = %v, want %d %s", err, tc.wantStatus, tc.wantCode)
+				}
+			}
+		})
+	}
+}
+
+func TestAPIExecAcceptsDocumentedKeepaliveWhitespace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "\n\n"+execJSON("payload\n", "", 0, false, false))
+	}))
+	defer server.Close()
+	result, err := newAPIClient(server.URL, "ibk_example", server.Client()).ExecCommand(context.Background(), testMachineID, "true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ExecOK() || result.Stdout != "payload\n" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestAPIExecRejectsAnUnsafeMachineIDBeforeAnyRequest(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+	}))
+	defer server.Close()
+	client := newAPIClient(server.URL, "ibk_example", server.Client())
+	for _, id := range []string{"", "m_bad", "m_aaaaaaaaaaaaaaaaaaaaaaaaaa/../../x", "build-a"} {
+		if _, err := client.ExecCommand(context.Background(), id, "true"); err == nil {
+			t.Fatalf("unsafe machine ID %q was accepted", id)
+		}
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("requests = %d, want 0", got)
+	}
+}
+
+func TestAPIExecTimeoutIsBounded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+	}))
+	defer server.Close()
+	client := newAPIClient(server.URL, "ibk_example", server.Client())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if _, err := client.ExecCommand(ctx, testMachineID, "true"); err == nil {
+		t.Fatal("expected the bounded request to fail")
+	}
+}
+
+func TestAPIExecRejectsAnOversizedAnswer(t *testing.T) {
+	// A body over the bounded reader is cut, so it cannot decode as a
+	// complete documented result and must not be treated as success.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"stdout":"`)
+		io.WriteString(w, strings.Repeat("a", maxExecBodySize+1024))
+		io.WriteString(w, `","stderr":"","exitCode":0,"timedOut":false,"truncated":false}`)
+	}))
+	defer server.Close()
+	if _, err := newAPIClient(server.URL, "ibk_example", server.Client()).ExecCommand(context.Background(), testMachineID, "true"); err == nil {
+		t.Fatal("an oversized exec answer was accepted")
+	}
+}
