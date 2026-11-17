@@ -309,6 +309,33 @@ func TestAPIExecNonzeroAndTimeoutAreResultsNotSuccess(t *testing.T) {
 	}
 }
 
+// The documented ExecResult marks invalidUtf8 optional ("Absent when false"),
+// and the live API has returned it as null too. Both mean false; an explicit
+// true must still make the result unverified.
+func TestAPIExecAcceptsAbsentOrNullInvalidUTF8AsFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "absent", body: `{"stdout":"payload\n","stderr":"","exitCode":0,"timedOut":false,"truncated":false}`},
+		{name: "null", body: `{"stdout":"payload\n","stderr":"","exitCode":0,"timedOut":false,"truncated":false,"invalidUtf8":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			result, err := newAPIClient(server.URL, "ibk_example", server.Client()).ExecCommand(context.Background(), testMachineID, "true")
+			if err != nil {
+				t.Fatalf("a completed exit-0 result with optional invalidUtf8 was rejected: %v", err)
+			}
+			if result.Stdout != "payload\n" || result.InvalidUTF8 || !result.ExecOK() {
+				t.Fatalf("result = %+v", result)
+			}
+		})
+	}
+}
+
 func TestAPIExecRejectsIncompleteOrErrorDocuments(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -318,7 +345,9 @@ func TestAPIExecRejectsIncompleteOrErrorDocuments(t *testing.T) {
 		wantStatus int
 	}{
 		{name: "missing exit code", body: `{"stdout":"x","stderr":"","timedOut":false,"truncated":false}`},
+		{name: "null exit code", body: `{"stdout":"x","stderr":"","exitCode":null,"timedOut":false,"truncated":false}`},
 		{name: "missing stdout", body: `{"stderr":"","exitCode":0,"timedOut":false,"truncated":false}`},
+		{name: "invalid utf8 wrong type", body: `{"stdout":"x","stderr":"","exitCode":0,"timedOut":false,"truncated":false,"invalidUtf8":"true"}`},
 		{name: "empty body", body: ``},
 		{name: "html body", body: `<html>ibk_secret_value</html>`},
 		{name: "after 200 error envelope", body: `{"error":{"code":"host_unavailable","retryable":false},"status":503}`, wantCode: "host_unavailable", wantStatus: 503},
