@@ -54,30 +54,40 @@ func run(args []string, stdout, stderr io.Writer, deps dependencies) int {
 		return 2
 	}
 
-	// Authentication is checked first: no config read, lock file, network
-	// request or SSH connection happens without a key.
-	key := ""
-	if deps.getenv != nil {
-		key = strings.TrimSpace(deps.getenv("INSTABOX_API_KEY"))
-	}
-	if key == "" {
-		fmt.Fprintln(stderr, "INSTABOX_API_KEY is required; no network or SSH request was made")
-		return 2
-	}
-
+	// The plain config is read first so each machine's apiKeyEnv name is known.
+	// It contains no key values. Every machine credential is then resolved and
+	// validated before any state directory, lock file, network request or SSH
+	// connection exists.
 	cfg, err := instaboxcontroller.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "instabox-controller config: %v\n", err)
 		return 2
 	}
-	api, err := deps.newAPI(key)
+	secrets, err := resolveCredentials(cfg, deps.getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, "instabox-controller could not create the API client")
+		fmt.Fprintf(stderr, "instabox-controller credentials: %v; no network or SSH request was made\n", err)
 		return 2
 	}
+
+	// One client per distinct key environment variable; machines that reference
+	// the same env var deliberately share one account.
+	apis := map[string]instaboxcontroller.MachineAPI{}
+	for env, key := range secrets {
+		api, err := deps.newAPI(key)
+		if err != nil {
+			fmt.Fprintf(stderr, "instabox-controller could not create an API client for %s\n", env)
+			return 2
+		}
+		apis[env] = api
+	}
+	machineAPIs := map[string]instaboxcontroller.MachineAPI{}
+	for i := range cfg.Machines {
+		machineAPIs[cfg.Machines[i].MachineID] = apis[apiKeyEnvName(cfg.Machines[i])]
+	}
+
 	controller := &instaboxcontroller.Controller{
 		Config: cfg,
-		API:    api,
+		APIs:   machineAPIs,
 		Writer: deps.newWriter(),
 		DryRun: *dryRun,
 		Logger: log.New(stderr, "instabox-controller: ", log.LstdFlags),
@@ -99,4 +109,34 @@ func run(args []string, stdout, stderr io.Writer, deps dependencies) int {
 		return 1
 	}
 	return 0
+}
+
+func apiKeyEnvName(machine instaboxcontroller.MachineConfig) string {
+	if machine.APIKeyEnv == nil {
+		return instaboxcontroller.DefaultAPIKeyEnv
+	}
+	return *machine.APIKeyEnv
+}
+
+// resolveCredentials validates every machine's key environment before any
+// client is built. A machine with an explicit apiKeyEnv never falls back to
+// the global INSTABOX_API_KEY; a missing or blank value fails closed.
+func resolveCredentials(cfg instaboxcontroller.Config, getenv func(string) string) (map[string]string, error) {
+	secrets := map[string]string{}
+	for i := range cfg.Machines {
+		machine := cfg.Machines[i]
+		env := apiKeyEnvName(machine)
+		if _, resolved := secrets[env]; resolved {
+			continue
+		}
+		value := ""
+		if getenv != nil {
+			value = strings.TrimSpace(getenv(env))
+		}
+		if value == "" {
+			return nil, fmt.Errorf("environment variable %s for machine %s is missing or empty", env, machine.MachineID)
+		}
+		secrets[env] = value
+	}
+	return secrets, nil
 }

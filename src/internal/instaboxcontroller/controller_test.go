@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -155,7 +156,15 @@ func (w *fakeWriter) WriteDeadline(ctx context.Context, target RemoteTarget, con
 }
 
 func newController(cfg Config, api MachineAPI, writer DeadlineWriter, now func() time.Time, log *bytes.Buffer) *Controller {
-	controller := &Controller{Config: cfg, API: api, Writer: writer, Now: now}
+	apis := map[string]MachineAPI{}
+	for _, machine := range cfg.Machines {
+		apis[machine.MachineID] = api
+	}
+	return newMultiController(cfg, apis, writer, now, log)
+}
+
+func newMultiController(cfg Config, apis map[string]MachineAPI, writer DeadlineWriter, now func() time.Time, log *bytes.Buffer) *Controller {
+	controller := &Controller{Config: cfg, APIs: apis, Writer: writer, Now: now}
 	if log != nil {
 		controller.Logger = logAdapter{log}
 	}
@@ -1548,5 +1557,166 @@ func TestPersistFailureBlocksWake(t *testing.T) {
 	}
 	if api.wakes != 0 {
 		t.Fatalf("wake was sent without a persisted attempt: %d", api.wakes)
+	}
+}
+
+func TestMachinesUseTheirOwnAccountKeyForGETAndWake(t *testing.T) {
+	type request struct {
+		method, path, key string
+	}
+	var mu sync.Mutex
+	var requestsA, requestsB []request
+	record := func(requests *[]request) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			*requests = append(*requests, request{r.Method, r.URL.Path, r.Header.Get("X-API-Key")})
+			mu.Unlock()
+			if r.Method == http.MethodPost {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			id := strings.TrimPrefix(r.URL.Path, "/v1/machines/")
+			switch id {
+			case testMachineA:
+				io.WriteString(w, `{"id":"`+testMachineA+`","state":"running","desiredState":"running","runtime":{"ready":true},"runStartedAt":"`+testNow.Add(-20*time.Minute).Format(time.RFC3339)+`","maxRunMinutes":120}`)
+			case testMachineB:
+				io.WriteString(w, `{"id":"`+testMachineB+`","state":"suspended","desiredState":"suspended","autoSuspendedAt":"`+testNow.Add(-10*time.Minute).Format(time.RFC3339)+`"}`)
+			}
+		}
+	}
+	serverA := httptest.NewServer(record(&requestsA))
+	defer serverA.Close()
+	serverB := httptest.NewServer(record(&requestsB))
+	defer serverB.Close()
+
+	cfg := testConfig(t, testMachineA, testMachineB)
+	cfg.EnableWake = true
+	cfg.EnableRemoteWrite = true
+	apis := map[string]MachineAPI{
+		testMachineA: newAPIClient(serverA.URL, "ibk_account_s1", serverA.Client()),
+		testMachineB: newAPIClient(serverB.URL, "ibk_account_s2", serverB.Client()),
+	}
+	controller := newMultiController(cfg, apis, &fakeWriter{}, func() time.Time { return testNow }, &bytes.Buffer{})
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// A is delivered over the fake writer, so its GET, post-write GET and
+	// any later check must all stay on the s1 client.
+	if len(requestsA) != 2 || requestsA[0].method != http.MethodGet || requestsA[1].method != http.MethodGet {
+		t.Fatalf("account s1 requests = %+v", requestsA)
+	}
+	for _, req := range requestsA {
+		if req.path != "/v1/machines/"+testMachineA || req.key != "ibk_account_s1" {
+			t.Fatalf("account s1 got %+v", req)
+		}
+	}
+	if len(requestsB) != 2 {
+		t.Fatalf("account s2 requests = %+v", requestsB)
+	}
+	if requestsB[0].method != http.MethodGet || requestsB[0].path != "/v1/machines/"+testMachineB {
+		t.Fatalf("first s2 request = %+v", requestsB[0])
+	}
+	if requestsB[1].method != http.MethodPost || requestsB[1].path != "/v1/machines/"+testMachineB+"/wake" {
+		t.Fatalf("wake request = %+v", requestsB[1])
+	}
+	for _, req := range requestsB {
+		if req.key != "ibk_account_s2" {
+			t.Fatalf("account s2 got key %q", req.key)
+		}
+	}
+}
+
+func TestControllerWithoutMachineClientFailsBeforeNetworkOrState(t *testing.T) {
+	cfg := testConfig(t, testMachineA, testMachineB)
+	apiA := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		t.Fatalf("GET for %s happened without its account client", id)
+		return Machine{}, nil
+	}}
+	apis := map[string]MachineAPI{testMachineA: apiA}
+	controller := newMultiController(cfg, apis, &fakeWriter{}, func() time.Time { return testNow }, &bytes.Buffer{})
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("expected the missing client to fail the round")
+	}
+	if apiA.gets != 0 {
+		t.Fatalf("gets = %d", apiA.gets)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "state.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state was written: %v", err)
+	}
+}
+
+func TestLoadConfigAcceptsAPIKeyEnvButRejectsInvalidNames(t *testing.T) {
+	validMachine := func(id, host, env string) string {
+		return fmt.Sprintf(`{"machineId":%q,"apiKeyEnv":%q,"deadlinePath":"/var/lib/gha-runner-tui/state/session-deadline.json","sshHost":%q,"sshUser":"dev"}`, id, env, host)
+	}
+	wrap := func(machine string) string {
+		return `{"stateDir":"/var/lib/instabox-controller","machines":[` + machine + `]}`
+	}
+	cfg, err := LoadConfig(writeConfigFile(t, wrap(validMachine(testMachineA, "runner.example.net", "INSTABOX_S1_API_KEY"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Machines[0].APIKeyEnv == nil || *cfg.Machines[0].APIKeyEnv != "INSTABOX_S1_API_KEY" {
+		t.Fatalf("apiKeyEnv = %v", cfg.Machines[0].APIKeyEnv)
+	}
+	for _, env := range []string{"", "S1 KEY", "S1-KEY", "ibk_secret-value", "1S1", "S1\nKEY"} {
+		t.Run(env, func(t *testing.T) {
+			if _, err := LoadConfig(writeConfigFile(t, wrap(validMachine(testMachineA, "runner.example.net", env)))); err == nil {
+				t.Fatal("expected the apiKeyEnv name to be rejected")
+			}
+		})
+	}
+}
+
+func TestLegacyStateStillSuppressesWakeWithPerAccountClients(t *testing.T) {
+	cfg := testConfig(t, testMachineA, testMachineB)
+	cfg.EnableWake = true
+	started := testNow
+	cycle := started.Add(-10 * time.Minute)
+	suspended := suspendedMachine(testMachineB, cycle)
+	legacy := `{"version":1,"deliveries":{},"wakeAttempts":{"` + testMachineB + `|` + cycle.Format(time.RFC3339Nano) + `":{"attemptedAt":"` + started.Format(time.RFC3339) + `","status":"sent"}}}`
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "state.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	apiA := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, started.Add(-20*time.Minute), 120), nil
+	}}
+	apiB := &fakeAPI{
+		getFunc: func(ctx context.Context, id string) (Machine, error) { return suspended, nil },
+		wakeFunc: func(ctx context.Context, id string) (Machine, error) {
+			t.Fatalf("legacy state did not suppress the wake of %s", id)
+			return Machine{}, nil
+		},
+	}
+	apis := map[string]MachineAPI{testMachineA: apiA, testMachineB: apiB}
+	controller := newMultiController(cfg, apis, &fakeWriter{}, func() time.Time { return started }, &bytes.Buffer{})
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if apiB.wakes != 0 || apiA.gets != 1 || apiB.gets != 1 {
+		t.Fatalf("gets A=%d B=%d wakes=%d", apiA.gets, apiB.gets, apiB.wakes)
+	}
+}
+
+func TestLoadConfigRejectsNullOrNonStringAPIKeyEnv(t *testing.T) {
+	wrap := func(machineEnv string) string {
+		return `{"stateDir":"/var/lib/instabox-controller","machines":[{"machineId":"` + testMachineA + `","apiKeyEnv":` + machineEnv + `,"deadlinePath":"/var/lib/session-deadline.json","sshHost":"runner.example.net","sshUser":"dev"}]}`
+	}
+	if _, err := LoadConfig(writeConfigFile(t, wrap(`null`))); err == nil {
+		t.Fatal("apiKeyEnv null must be rejected rather than falling back to the global key")
+	}
+	if _, err := LoadConfig(writeConfigFile(t, wrap(`{"name":"INSTABOX_S1_API_KEY"}`))); err == nil {
+		t.Fatal("apiKeyEnv must be a string")
+	}
+	if _, err := LoadConfig(writeConfigFile(t, wrap(`12345`))); err == nil {
+		t.Fatal("apiKeyEnv must be a string, not a number")
+	}
+	if _, err := LoadConfig(writeConfigFile(t, wrap(`["INSTABOX_S1_API_KEY"]`))); err == nil {
+		t.Fatal("apiKeyEnv must be a string, not an array")
 	}
 }

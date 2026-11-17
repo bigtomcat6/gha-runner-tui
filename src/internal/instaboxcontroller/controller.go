@@ -36,17 +36,22 @@ const (
 	maxPollInterval     = time.Hour
 
 	stateVersion = 1
+
+	// DefaultAPIKeyEnv is the environment variable used by a machine that does
+	// not name its own apiKeyEnv, preserving old single-account configs.
+	DefaultAPIKeyEnv = "INSTABOX_API_KEY"
 )
 
 var (
 	machineIDPattern = regexp.MustCompile(`^m_[a-z2-7]{26}$`)
 	sshHostPattern   = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$`)
 	sshUserPattern   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9._-]{0,31}$`)
+	apiKeyEnvPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 )
 
 // Config is the controller's local JSON configuration. It intentionally has no
-// API base URL and no API key field: the key comes only from
-// INSTABOX_API_KEY and the API host is fixed.
+// API base URL and no raw API key field: each machine may name the environment
+// variable holding the key for its Instabox account, and the API host is fixed.
 type Config struct {
 	PollIntervalSeconds int             `json:"pollIntervalSeconds"`
 	StateDir            string          `json:"stateDir"`
@@ -56,13 +61,41 @@ type Config struct {
 }
 
 // MachineConfig describes one machine and the absolute deadline file on it.
+// APIKeyEnv optionally names the environment variable holding the API key for
+// this machine's Instabox account; nil keeps the legacy INSTABOX_API_KEY.
 type MachineConfig struct {
-	MachineID       string `json:"machineId"`
-	DeadlinePath    string `json:"deadlinePath"`
-	SSHHost         string `json:"sshHost"`
-	SSHUser         string `json:"sshUser"`
-	SSHPort         int    `json:"sshPort"`
-	SSHIdentityFile string `json:"sshIdentityFile"`
+	MachineID       string  `json:"machineId"`
+	DeadlinePath    string  `json:"deadlinePath"`
+	SSHHost         string  `json:"sshHost"`
+	SSHUser         string  `json:"sshUser"`
+	SSHPort         int     `json:"sshPort"`
+	SSHIdentityFile string  `json:"sshIdentityFile"`
+	APIKeyEnv       *string `json:"apiKeyEnv,omitempty"`
+}
+
+// UnmarshalJSON accepts apiKeyEnv only as a string name. A present but null
+// field is rejected instead of silently falling back to the global key.
+func (m *MachineConfig) UnmarshalJSON(data []byte) error {
+	type plain MachineConfig
+	wrapped := struct {
+		*plain
+		APIKeyEnv json.RawMessage `json:"apiKeyEnv"`
+	}{plain: (*plain)(m)}
+	m.APIKeyEnv = nil
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&wrapped); err != nil {
+		return err
+	}
+	if len(wrapped.APIKeyEnv) == 0 {
+		return nil
+	}
+	var name string
+	if err := json.Unmarshal(wrapped.APIKeyEnv, &name); err != nil {
+		return errors.New("apiKeyEnv must be a string environment variable name")
+	}
+	m.APIKeyEnv = &name
+	return nil
 }
 
 // LoadConfig reads and strictly validates the local configuration. Unknown
@@ -130,6 +163,9 @@ func (c *Config) Validate() error {
 func (m *MachineConfig) Validate() error {
 	if !machineIDPattern.MatchString(m.MachineID) {
 		return errors.New("machineId must be an Instabox machine ID (m_...)")
+	}
+	if m.APIKeyEnv != nil && !apiKeyEnvPattern.MatchString(*m.APIKeyEnv) {
+		return errors.New("apiKeyEnv must be an environment variable name, not a key value")
 	}
 	if !validLocalPath(m.DeadlinePath) {
 		return errors.New("deadlinePath must be absolute, clean and use safe characters")
@@ -290,10 +326,12 @@ type Logger interface {
 }
 
 // Controller polls the platform, delivers deadlines and, only when explicitly
-// enabled, wakes one safe standby.
+// enabled, wakes one safe standby. APIs maps a validated machine ID to the
+// client for that machine's account; a machine without a client is not ready
+// and is never sent to another account's key.
 type Controller struct {
 	Config Config
-	API    MachineAPI
+	APIs   map[string]MachineAPI
 	Writer DeadlineWriter
 	DryRun bool
 	Logger Logger
@@ -326,9 +364,18 @@ func (c *Controller) logf(format string, args ...any) {
 	}
 }
 
+// apiFor returns the client for exactly this machine's account. A missing
+// client is an error, never a fallback to another machine's key.
+func (c *Controller) apiFor(machineID string) (MachineAPI, error) {
+	if api := c.APIs[machineID]; api != nil {
+		return api, nil
+	}
+	return nil, fmt.Errorf("machine %s has no API client for its account", machineID)
+}
+
 // ensureReady creates the state directory, takes the lock and loads state
-// before any network or SSH access. A corrupt state file or a second instance
-// fails closed here.
+// before any network or SSH access. A corrupt state file, a machine without its
+// own API client or a second instance fails closed here.
 func (c *Controller) ensureReady() error {
 	if c.loaded {
 		return nil
@@ -336,8 +383,10 @@ func (c *Controller) ensureReady() error {
 	if err := c.Config.Validate(); err != nil {
 		return err
 	}
-	if c.API == nil {
-		return errors.New("controller API client is not configured")
+	for _, machine := range c.Config.Machines {
+		if c.APIs[machine.MachineID] == nil {
+			return fmt.Errorf("machine %s has no API client for its account", machine.MachineID)
+		}
 	}
 	if err := os.MkdirAll(c.Config.StateDir, 0o700); err != nil {
 		return errors.New("controller state directory could not be created")
@@ -404,7 +453,17 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 
 	for i, mc := range c.Config.Machines {
 		outcome := machineOutcome{config: mc}
-		machine, err := c.API.GetMachine(ctx, mc.MachineID)
+		api, err := c.apiFor(mc.MachineID)
+		if err != nil {
+			outcome.getFailed = true
+			allGETsOK = false
+			c.roundGetFailed = true
+			problems = append(problems, err.Error())
+			c.logf("%v", err)
+			outcomes[i] = outcome
+			continue
+		}
+		machine, err := api.GetMachine(ctx, mc.MachineID)
 		if err != nil {
 			outcome.getFailed = true
 			allGETsOK = false
@@ -522,7 +581,12 @@ func (c *Controller) ensureDelivery(ctx context.Context, mc MachineConfig, machi
 // deadline the confirmation assumed did not move in between; a changed run or
 // deadline is never reported ready.
 func (c *Controller) verifyAfterConfirmation(ctx context.Context, mc MachineConfig, machine Machine, budget budget, ready bool) (bool, error) {
-	fresh, err := c.API.GetMachine(ctx, mc.MachineID)
+	api, err := c.apiFor(mc.MachineID)
+	if err != nil {
+		c.roundGetFailed = true
+		return false, errors.New("post-write GET has no API client for this machine's account; delivery is confirmed but readiness is not")
+	}
+	fresh, err := api.GetMachine(ctx, mc.MachineID)
 	if err != nil {
 		c.roundGetFailed = true
 		return false, errors.New("post-write GET failed; delivery is confirmed but readiness is not")
@@ -649,8 +713,9 @@ func safeWakeCycle(machine Machine, now time.Time) (string, bool) {
 }
 
 func (c *Controller) attemptWake(ctx context.Context, machineID, cycle string, now time.Time) error {
-	if c.API == nil {
-		return errors.New("wake is enabled but no API client is configured")
+	api, err := c.apiFor(machineID)
+	if err != nil {
+		return fmt.Errorf("wake is enabled but %w", err)
 	}
 	attempt := wakeAttempt{AttemptedAt: now, Status: "pending"}
 	c.state.WakeAttempts[cycle] = attempt
@@ -660,7 +725,7 @@ func (c *Controller) attemptWake(ctx context.Context, machineID, cycle string, n
 		return fmt.Errorf("wake attempt record could not be saved; not sending: %w", err)
 	}
 	c.logf("machine %s: waking automatically idle-suspended standby", machineID)
-	_, err := c.API.WakeMachine(ctx, machineID)
+	_, err = api.WakeMachine(ctx, machineID)
 	if err == nil {
 		attempt.Status = "sent"
 		c.state.WakeAttempts[cycle] = attempt
@@ -680,9 +745,9 @@ func (c *Controller) attemptWake(ctx context.Context, machineID, cycle string, n
 	c.state.WakeAttempts[cycle] = attempt
 	_ = c.saveState()
 
-	// A timeout may have woken the machine. Disambiguate with GET, but never
-	// resend for the same cycle.
-	fresh, getErr := c.API.GetMachine(ctx, machineID)
+	// A timeout may have woken the machine. Disambiguate with GET using the
+	// same account's client, but never resend for the same cycle.
+	fresh, getErr := api.GetMachine(ctx, machineID)
 	if getErr != nil {
 		c.roundGetFailed = true
 	}
