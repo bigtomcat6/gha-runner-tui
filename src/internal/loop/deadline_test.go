@@ -424,6 +424,93 @@ func TestWaitSessionDeadlineWithdrawalSafety(t *testing.T) {
 	}
 }
 
+func TestWaitSessionDeadlineWithdrawalRequiresTrustedDocker(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour).UTC().Format(time.RFC3339)
+	for _, tc := range []struct {
+		name   string
+		docker *dockerScript
+	}{
+		{
+			name: "inspect error",
+			docker: &dockerScript{
+				inspect:     [][]byte{[]byte("daemon down")},
+				inspectErrs: []error{errors.New("exit status 1")},
+			},
+		},
+		{
+			name:   "created",
+			docker: &dockerScript{inspect: [][]byte{containerInspectJSON("created", future, "0001-01-01T00:00:00Z", 0)}},
+		},
+		{
+			name:   "unknown",
+			docker: &dockerScript{inspect: [][]byte{containerInspectJSON("mystery", now.Format(time.RFC3339), now.Format(time.RFC3339), 0)}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := deadlinePath(t)
+			writeSessionDeadline(t, path, now.Add(50*time.Minute))
+			p := loopProfile(t)
+			p.Loop.SessionDeadlineFile = path
+			clock := newTestClock(t, now)
+			script := &ghScript{
+				list:        []ghObs{{found: true, id: 7, busy: false}},
+				deleteCodes: []int{http.StatusNoContent},
+			}
+			srv := newGHScript(t, script)
+			defer srv.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			clock.cancelAt, clock.cancel = 2, cancel
+			s := newWaitSupervisor(t, clock, tc.docker, srv)
+
+			got, err := s.waitContainer(ctx, p, waitInfo(t), 24*time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.forceRemove || script.listCalls != 0 || script.deleteCalls != 0 || tc.docker.rmN != 0 {
+				t.Fatalf("untrusted Docker observation reached GitHub: result=%+v list=%d delete=%d rm=%d", got, script.listCalls, script.deleteCalls, tc.docker.rmN)
+			}
+			if !got.retained {
+				t.Fatalf("expected retention after the stop budget, got %+v", got)
+			}
+		})
+	}
+}
+
+func TestWaitSessionDeadlineMissingRunnerNeverAuthorizesRemoval(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	path := deadlinePath(t)
+	writeSessionDeadline(t, path, now.Add(50*time.Minute))
+	p := loopProfile(t)
+	p.Loop.SessionDeadlineFile = path
+	clock := newTestClock(t, now)
+	d := &dockerScript{inspect: [][]byte{runningInspect(now.Format(time.RFC3339), now.Format(time.RFC3339))}}
+	// The runner is seen busy first, then disappears twice. Without a DELETE
+	// 204, an exhausted deadline must never force-remove the container.
+	script := &ghScript{list: []ghObs{{found: true, id: 7, busy: true}, {}}}
+	srv := newGHScript(t, script)
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clock.cancelAt, clock.cancel = 12, cancel
+	s := newWaitSupervisor(t, clock, d, srv)
+
+	got, err := s.waitContainer(ctx, p, waitInfo(t), 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.forceRemove || script.deleteCalls != 0 || d.rmN != 0 {
+		t.Fatalf("missing runner authorized removal without DELETE: result=%+v delete=%d rm=%d", got, script.deleteCalls, d.rmN)
+	}
+	if script.listCalls < 3 {
+		t.Fatalf("expected repeated deadline observations, got %d", script.listCalls)
+	}
+	if !got.retained {
+		t.Fatalf("expected retention after the stop budget, got %+v", got)
+	}
+}
+
 func TestAdoptManagedSessionDeadlineWithdrawsIdleRunner(t *testing.T) {
 	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
 	path := deadlinePath(t)

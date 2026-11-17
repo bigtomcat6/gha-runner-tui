@@ -979,15 +979,15 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 		// unknown states never reach GitHub, so a stray busy=false 204 cannot
 		// force-remove a run that has not reliably started.
 		deadlineReached := s.sessionDeadlineReached(p)
+		trustedObservation := inspectErr == nil && reliableContainerState(details.State)
+		idleReached := idleExceeded(s.now(), details.StartedAt, idle)
 		checkGitHub := false
 		switch {
-		case inspectErr != nil:
-			checkGitHub = false
-		case !reliableContainerState(details.State):
+		case !trustedObservation:
 			checkGitHub = false
 		case stopping:
 			checkGitHub = true
-		case idleExceeded(s.now(), details.StartedAt, idle):
+		case idleReached:
 			if lastGitHub.IsZero() || s.now().Sub(lastGitHub) >= waitGitHubInterval {
 				checkGitHub = true
 			}
@@ -995,7 +995,9 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 		// Crossing the deadline is not an idle timeout. Withdraw only after the
 		// same reliable observation and GitHub idle check, and throttle the
 		// query like idle cleanup so a long busy job is not polled every loop.
-		if deadlineReached && !stopping {
+		// An unreliable or in-flight container observation must never be
+		// upgraded into a GitHub lookup by the deadline alone.
+		if deadlineReached && !stopping && trustedObservation {
 			if lastDeadline.IsZero() || s.now().Sub(lastDeadline) >= waitGitHubInterval {
 				lastDeadline = s.now()
 				checkGitHub = true
@@ -1042,9 +1044,22 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 					deadlineWithdrawalNotified = true
 				}
 			case seen:
-				missing++
-				if missing == 2 {
-					return waitResult{forceRemove: true}, nil
+				if deadlineReached {
+					// A runner disappearing from the listing is not proof that
+					// the job was withdrawn: only a current busy=false plus a
+					// DELETE 204 may authorize deadline cleanup. Reset the idle
+					// miss counter so these observations cannot later combine
+					// into a zero-DELETE force removal.
+					missing = 0
+					if !deadlineWithdrawalNotified {
+						s.noteWaitIssue(p, c, "session deadline reached; runner missing; container retained (withdrawal incomplete; may accept work)")
+						deadlineWithdrawalNotified = true
+					}
+				} else {
+					missing++
+					if missing == 2 {
+						return waitResult{forceRemove: true}, nil
+					}
 				}
 			default:
 				if inspectErr == nil && idleExceeded(s.now(), details.StartedAt, idle) && !notifiedNeverSeen {

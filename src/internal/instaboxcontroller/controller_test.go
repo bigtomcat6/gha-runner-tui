@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -559,6 +560,109 @@ func TestUnknownWriteIsConfirmedOrReplacedOnlyAfterReading(t *testing.T) {
 	})
 }
 
+func TestPendingReadbackIsNotReadyWithoutPostConfirmationGET(t *testing.T) {
+	cfg := testConfig(t, testMachineA)
+	cfg.EnableRemoteWrite = true
+	now := testNow
+	started := testNow
+	expected := deadlinePayload(started.Add(120 * time.Minute))
+	getCalls := 0
+	api := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		getCalls++
+		if getCalls >= 3 {
+			// A new run may have started while the earlier write was being
+			// confirmed. The pending readback alone must not report it ready.
+			return runningMachine(testMachineA, started.Add(time.Minute), 120), nil
+		}
+		return runningMachine(testMachineA, started, 120), nil
+	}}
+	writer := &fakeWriter{content: map[string]string{}}
+	writer.onWrite = func(target RemoteTarget, content string) {
+		// The write may have landed even though the answer was lost.
+		writer.content[target.key()] = expected
+	}
+	writer.writeErr = errors.New("connection lost")
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, writer, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("expected the unknown write to be reported")
+	}
+	if writer.writes != 1 || writer.reads != 0 {
+		t.Fatalf("first round writes=%d reads=%d", writer.writes, writer.reads)
+	}
+
+	writer.writeErr = nil
+	writer.onWrite = nil
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("a changed run after the pending readback must not be reported ready")
+	}
+	if writer.reads != 1 || writer.writes != 1 {
+		t.Fatalf("matching readback should confirm without rewriting: reads=%d writes=%d", writer.reads, writer.writes)
+	}
+	if getCalls != 3 {
+		t.Fatalf("post-confirmation GET calls = %d, want 3", getCalls)
+	}
+	if strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("changed run was reported ready: %s", logBuffer.String())
+	}
+}
+
+func TestExpiredTrustedDeadlineReplacesALooserDeliveredValue(t *testing.T) {
+	cfg := testConfig(t, testMachineA)
+	cfg.EnableRemoteWrite = true
+	now := testNow
+	started := testNow
+	maxRun := 120
+	api := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, started, maxRun), nil
+	}}
+	writer := &fakeWriter{}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, writer, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 1 || writer.lastWrite != deadlinePayload(started.Add(120*time.Minute)) {
+		t.Fatalf("first delivery writes=%d value=%q", writer.writes, writer.lastWrite)
+	}
+
+	// The platform reports maxRunMinutes 0 after a 120-minute deadline was
+	// delivered. The documented meaning is "sleeps immediately", so the new
+	// trustworthy deadline is already expired and must replace the looser one.
+	now = started.Add(10 * time.Minute)
+	maxRun = 0
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 2 {
+		t.Fatalf("expired trusted deadline was not delivered: writes=%d", writer.writes)
+	}
+	if want := deadlinePayload(started); writer.lastWrite != want {
+		t.Fatalf("delivered = %q, want %q", writer.lastWrite, want)
+	}
+	if strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("expired run was reported ready: %s", logBuffer.String())
+	}
+	entry := readStateFile(t, cfg.StateDir).Deliveries[testMachineA]
+	if entry.Status != "confirmed" || entry.Deadline != started.Format(time.RFC3339) {
+		t.Fatalf("delivery state = %+v", entry)
+	}
+
+	// The conservative value is now confirmed; later rounds must not rewrite.
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 2 {
+		t.Fatalf("confirmed expired deadline was rewritten: writes=%d", writer.writes)
+	}
+}
+
 func TestGETFailureDoesNotExtendOrTriggerWake(t *testing.T) {
 	cfg := testConfig(t, testMachineA, testMachineB)
 	cfg.EnableRemoteWrite = true
@@ -970,6 +1074,10 @@ func TestCorruptStateFailsClosedBeforeNetwork(t *testing.T) {
 		{name: "unsupported version", content: `{"version":9,"deliveries":{},"wakeAttempts":{}}`},
 		{name: "unknown field", content: `{"version":1,"deliveries":{},"wakeAttempts":{},"extra":true}`},
 		{name: "wrong types", content: `{"version":1,"deliveries":[],"wakeAttempts":{}}`},
+		{name: "missing required maps", content: `{"version":1}`},
+		{name: "missing wake attempts", content: `{"version":1,"deliveries":{}}`},
+		{name: "null deliveries", content: `{"version":1,"deliveries":null,"wakeAttempts":{}}`},
+		{name: "null wake attempts", content: `{"version":1,"deliveries":{},"wakeAttempts":null}`},
 		{name: "trailing data", content: `{"version":1,"deliveries":{},"wakeAttempts":{}} junk`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -993,6 +1101,28 @@ func TestCorruptStateFailsClosedBeforeNetwork(t *testing.T) {
 				t.Fatalf("gets=%d wakes=%d writes=%d reads=%d", api.gets, api.wakes, writer.writes, writer.reads)
 			}
 		})
+	}
+}
+
+func TestLoadStateInitializesOnlyAMissingFile(t *testing.T) {
+	missing, err := loadState(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.Deliveries == nil || missing.WakeAttempts == nil {
+		t.Fatalf("a missing state file must initialize valid empty maps: %+v", missing)
+	}
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"deliveries":{},"wakeAttempts":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Deliveries == nil || state.WakeAttempts == nil {
+		t.Fatalf("legitimate empty maps were lost: %+v", state)
 	}
 }
 
@@ -1163,8 +1293,11 @@ func TestSSHArgumentsAndScriptsAreSafe(t *testing.T) {
 	if strings.Contains(script, `{"deadline"`) {
 		t.Fatalf("write script contains raw JSON: %q", script)
 	}
-	if !strings.Contains(script, ".instabox-controller.tmp") || !strings.Contains(script, "mv -f --") {
-		t.Fatalf("write script is not an atomic replacement: %q", script)
+	if !strings.Contains(script, "mktemp") || !strings.Contains(script, ".instabox-controller.XXXXXX") || !strings.Contains(script, "mv -f --") {
+		t.Fatalf("write script is not an exclusive atomic replacement: %q", script)
+	}
+	if strings.Contains(script, ".instabox-controller.tmp") {
+		t.Fatalf("write script still uses a fixed, symlink-followable temp name: %q", script)
 	}
 	if got := readScript(target); !strings.HasPrefix(got, "cat -- '") {
 		t.Fatalf("read script = %q", got)
@@ -1190,6 +1323,76 @@ func TestSSHArgumentsAndScriptsAreSafe(t *testing.T) {
 	}
 	if got := shellQuote("a'b"); got != `'a'\''b'` {
 		t.Fatalf("shellQuote = %q", got)
+	}
+}
+
+func TestWriteScriptDoesNotFollowExistingSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "session-deadline.json")
+	targetVictim := filepath.Join(dir, "target-victim")
+	tmpVictim := filepath.Join(dir, "tmp-victim")
+	legacyTmp := target + ".instabox-controller.tmp"
+	content := deadlinePayload(testNow.Add(120 * time.Minute))
+
+	if err := os.WriteFile(targetVictim, []byte("keep target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmpVictim, []byte("keep tmp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetVictim, target); err != nil {
+		t.Fatal(err)
+	}
+	// The previous fixed temp name could be a pre-existing symlink, and the
+	// shell redirect would truncate the file it pointed at.
+	if err := os.Symlink(tmpVictim, legacyTmp); err != nil {
+		t.Fatal(err)
+	}
+
+	script, err := writeScript(RemoteTarget{
+		Host: "runner.example.net",
+		User: "dev",
+		Port: 22,
+		Path: target,
+	}, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The remote shell body runs locally, confined to this temporary test
+	// directory; no SSH or host alias is involved.
+	cmd := exec.Command("/bin/sh", "-c", script)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("write script failed: %v", err)
+	}
+	if string(out) != content {
+		t.Fatalf("readback = %q, want %q", out, content)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != content {
+		t.Fatalf("target = %q err=%v", got, err)
+	}
+	if info, err := os.Lstat(target); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("target must be an atomically replaced regular file: info=%v err=%v", info, err)
+	}
+	if got, err := os.ReadFile(targetVictim); err != nil || string(got) != "keep target" {
+		t.Fatalf("target symlink target was clobbered: %q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(tmpVictim); err != nil || string(got) != "keep tmp" {
+		t.Fatalf("legacy temp symlink target was clobbered: %q err=%v", got, err)
+	}
+	if info, err := os.Lstat(legacyTmp); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("a pre-existing unrelated temp path was removed: info=%v err=%v", info, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		switch entry.Name() {
+		case "session-deadline.json", "target-victim", "tmp-victim", filepath.Base(legacyTmp):
+		default:
+			t.Fatalf("write left an unowned temporary file: %s", entry.Name())
+		}
 	}
 }
 

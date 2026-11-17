@@ -426,9 +426,10 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 		}
 		outcome.remaining = budget.remaining(now)
 		if outcome.remaining <= 0 {
-			c.logf("machine %s: run budget is exhausted (%s remaining); no delivery", mc.MachineID, outcome.remaining.Round(time.Second))
-			outcomes[i] = outcome
-			continue
+			// A trusted deadline at or before now is still authoritative. It
+			// must replace a previously looser value on the machine even
+			// though this run can no longer be budget-ready.
+			c.logf("machine %s: run budget is exhausted (%s remaining); delivery still reconciled", mc.MachineID, outcome.remaining.Round(time.Second))
 		}
 		ready, err := c.ensureDelivery(ctx, mc, machine, budget, now)
 		if err != nil {
@@ -491,7 +492,13 @@ func (c *Controller) ensureDelivery(ctx context.Context, mc MachineConfig, machi
 			return false, fmt.Errorf("remote deadline remains unconfirmed: %w", err)
 		}
 		if sameDeadline(got, content) {
-			return c.confirmDelivery(key, entry, now, budget)
+			ready, err := c.confirmDelivery(key, entry, now, budget)
+			if err != nil {
+				return false, err
+			}
+			// The readback confirmed an earlier write, but only a fresh GET can
+			// prove a new run did not start while it was being confirmed.
+			return c.verifyAfterConfirmation(ctx, mc, machine, budget, ready)
 		}
 		// Different content is a known state; the atomic replace below is safe.
 	}
@@ -507,9 +514,14 @@ func (c *Controller) ensureDelivery(ctx context.Context, mc MachineConfig, machi
 	if err != nil {
 		return false, err
 	}
+	return c.verifyAfterConfirmation(ctx, mc, machine, budget, ready)
+}
 
-	// A second GET proves the identity and deadline the write assumed did not
-	// move while SSH was running.
+// verifyAfterConfirmation performs the post-confirmation GET that both the
+// write and the pending-readback paths need. It proves the identity and
+// deadline the confirmation assumed did not move in between; a changed run or
+// deadline is never reported ready.
+func (c *Controller) verifyAfterConfirmation(ctx context.Context, mc MachineConfig, machine Machine, budget budget, ready bool) (bool, error) {
 	fresh, err := c.API.GetMachine(ctx, mc.MachineID)
 	if err != nil {
 		c.roundGetFailed = true
@@ -756,24 +768,31 @@ func loadState(path string) (controllerState, error) {
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	var state controllerState
-	if err := dec.Decode(&state); err != nil {
+	// Pointer-to-map distinguishes an absent or null required deduplication
+	// field (fail closed) from a legitimate empty object.
+	var fileState struct {
+		Version      int                       `json:"version"`
+		Deliveries   *map[string]deliveryState `json:"deliveries"`
+		WakeAttempts *map[string]wakeAttempt   `json:"wakeAttempts"`
+	}
+	if err := dec.Decode(&fileState); err != nil {
 		return controllerState{}, errors.New("controller state is corrupt; refusing to act")
 	}
-	if state.Version != stateVersion {
+	if fileState.Version != stateVersion {
 		return controllerState{}, errors.New("controller state has an unsupported version; refusing to act")
 	}
 	var extra any
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return controllerState{}, errors.New("controller state has trailing data; refusing to act")
 	}
-	if state.Deliveries == nil {
-		state.Deliveries = map[string]deliveryState{}
+	if fileState.Deliveries == nil || fileState.WakeAttempts == nil {
+		return controllerState{}, errors.New("controller state is missing required deduplication state; refusing to act")
 	}
-	if state.WakeAttempts == nil {
-		state.WakeAttempts = map[string]wakeAttempt{}
-	}
-	return state, nil
+	return controllerState{
+		Version:      fileState.Version,
+		Deliveries:   *fileState.Deliveries,
+		WakeAttempts: *fileState.WakeAttempts,
+	}, nil
 }
 
 type lockHandle struct {
@@ -908,12 +927,18 @@ func writeScript(target RemoteTarget, content string) (string, error) {
 	if !validLocalPath(target.Path) || strings.HasSuffix(target.Path, "/") {
 		return "", errors.New("refusing SSH: unsafe deadline path")
 	}
-	tmp := target.Path + ".instabox-controller.tmp"
+	// Create an exclusive random file in the target's own directory. A fixed
+	// temp name could already be a symlink, and the shell redirect would
+	// truncate whatever it pointed at. The trap removes only the file mktemp
+	// just created, never an unrelated path.
+	tmpTemplate := filepath.Join(filepath.Dir(target.Path), ".instabox-controller.XXXXXX")
 	encoded := shellQuote(base64.StdEncoding.EncodeToString([]byte(content)))
-	return "umask 077; printf %s " + encoded +
-		" | base64 -d > " + shellQuote(tmp) +
-		" && mv -f -- " + shellQuote(tmp) + " " + shellQuote(target.Path) +
-		" && cat -- " + shellQuote(target.Path), nil
+	targetPath := shellQuote(target.Path)
+	return "umask 077; tmp=$(mktemp " + shellQuote(tmpTemplate) + ") || exit 1; " +
+		"trap 'rm -f -- \"$tmp\"' 0 HUP INT TERM; " +
+		"printf %s " + encoded + " | base64 -d > \"$tmp\" && " +
+		"mv -f -- \"$tmp\" " + targetPath + " && " +
+		"cat -- " + targetPath, nil
 }
 
 func (w *SSHWriter) run(ctx context.Context, target RemoteTarget, script string) (string, error) {
