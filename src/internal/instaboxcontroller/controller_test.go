@@ -213,18 +213,39 @@ func TestComputeBudgetCapsAndWindow(t *testing.T) {
 		wantReady bool
 	}{
 		{
-			name:      "free plan grown to 480 is capped at two hours",
+			name:      "free plan grown to 480 extends the current 15-minute bucket",
 			machine:   func() Machine { return runningMachine(testMachineA, started, 480) },
-			now:       started.Add(30 * time.Minute),
-			wantDead:  started.Add(120 * time.Minute),
-			wantReady: false, // only 90 minutes left
+			now:       started.Add(31 * time.Minute),
+			wantDead:  started.Add(150 * time.Minute),
+			wantReady: true, // 119 minutes left, capped at 120 from the anchor
 		},
 		{
-			name:      "unlimited paid run keeps the two-hour cap",
+			name:      "unlimited paid run uses the rolling anchored cap",
 			machine:   func() Machine { return runningMachine(testMachineA, started, -1) },
 			now:       started,
 			wantDead:  started.Add(120 * time.Minute),
 			wantReady: true,
+		},
+		{
+			name:      "120-minute platform budget keeps the original 20-minute window",
+			machine:   func() Machine { return runningMachine(testMachineA, started, 120) },
+			now:       started.Add(20 * time.Minute),
+			wantDead:  started.Add(120 * time.Minute),
+			wantReady: true,
+		},
+		{
+			name:      "120-minute platform budget is not extended past 20 minutes",
+			machine:   func() Machine { return runningMachine(testMachineA, started, 120) },
+			now:       started.Add(20*time.Minute + time.Second),
+			wantDead:  started.Add(120 * time.Minute),
+			wantReady: false,
+		},
+		{
+			name:      "shorter platform deadline wins inside the rolling cap",
+			machine:   func() Machine { return runningMachine(testMachineA, started, 125) },
+			now:       started.Add(31 * time.Minute),
+			wantDead:  started.Add(125 * time.Minute),
+			wantReady: false,
 		},
 		{
 			name:      "shorter max run limits the deadline",
@@ -271,6 +292,12 @@ func TestComputeBudgetCapsAndWindow(t *testing.T) {
 		{
 			name:    "far future run start is a clock anomaly",
 			machine: func() Machine { return runningMachine(testMachineA, started.Add(10*time.Minute), 120) },
+			now:     started,
+			wantErr: true,
+		},
+		{
+			name:    "even a slightly future run start is unknown",
+			machine: func() Machine { return runningMachine(testMachineA, started.Add(time.Second), 120) },
 			now:     started,
 			wantErr: true,
 		},
@@ -333,6 +360,109 @@ func TestBudgetReadyOnlyInsideTheTwentyMinuteWindow(t *testing.T) {
 	} {
 		if got := budgetReady(budget, tc.now); got != tc.want {
 			t.Fatalf("now=%s ready=%t, want %t", tc.now, got, tc.want)
+		}
+	}
+}
+
+func TestExtendedRunRecoversWhile120MinuteRunStaysRefused(t *testing.T) {
+	now := time.Date(2026, 11, 17, 17, 31, 0, 0, time.UTC)
+
+	s1Start := time.Date(2026, 11, 17, 14, 53, 6, 16_000_000, time.UTC)
+	s1, err := computeBudget(runningMachine(testMachineA, s1Start, 480), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantS1 := time.Date(2026, 11, 17, 19, 23, 6, 0, time.UTC)
+	if !s1.Deadline.Equal(wantS1) {
+		t.Fatalf("S1 deadline = %s, want %s", s1.Deadline, wantS1)
+	}
+	if !budgetReady(s1, now) {
+		t.Fatalf("S1 with %s remaining should be ready", s1.remaining(now))
+	}
+	if s1.Deadline.After(now.Add(hardRunCap)) {
+		t.Fatalf("S1 deadline %s is beyond now + %s", s1.Deadline, hardRunCap)
+	}
+	if !s1Start.Add(hardRunCap).Before(now) {
+		t.Fatal("fixture no longer exercises the expired initial-run cap")
+	}
+
+	s2Start := time.Date(2026, 11, 17, 16, 56, 58, 0, time.UTC)
+	s2, err := computeBudget(runningMachine(testMachineB, s2Start, 120), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantS2 := time.Date(2026, 11, 17, 18, 56, 58, 0, time.UTC)
+	if !s2.Deadline.Equal(wantS2) {
+		t.Fatalf("S2 deadline = %s, want %s", s2.Deadline, wantS2)
+	}
+	if s2.remaining(now) >= admissionFloor || budgetReady(s2, now) {
+		t.Fatalf("S2 with %s remaining must stay refused", s2.remaining(now))
+	}
+
+	// The same two observations through one whole controller round: S1 is
+	// admitted again and S2 remains refused.
+	cfg := testConfig(t, testMachineA, testMachineB)
+	cfg.EnableRemoteWrite = true
+	api := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		if id == testMachineA {
+			return runningMachine(testMachineA, s1Start, 480), nil
+		}
+		return runningMachine(testMachineB, s2Start, 120), nil
+	}}
+	writer := &fakeWriter{}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, writer, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 2 {
+		t.Fatalf("writes = %d, want one per machine", writer.writes)
+	}
+	if got := writer.content[remoteTarget(cfg.Machines[0]).key()]; got != deadlinePayload(wantS1) {
+		t.Fatalf("S1 delivered = %q", got)
+	}
+	if got := writer.content[remoteTarget(cfg.Machines[1]).key()]; got != deadlinePayload(wantS2) {
+		t.Fatalf("S2 delivered = %q", got)
+	}
+	ready := map[string]bool{}
+	for _, line := range strings.Split(logBuffer.String(), "\n") {
+		for _, id := range []string{testMachineA, testMachineB} {
+			if strings.Contains(line, "machine "+id+":") {
+				ready[id] = strings.Contains(line, "budget-ready=true")
+			}
+		}
+	}
+	if !ready[testMachineA] || ready[testMachineB] {
+		t.Fatalf("readiness A=%t B=%t; log=%s", ready[testMachineA], ready[testMachineB], logBuffer.String())
+	}
+}
+
+func TestOldDeadlineIsConservativeAcrossAFreshRun(t *testing.T) {
+	oldNow := time.Date(2026, 11, 17, 17, 31, 0, 0, time.UTC)
+	oldStart := time.Date(2026, 11, 17, 14, 53, 6, 16_000_000, time.UTC)
+	old, err := computeBudget(runningMachine(testMachineA, oldStart, 480), oldNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Deadline.After(oldNow.Add(hardRunCap)) {
+		t.Fatalf("old delivery %s is beyond its observation + %s", old.Deadline, hardRunCap)
+	}
+	if old.Deadline.Equal(oldStart.Add(480 * time.Minute)) {
+		t.Fatal("the old run's full platform deadline was delivered")
+	}
+
+	freshStart := oldNow.Add(time.Minute)
+	for _, maxRun := range []int{120, 480} {
+		fresh, err := computeBudget(runningMachine(testMachineB, freshStart, maxRun), freshStart)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if old.Deadline.After(freshStart.Add(hardRunCap)) {
+			t.Fatalf("old delivery %s is beyond the fresh run's initial cap %s", old.Deadline, freshStart.Add(hardRunCap))
+		}
+		if old.Deadline.After(fresh.Deadline) {
+			t.Fatalf("old delivery %s is beyond the fresh effective deadline %s", old.Deadline, fresh.Deadline)
 		}
 	}
 }
@@ -441,6 +571,172 @@ func TestDeliveryOncePerRunAndOnDeadlineChange(t *testing.T) {
 	}
 	if want := deadlinePayload(started.Add(120 * time.Minute)); writer.lastWrite != want {
 		t.Fatalf("new run write = %q, want %q", writer.lastWrite, want)
+	}
+}
+
+func TestDeliveryUsesStableFifteenMinuteAnchors(t *testing.T) {
+	cfg := testConfig(t, testMachineA)
+	cfg.EnableRemoteWrite = true
+	started := testNow
+	now := started.Add(time.Minute)
+	api := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, started, 480), nil
+	}}
+	writer := &fakeWriter{}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, writer, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 1 || writer.lastWrite != deadlinePayload(started.Add(120*time.Minute)) {
+		t.Fatalf("first write=%d value=%q", writer.writes, writer.lastWrite)
+	}
+
+	// Several polls inside the same 15-minute bucket must not rewrite the
+	// confirmed deadline.
+	for _, offset := range []time.Duration{2 * time.Minute, 5 * time.Minute, 14*time.Minute + 59*time.Second} {
+		now = started.Add(offset)
+		if err := controller.RunOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if writer.writes != 1 {
+			t.Fatalf("poll at %s rewrote the deadline: writes=%d", offset, writer.writes)
+		}
+	}
+
+	now = started.Add(15 * time.Minute)
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 2 || writer.lastWrite != deadlinePayload(started.Add(135*time.Minute)) {
+		t.Fatalf("bucket boundary write=%d value=%q", writer.writes, writer.lastWrite)
+	}
+	if want := started.Add(135 * time.Minute); want.After(now.Add(hardRunCap)) {
+		t.Fatalf("bucket deadline %s is beyond now + %s", want, hardRunCap)
+	}
+
+	now = started.Add(15*time.Minute + 30*time.Second)
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 2 {
+		t.Fatalf("second poll in the new bucket rewrote the deadline: writes=%d", writer.writes)
+	}
+}
+
+func TestExtendedDeadlineTightensImmediatelyOnCapChangeOrNewRun(t *testing.T) {
+	cfg := testConfig(t, testMachineA)
+	cfg.EnableRemoteWrite = true
+	started := testNow
+	now := started.Add(30 * time.Minute)
+	maxRun := 480
+	api := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, started, maxRun), nil
+	}}
+	writer := &fakeWriter{}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, writer, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 1 || writer.lastWrite != deadlinePayload(started.Add(150*time.Minute)) {
+		t.Fatalf("extended write=%d value=%q", writer.writes, writer.lastWrite)
+	}
+
+	// A shortened platform cap must replace the looser value at once.
+	maxRun = 120
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 2 || writer.lastWrite != deadlinePayload(started.Add(120*time.Minute)) {
+		t.Fatalf("shortened write=%d value=%q", writer.writes, writer.lastWrite)
+	}
+	if strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("shortened run was reported ready: %s", logBuffer.String())
+	}
+
+	// Zero means the platform run is already over. It is still authoritative
+	// and must replace the looser file even though readiness is false.
+	maxRun = 0
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 3 || writer.lastWrite != deadlinePayload(started) {
+		t.Fatalf("zero-cap write=%d value=%q", writer.writes, writer.lastWrite)
+	}
+	if strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("expired run was reported ready: %s", logBuffer.String())
+	}
+
+	// A new run gets a deadline for its own run start, never the old value.
+	started = started.Add(30 * time.Minute)
+	now = started.Add(time.Minute)
+	maxRun = 480
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 4 || writer.lastWrite != deadlinePayload(started.Add(120*time.Minute)) {
+		t.Fatalf("new-run write=%d value=%q", writer.writes, writer.lastWrite)
+	}
+	if !strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("new run was not reported ready: %s", logBuffer.String())
+	}
+}
+
+func TestPostWriteBucketChangeIsUnknownAndRecomputedNextRound(t *testing.T) {
+	cfg := testConfig(t, testMachineA)
+	cfg.EnableRemoteWrite = true
+	started := testNow
+	firstNow := started.Add(29*time.Minute + 59*time.Second)
+	secondNow := started.Add(30*time.Minute + 20*time.Second)
+	calls := 0
+	api := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		return runningMachine(testMachineA, started, 480), nil
+	}}
+	writer := &fakeWriter{}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, writer, func() time.Time {
+		calls++
+		if calls == 1 {
+			return firstNow
+		}
+		return secondNow
+	}, logBuffer)
+	defer controller.Close()
+
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("a post-write GET in a new bucket must not be reported ready")
+	}
+	if writer.writes != 1 || writer.lastWrite != deadlinePayload(started.Add(135*time.Minute)) {
+		t.Fatalf("first write=%d value=%q", writer.writes, writer.lastWrite)
+	}
+	if strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("cross-bucket post-write GET was reported ready: %s", logBuffer.String())
+	}
+
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 2 || writer.lastWrite != deadlinePayload(started.Add(150*time.Minute)) {
+		t.Fatalf("recomputed write=%d value=%q", writer.writes, writer.lastWrite)
+	}
+	if !strings.Contains(logBuffer.String(), "budget-ready=true") {
+		t.Fatalf("recomputed deadline was not ready: %s", logBuffer.String())
+	}
+
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.writes != 2 {
+		t.Fatalf("same-bucket poll rewrote the deadline: writes=%d", writer.writes)
 	}
 }
 
