@@ -210,3 +210,26 @@ loop:
 		})
 	}
 }
+
+func TestLoadProfileOptionalSessionDeadlineFile(t *testing.T) {
+	t.Parallel()
+
+	write := func(t *testing.T, extra string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "profile.yaml")
+		content := "name: remind-me\nrepo: {owner: me, name: app}\nservice: {name: gha-remind-me.service}\ndocker: {container_name_prefix: gha-remind-me}\nloop:\n  state_file: /var/lib/gha-runner-tui/state/remind-me.json\n" + extra
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	profile, err := LoadProfile(write(t, ""))
+	if err != nil || profile.Loop.SessionDeadlineFile != "" {
+		t.Fatalf("unconfigured deadline=%q err=%v", profile.Loop.SessionDeadlineFile, err)
+	}
+	profile, err = LoadProfile(write(t, "  session_deadline_file: /run/gha-runner-tui/session-deadline.json\n"))
+	if err != nil || profile.Loop.SessionDeadlineFile != "/run/gha-runner-tui/session-deadline.json" {
+		t.Fatalf("configured deadline=%q err=%v", profile.Loop.SessionDeadlineFile, err)
+	}
+}

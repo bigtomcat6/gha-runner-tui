@@ -109,11 +109,19 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			break
 		}
 		var wait time.Duration
-		if err != nil {
+		switch {
+		case errors.Is(err, errSessionDeadline):
+			// A refusal is a safe wait, not a failing backend. Re-read the
+			// externally supplied file at the normal poll cadence instead of
+			// growing the error backoff, so updates take effect quickly.
+			result.state = state.LoopBackoff
+			backoff = max(profile.Loop.BackoffSeconds, 1)
+			wait = s.Jitter(settings.poll)
+		case err != nil:
 			result.state = state.LoopBackoff
 			wait = time.Duration(backoff) * time.Second
 			backoff = min(backoff*2, maxBackoff)
-		} else {
+		default:
 			backoff = max(profile.Loop.BackoffSeconds, 1)
 			wait = s.Jitter(settings.poll)
 		}
@@ -159,6 +167,11 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	}
 	if ctx.Err() != nil {
 		return result, ctx.Err()
+	}
+	// Re-read before any job query: an unconfigured profile is unchanged, while
+	// any unusable deadline refuses a new registration/create/retry early.
+	if err := s.sessionDeadlineAdmission(p); err != nil {
+		return result, err
 	}
 	repos := make([]gh.Repository, 0, len(settings.watch))
 	for _, slug := range settings.watch {
@@ -210,6 +223,11 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
+	// Holding the host lock is not enough if the deadline changed while the
+	// job queries ran. Refuse before registering or consuming a token.
+	if err := s.sessionDeadlineAdmission(p); err != nil {
+		return result, err
+	}
 	result.state = state.LoopRegistering
 	if err := s.writeCycle(p, result, nil); err != nil {
 		return result, err
@@ -218,6 +236,11 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	registrationToken, err := registrationTokenForProfile(tokenCtx, s.GitHub, p)
 	cancelToken()
 	if err != nil {
+		return result, err
+	}
+	// A registration token may already have been issued, so check once more
+	// immediately before committing a runner name and container run.
+	if err := s.sessionDeadlineAdmission(p); err != nil {
 		return result, err
 	}
 	stamp := s.now().UTC().Format("20060102-150405")
@@ -903,7 +926,9 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 	notifiedNeverSeen := false
 	createdRetried := false
 	stopping := false
+	deadlineWithdrawalNotified := false
 	var lastGitHub time.Time
+	var lastDeadline time.Time
 
 	if ctx.Err() != nil {
 		stopping = true
@@ -953,16 +978,28 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 		// non-created observation. Inspect errors, created containers, and
 		// unknown states never reach GitHub, so a stray busy=false 204 cannot
 		// force-remove a run that has not reliably started.
+		deadlineReached := s.sessionDeadlineReached(p)
+		trustedObservation := inspectErr == nil && reliableContainerState(details.State)
+		idleReached := idleExceeded(s.now(), details.StartedAt, idle)
 		checkGitHub := false
 		switch {
-		case inspectErr != nil:
-			checkGitHub = false
-		case !reliableContainerState(details.State):
+		case !trustedObservation:
 			checkGitHub = false
 		case stopping:
 			checkGitHub = true
-		case idleExceeded(s.now(), details.StartedAt, idle):
+		case idleReached:
 			if lastGitHub.IsZero() || s.now().Sub(lastGitHub) >= waitGitHubInterval {
+				checkGitHub = true
+			}
+		}
+		// Crossing the deadline is not an idle timeout. Withdraw only after the
+		// same reliable observation and GitHub idle check, and throttle the
+		// query like idle cleanup so a long busy job is not polled every loop.
+		// An unreliable or in-flight container observation must never be
+		// upgraded into a GitHub lookup by the deadline alone.
+		if deadlineReached && !stopping && trustedObservation {
+			if lastDeadline.IsZero() || s.now().Sub(lastDeadline) >= waitGitHubInterval {
+				lastDeadline = s.now()
 				checkGitHub = true
 			}
 		}
@@ -973,25 +1010,56 @@ func (s *Supervisor) waitContainer(ctx context.Context, p config.Profile, c dock
 			switch {
 			case queryErr != nil:
 				missing = 0
-				s.noteWaitIssue(p, c, "runner lookup failed; container retained")
+				if deadlineReached && !deadlineWithdrawalNotified {
+					s.noteWaitIssue(p, c, "session deadline reached; runner lookup failed; container retained (withdrawal incomplete; may accept work)")
+					deadlineWithdrawalNotified = true
+				} else if !deadlineReached {
+					s.noteWaitIssue(p, c, "runner lookup failed; container retained")
+				}
 			case runner != nil:
 				seen, missing = true, 0
 				if !runner.Busy {
 					derr := s.deleteRunner(ctx, target, runner.ID, stopping)
 					if derr == nil {
-						return waitResult{forceRemove: true, idleExpired: !stopping}, nil
+						if deadlineReached {
+							s.noteWaitIssue(p, c, "session deadline reached; idle runner withdrawn")
+						}
+						return waitResult{forceRemove: true, idleExpired: !stopping && !deadlineReached}, nil
 					}
 					var api *gh.APIError
 					if errors.As(derr, &api) && api.StatusCode == 422 {
 						// The job was accepted: keep waiting and never rm.
-					} else {
+						if deadlineReached && !deadlineWithdrawalNotified {
+							s.noteWaitIssue(p, c, "session deadline reached; runner accepted a job; container retained (withdrawal incomplete; may accept work)")
+							deadlineWithdrawalNotified = true
+						}
+					} else if deadlineReached && !deadlineWithdrawalNotified {
+						s.noteWaitIssue(p, c, "session deadline reached; runner deletion failed; container retained (withdrawal incomplete; may accept work)")
+						deadlineWithdrawalNotified = true
+					} else if !deadlineReached {
 						s.noteWaitIssue(p, c, "runner deletion failed; container retained")
 					}
+				} else if deadlineReached && !deadlineWithdrawalNotified {
+					s.noteWaitIssue(p, c, "session deadline reached; runner busy; container retained (withdrawal incomplete; may accept work)")
+					deadlineWithdrawalNotified = true
 				}
 			case seen:
-				missing++
-				if missing == 2 {
-					return waitResult{forceRemove: true}, nil
+				if deadlineReached {
+					// A runner disappearing from the listing is not proof that
+					// the job was withdrawn: only a current busy=false plus a
+					// DELETE 204 may authorize deadline cleanup. Reset the idle
+					// miss counter so these observations cannot later combine
+					// into a zero-DELETE force removal.
+					missing = 0
+					if !deadlineWithdrawalNotified {
+						s.noteWaitIssue(p, c, "session deadline reached; runner missing; container retained (withdrawal incomplete; may accept work)")
+						deadlineWithdrawalNotified = true
+					}
+				} else {
+					missing++
+					if missing == 2 {
+						return waitResult{forceRemove: true}, nil
+					}
 				}
 			default:
 				if inspectErr == nil && idleExceeded(s.now(), details.StartedAt, idle) && !notifiedNeverSeen {

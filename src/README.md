@@ -51,6 +51,24 @@ loop:
 - Poll defaults to 30 seconds, clamps to a minimum of 10 seconds, with ±20% jitter. Idle timeout defaults to 180 seconds and clamps to a minimum of 60 seconds. Legacy `interval_seconds` is accepted in YAML but does not control new polling.
 - New profiles are always ephemeral. Loop-only checks enforce ephemeral/watch settings; old profiles can still be loaded for read-only diagnosis. A loop-only validation failure records `failed` and its reason, then waits for SIGTERM rather than creating a `RestartSec=5` restart storm. YAML loading, required managed-name validation and state/log-directory errors can still fail startup.
 
+### Session deadline admission protection (opt-in, best effort)
+
+`loop.session_deadline_file` is optional. When it is unset, the protection is **not enabled** and the loop behaves exactly as described here. When set, it must point to a local JSON file:
+
+```json
+{"deadline":"2026-11-17T20:00:00Z"}
+```
+
+Every cycle re-reads that file, so an external coordinator can move the deadline without restarting the loop. The loop never writes, extends or infers it: uptime, SSH session age and process start time are not deadline sources, and the configured clock/deadline are trusted as given. While the file is configured, a missing, unreadable or invalid file, a missing/invalid RFC3339 time, an expired deadline, or less than 100 minutes remaining (90 minutes of work plus a 10-minute buffer) refuses **new** registration, creation and retry. The check runs before job polling and again after the host lock and registration token are obtained.
+
+This is a best-effort admission guard, not an atomic 90-minute guarantee and not fail-closed at every stage:
+
+- GitHub can assign a queued job between the last admission check and registration; the local check cannot reserve a job.
+- A registered runner is adopted at startup. After the threshold, an idle runner is withdrawn only when GitHub reports it idle **and** DELETE returns 204; only then may its container be cleaned. Busy runners, HTTP 422 (a job was accepted), lookup errors and failed DELETEs retain the container and publish an incomplete-withdrawal diagnostic because the runner may still accept work. A DELETE/assignment race remains.
+- Deadline-triggered withdrawal is not an idle timeout: it does not add candidate jobs to the in-memory 30-minute skip list, and it does not kill or remove a container on unverified data. Existing busy work may still run past the deadline.
+
+README statements and local tests do not prove the external GitHub contract or real systemd races.
+
 ## Credentials: strict files, no silent identity switch
 
 Profile `github.token_file` takes priority over `github.env_file`. A specified file must yield a token: missing, unreadable, empty, malformed or missing-key files fail, never fall back to the SSH process environment. A permission/read failure may try `sudo -n cat` internally; file contents are not printed.
@@ -96,7 +114,7 @@ io.gha-runner-tui.runner=<runner name>
 
 While waiting, normal inspect cadence is 15 seconds. A retained `created` container gets 60 seconds from creation before a **non-force** removal attempt; failed/unknown removal retains the slot and rechecks rather than assuming it is free. A runner never seen in GitHub is never automatically force-deleted: it can block the host indefinitely, requiring an explicit operator decision.
 
-Idle cleanup requires authoritative evidence: DELETE HTTP 204 authorizes force removal, HTTP 422 keeps waiting, other errors retain the container; a previously seen runner missing on two consecutive checks also authorizes removal. After idle cleanup, candidate job IDs are skipped **in memory for 30 minutes**. Restart loses that skip list; it is not persistent scheduling.
+Idle cleanup requires authoritative evidence: DELETE HTTP 204 authorizes force removal, HTTP 422 keeps waiting, other errors retain the container; a previously seen runner missing on two consecutive checks also authorizes removal. After idle cleanup, candidate job IDs are skipped **in memory for 30 minutes**. Restart loses that skip list; it is not persistent scheduling. Deadline-triggered withdrawal does not use this idle skip list.
 
 Stop/restart call only systemctl, not Docker kill: **停止后不再接新 job；正在运行的 job 会继续跑完**. Restart starts the loop again and adopts a retained container. A stopped service does not prove a finished job or a free slot. On SIGTERM, the loop drains/checks for up to 60 seconds at 5-second intervals, then can exit leaving the container occupying the slot. A launch already in progress uses an independent 120-second context and `docker run --sig-proxy=false`, not signal cancellation. Completed-container logs are redacted before persistence.
 
