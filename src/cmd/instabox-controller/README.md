@@ -119,9 +119,17 @@ INSTABOX_S2_API_KEY=REPLACE_WITH_S2_ACCOUNT_KEY
    A different account needs its own key; never point two accounts at one key.
 3. First run a preflight round; this makes GETs but no SSH and no wake.
    With split accounts, each key performs only the GETs for its own machines.
-   Set the variables the config names, for example by exporting the contents
-   of the file you created above in the same shell (`set -a; . ./credentials.env; set +a`),
-   or keep a single legacy key inline:
+   Let systemd read the `EnvironmentFile` you created above; never source or
+   `eval` it in a shell (its values are data, and keys may contain `$` or
+   backticks that must stay literal):
+
+   ```bash
+   sudo systemd-run --wait --pipe --collect \
+     -p EnvironmentFile=/etc/instabox-controller/credentials.env \
+     -- "$(pwd)/instabox-controller" --config "$(pwd)/controller.json" --once --dry-run
+   ```
+
+   For a legacy single-account config, keep one key inline:
 
    ```bash
    INSTABOX_API_KEY=... ./instabox-controller --config controller.json --once --dry-run
