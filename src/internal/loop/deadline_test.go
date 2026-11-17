@@ -95,8 +95,8 @@ func TestReadSessionDeadlineUnusableFiles(t *testing.T) {
 			if !errors.Is(err, errSessionDeadline) || !deadline.IsZero() {
 				t.Fatalf("deadline=%s err=%v", deadline, err)
 			}
-			if sessionDeadlineExhausted(path, now) {
-				t.Fatal("unusable file must not be treated as exhausted")
+			if !sessionDeadlineExhausted(path, now) {
+				t.Fatal("configured but unusable deadline must enter the protected withdrawal path")
 			}
 		})
 	}
@@ -551,5 +551,189 @@ func TestAdoptManagedSessionDeadlineWithdrawsIdleRunner(t *testing.T) {
 	saved, err := state.LoadLoopState(p.Loop.StateFile)
 	if err != nil || saved.LastError == nil || !strings.Contains(*saved.LastError, "idle runner withdrawn") {
 		t.Fatalf("diagnostic=%+v err=%v", saved, err)
+	}
+}
+
+// writeUnusableSessionDeadline creates each configured-but-unprovable deadline
+// state. None of these may fall back to the unconfigured ordinary two-miss
+// force-removal path.
+func writeUnusableSessionDeadline(t *testing.T, path, kind string) {
+	t.Helper()
+	switch kind {
+	case "missing":
+	case "unreadable":
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	case "invalid json":
+		if err := os.WriteFile(path, []byte(`{"deadline":`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	case "invalid time":
+		if err := os.WriteFile(path, []byte(`{"deadline":"tomorrow"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unknown deadline fixture %q", kind)
+	}
+}
+
+func TestWaitUnusableSessionDeadlineProtectsOrdinaryModes(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	for _, mode := range []struct {
+		name    string
+		fixture string
+		policy  state.AdmissionPolicy
+	}{
+		{name: "mode1", policy: state.DefaultAdmissionPolicy()},
+		{name: "mode2 grace elapsed", fixture: `{"mode":2,"delay_seconds":60}`, policy: state.AdmissionPolicy{Mode: state.AdmissionDelayed, DelaySeconds: 60}},
+	} {
+		for _, kind := range []string{"missing", "unreadable", "invalid json", "invalid time"} {
+			t.Run(mode.name+" "+kind, func(t *testing.T) {
+				path := deadlinePath(t)
+				writeUnusableSessionDeadline(t, path, kind)
+				p := loopProfile(t)
+				p.Loop.SessionDeadlineFile = path
+				if mode.fixture != "" {
+					writeAdmissionFixture(t, p, mode.fixture)
+				}
+				clock := newTestClock(t, now)
+				d := &dockerScript{inspect: [][]byte{runningInspect(now.Format(time.RFC3339), now.Format(time.RFC3339))}}
+				script := &ghScript{list: []ghObs{{found: true, id: 7, busy: true}, {}}}
+				srv := newGHScript(t, script)
+				defer srv.Close()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				clock.cancelAt, clock.cancel = 6, cancel
+				s := newWaitSupervisor(t, clock, d, srv)
+				s.admissionPolicy = mode.policy
+
+				got, err := s.waitContainer(ctx, p, waitInfo(t), 24*time.Hour)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.forceRemove || got.idleExpired || script.deleteCalls != 0 || d.rmN != 0 {
+					t.Fatalf("unusable deadline authorized removal: result=%+v deletes=%d rm=%d", got, script.deleteCalls, d.rmN)
+				}
+				if script.listCalls < 3 || !got.retained {
+					t.Fatalf("protected withdrawal was not observed: result=%+v lookups=%d", got, script.listCalls)
+				}
+				if len(s.skippedJobs) != 0 {
+					t.Fatalf("busy job skipped the queue: %v", s.skippedJobs)
+				}
+				saved, err := state.LoadLoopState(p.Loop.StateFile)
+				if err != nil || saved.LastError == nil || !strings.Contains(*saved.LastError, "withdrawal incomplete; may accept work") {
+					t.Fatalf("diagnostic=%+v err=%v", saved, err)
+				}
+			})
+		}
+	}
+}
+
+func TestWaitUnusableSessionDeadlineKeepsSafetyGates(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour).UTC().Format(time.RFC3339)
+	for _, tc := range []struct {
+		name       string
+		docker     *dockerScript
+		list       []ghObs
+		deletes    []int
+		wantRemove bool
+		wantDelete int
+		wantNoList bool
+		wantDiag   string
+	}{
+		{
+			name:       "valid docker idle delete 204",
+			docker:     &dockerScript{inspect: [][]byte{runningInspect(now.Format(time.RFC3339), now.Format(time.RFC3339))}},
+			list:       []ghObs{{found: true, id: 7}},
+			deletes:    []int{http.StatusNoContent},
+			wantRemove: true, wantDelete: 1, wantDiag: "idle runner withdrawn",
+		},
+		{
+			name:     "busy",
+			docker:   &dockerScript{inspect: [][]byte{runningInspect(now.Format(time.RFC3339), now.Format(time.RFC3339))}},
+			list:     []ghObs{{found: true, id: 7, busy: true}},
+			wantDiag: "withdrawal incomplete; may accept work",
+		},
+		{
+			name:       "422 accepted job",
+			docker:     &dockerScript{inspect: [][]byte{runningInspect(now.Format(time.RFC3339), now.Format(time.RFC3339))}},
+			list:       []ghObs{{found: true, id: 7}},
+			deletes:    []int{http.StatusUnprocessableEntity},
+			wantDelete: 1, wantDiag: "withdrawal incomplete; may accept work",
+		},
+		{
+			name:     "lookup error",
+			docker:   &dockerScript{inspect: [][]byte{runningInspect(now.Format(time.RFC3339), now.Format(time.RFC3339))}},
+			list:     []ghObs{{status: http.StatusInternalServerError}},
+			wantDiag: "withdrawal incomplete; may accept work",
+		},
+		{
+			name:       "missing runner",
+			docker:     &dockerScript{inspect: [][]byte{runningInspect(now.Format(time.RFC3339), now.Format(time.RFC3339))}},
+			list:       []ghObs{{}},
+			wantNoList: false,
+		},
+		{
+			name: "inspect error",
+			docker: &dockerScript{
+				inspect:     [][]byte{[]byte("daemon down")},
+				inspectErrs: []error{errors.New("exit status 1")},
+			},
+			wantNoList: true,
+		},
+		{
+			name:       "created",
+			docker:     &dockerScript{inspect: [][]byte{containerInspectJSON("created", future, "0001-01-01T00:00:00Z", 0)}},
+			wantNoList: true,
+		},
+		{
+			name:       "unknown",
+			docker:     &dockerScript{inspect: [][]byte{containerInspectJSON("mystery", now.Format(time.RFC3339), now.Format(time.RFC3339), 0)}},
+			wantNoList: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := deadlinePath(t)
+			writeUnusableSessionDeadline(t, path, "invalid json")
+			p := loopProfile(t)
+			p.Loop.SessionDeadlineFile = path
+			clock := newTestClock(t, now)
+			script := &ghScript{list: tc.list, deleteCodes: tc.deletes}
+			srv := newGHScript(t, script)
+			defer srv.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			clock.cancelAt, clock.cancel = 3, cancel
+			s := newWaitSupervisor(t, clock, tc.docker, srv)
+
+			got, err := s.waitContainer(ctx, p, waitInfo(t), 24*time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.forceRemove != tc.wantRemove {
+				t.Fatalf("result=%+v", got)
+			}
+			if script.deleteCalls < tc.wantDelete || tc.docker.rmN != 0 {
+				t.Fatalf("delete=%d rm=%d", script.deleteCalls, tc.docker.rmN)
+			}
+			if tc.wantNoList && script.listCalls != 0 {
+				t.Fatalf("untrusted Docker observation reached GitHub: lookups=%d", script.listCalls)
+			}
+			if tc.wantRemove {
+				if got.idleExpired || got.retained {
+					t.Fatalf("safe withdrawal was misclassified: %+v", got)
+				}
+			} else if !got.retained {
+				t.Fatalf("expected retention, got %+v", got)
+			}
+			if tc.wantDiag != "" {
+				saved, err := state.LoadLoopState(p.Loop.StateFile)
+				if err != nil || saved.LastError == nil || !strings.Contains(*saved.LastError, tc.wantDiag) {
+					t.Fatalf("diagnostic=%+v err=%v", saved, err)
+				}
+			}
+		})
 	}
 }

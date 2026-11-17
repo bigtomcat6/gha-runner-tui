@@ -85,15 +85,17 @@ func (s *Supervisor) sessionDeadlineAdmission(p config.Profile) error {
 	return sessionDeadlineAdmission(p, s.now())
 }
 
-// sessionDeadlineExhausted reports a parsed deadline at or below the floor.
-// Unknown or unreadable deadlines are not treated as exhausted: without a
-// trustworthy time, withdrawal must not guess.
+// sessionDeadlineExhausted reports when a configured deadline cannot prove
+// usable remaining time: missing, unreadable, invalid, expired, or below the
+// floor. A configured-but-unknown deadline must fail closed into the protected
+// withdrawal path rather than fall back to zero-DELETE removal. Only an
+// unconfigured path stays inactive.
 func sessionDeadlineExhausted(path string, now time.Time) bool {
 	if path == "" {
 		return false
 	}
-	deadline, err := readSessionDeadline(path, now)
-	return err != nil && !deadline.IsZero()
+	_, err := readSessionDeadline(path, now)
+	return err != nil
 }
 
 // sessionDeadlineReached keeps the unconfigured loop free of extra clock and
