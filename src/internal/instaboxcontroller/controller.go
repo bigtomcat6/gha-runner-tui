@@ -29,11 +29,14 @@ const (
 	// admissionFloor mirrors the loop's session deadline floor (90 minutes of
 	// work plus a 10 minute buffer).
 	admissionFloor = 100 * time.Minute
-	// standbyWakeThreshold wakes a standby once the only usable machine has
-	// five minutes less than the admission floor left.
+	// standbyWakeThreshold wakes a standby once the only usable machine's run
+	// has five minutes less than the admission floor left before its
+	// (projected) platform end.
 	standbyWakeThreshold = 105 * time.Minute
-	// The usable budget window of a run is the 20 minutes between the
-	// admission floor and the hard cap.
+	// freePlanRunMinutes is the documented ceiling of one free-plan run. The
+	// service starts each run at 120 minutes and extends it while the machine
+	// is in use, so a free machine's run is projected to this ceiling.
+	freePlanRunMinutes  = 480
 	defaultPollInterval = 30 * time.Second
 	minPollInterval     = 10 * time.Second
 	maxPollInterval     = time.Hour
@@ -245,9 +248,22 @@ func validLocalPath(path string) bool {
 type budget struct {
 	RunStartedAt time.Time
 	Deadline     time.Time
+	// RunEnd is the (projected) platform end of the run; zero means the run
+	// has no platform end (maxRunMinutes -1).
+	RunEnd time.Time
 }
 
 func (b budget) remaining(now time.Time) time.Duration { return b.Deadline.Sub(now) }
+
+// runRemaining is the time left before the run's (projected) platform end. It
+// is not capped by the rolling 120-minute window, so it decides when a standby
+// must take over.
+func (b budget) runRemaining(now time.Time) (time.Duration, bool) {
+	if b.RunEnd.IsZero() {
+		return 0, false
+	}
+	return b.RunEnd.Sub(now), true
+}
 func (b budget) runKey() string {
 	return b.RunStartedAt.UTC().Format(time.RFC3339Nano)
 }
@@ -263,6 +279,11 @@ func (b budget) deadlineKey() string {
 // minutes ahead and is stable inside one interval. A platform deadline at or
 // below the cap is used unchanged. A missing or untrusted start or max-run
 // value makes the machine not ready: the controller never guesses a budget.
+//
+// On a free machine (free=true) a positive maxRunMinutes below 480 is
+// projected to 480: the service extends a run that is in use before it ends,
+// up to 480 minutes. This trusts the documented extension rule; a run the
+// service does not extend still pauses at its current limit.
 func computeBudget(m Machine, now time.Time) (budget, error) {
 	if m.State != "running" {
 		return budget{}, fmt.Errorf("machine is %s, not running", m.State)
@@ -290,8 +311,12 @@ func computeBudget(m Machine, now time.Time) (budget, error) {
 	if max < -1 {
 		return budget{}, errors.New("machine maxRunMinutes is invalid")
 	}
+	if m.Free != nil && *m.Free && max > 0 && max < freePlanRunMinutes {
+		max = freePlanRunMinutes
+	}
 	anchor := started.Add(now.Sub(started).Truncate(budgetAnchorQuantum))
 	deadline := anchor.Add(hardRunCap)
+	var runEnd time.Time
 	if max >= 0 {
 		// Compare in minutes before multiplying so an implausibly large
 		// maxRunMinutes cannot overflow a duration. A platform deadline beyond
@@ -302,10 +327,16 @@ func computeBudget(m Machine, now time.Time) (budget, error) {
 				deadline = platformEnd
 			}
 		}
+		// The same overflow guard for the run end: a limit longer than ten
+		// years is treated as no platform end.
+		if max <= 10*365*24*60 {
+			runEnd = started.Add(time.Duration(max) * time.Minute).UTC()
+		}
 	}
 	return budget{
 		RunStartedAt: started.UTC(),
 		Deadline:     deadline.UTC().Truncate(time.Second),
+		RunEnd:       runEnd,
 	}, nil
 }
 
@@ -477,7 +508,11 @@ type machineOutcome struct {
 	getFailed bool
 	state     string
 	remaining time.Duration
-	ready     bool
+	// runRemaining is the time to the run's (projected) platform end;
+	// hasRunEnd is false for a run without one.
+	runRemaining time.Duration
+	hasRunEnd    bool
+	ready        bool
 }
 
 // RunOnce performs one whole polling round. It returns an error when a GET
@@ -538,7 +573,12 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 			c.logf("machine %s: %v", mc.MachineID, err)
 		}
 		outcome.ready = ready
-		c.logf("machine %s: state=%s remaining=%s budget-ready=%t", mc.MachineID, outcome.state, outcome.remaining.Round(time.Second), ready)
+		outcome.runRemaining, outcome.hasRunEnd = budget.runRemaining(now)
+		if outcome.hasRunEnd {
+			c.logf("machine %s: state=%s remaining=%s budget-ready=%t run-remaining=%s", mc.MachineID, outcome.state, outcome.remaining.Round(time.Second), ready, outcome.runRemaining.Round(time.Second))
+		} else {
+			c.logf("machine %s: state=%s remaining=%s budget-ready=%t", mc.MachineID, outcome.state, outcome.remaining.Round(time.Second), ready)
+		}
 		outcomes[i] = outcome
 	}
 
@@ -683,8 +723,11 @@ func sameDeadline(got, want string) bool {
 }
 
 // maybeWake wakes at most one standby, and only when there is no safe
-// budget-ready machine or the single ready machine is inside the 105-minute
-// threshold. A GET failure anywhere cancels waking for the round.
+// budget-ready machine or the single ready machine's run is within 105 minutes
+// of its (projected) platform end. Measuring the run end rather than the
+// rolling 120-minute deadline wakes the standby just before the active machine
+// stops admitting, so two machines alternate instead of running in phase. A
+// GET failure anywhere cancels waking for the round.
 func (c *Controller) maybeWake(ctx context.Context, outcomes []machineOutcome, allGETsOK bool, now time.Time) error {
 	if !c.Config.EnableWake || c.DryRun {
 		return nil
@@ -702,7 +745,7 @@ func (c *Controller) maybeWake(ctx context.Context, outcomes []machineOutcome, a
 	switch {
 	case len(ready) > 1:
 		return nil
-	case len(ready) == 1 && ready[0].remaining > standbyWakeThreshold:
+	case len(ready) == 1 && (!ready[0].hasRunEnd || ready[0].runRemaining > standbyWakeThreshold):
 		return nil
 	}
 

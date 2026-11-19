@@ -70,7 +70,10 @@ type Machine struct {
 	CooldownUntil   *string `json:"cooldownUntil"`
 	CooldownReason  *string `json:"cooldownReason"`
 	AutoSuspendedAt *string `json:"autoSuspendedAt"`
-	Revision        int64   `json:"revision"`
+	// Free marks a free-tier org's machine, whose run limit the service grows
+	// while the machine is in use (up to freePlanRunMinutes per run).
+	Free     *bool `json:"free"`
+	Revision int64 `json:"revision"`
 }
 
 // ExecResult is the documented synchronous answer of POST

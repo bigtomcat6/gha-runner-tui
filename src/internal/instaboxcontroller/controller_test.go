@@ -2641,3 +2641,163 @@ func TestAPIExec403FailsWithoutFallbackToSSH(t *testing.T) {
 		t.Fatalf("refused write must stay unconfirmed: %+v", entry)
 	}
 }
+
+func freeMachine(id string, started time.Time, maxRun int) Machine {
+	m := runningMachine(id, started, maxRun)
+	free := true
+	m.Free = &free
+	return m
+}
+
+func TestFreeRunIsProjectedToTheFreePlanCeiling(t *testing.T) {
+	started := testNow
+	for _, tc := range []struct {
+		name         string
+		machine      Machine
+		elapsed      time.Duration
+		wantDL       time.Time
+		wantReady    bool
+		wantRunEnd   time.Time
+		wantNoRunEnd bool
+	}{
+		{
+			name:       "fresh free run is admitted past the first 20 minutes",
+			machine:    freeMachine(testMachineA, started, 120),
+			elapsed:    30 * time.Minute,
+			wantDL:     started.Add(150 * time.Minute),
+			wantReady:  true,
+			wantRunEnd: started.Add(480 * time.Minute),
+		},
+		{
+			name:       "same run without free stays on the granted limit",
+			machine:    runningMachine(testMachineA, started, 120),
+			elapsed:    30 * time.Minute,
+			wantDL:     started.Add(120 * time.Minute),
+			wantReady:  false,
+			wantRunEnd: started.Add(120 * time.Minute),
+		},
+		{
+			name:       "free run is ready with exactly 100 projected minutes",
+			machine:    freeMachine(testMachineA, started, 240),
+			elapsed:    380 * time.Minute,
+			wantDL:     started.Add(480 * time.Minute),
+			wantReady:  true,
+			wantRunEnd: started.Add(480 * time.Minute),
+		},
+		{
+			name:       "free run stops admitting below 100 projected minutes",
+			machine:    freeMachine(testMachineA, started, 480),
+			elapsed:    381 * time.Minute,
+			wantDL:     started.Add(480 * time.Minute),
+			wantReady:  false,
+			wantRunEnd: started.Add(480 * time.Minute),
+		},
+		{
+			name:       "free maxRunMinutes 0 is never projected",
+			machine:    freeMachine(testMachineA, started, 0),
+			elapsed:    time.Minute,
+			wantDL:     started,
+			wantReady:  false,
+			wantRunEnd: started,
+		},
+		{
+			name:         "unlimited run has no run end",
+			machine:      freeMachine(testMachineA, started, -1),
+			elapsed:      30 * time.Minute,
+			wantDL:       started.Add(150 * time.Minute),
+			wantReady:    true,
+			wantNoRunEnd: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := started.Add(tc.elapsed)
+			b, err := computeBudget(tc.machine, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !b.Deadline.Equal(tc.wantDL) {
+				t.Fatalf("deadline = %s, want %s", b.Deadline, tc.wantDL)
+			}
+			if got := budgetReady(b, now); got != tc.wantReady {
+				t.Fatalf("ready = %t with %s remaining, want %t", got, b.remaining(now), tc.wantReady)
+			}
+			if b.Deadline.After(now.Add(hardRunCap)) {
+				t.Fatalf("deadline %s is beyond now + %s", b.Deadline, hardRunCap)
+			}
+			runRemaining, ok := b.runRemaining(now)
+			if tc.wantNoRunEnd {
+				if ok {
+					t.Fatalf("run end = %s, want none", b.RunEnd)
+				}
+				return
+			}
+			if !ok || runRemaining != tc.wantRunEnd.Sub(now) {
+				t.Fatalf("run remaining = %s (%t), want %s", runRemaining, ok, tc.wantRunEnd.Sub(now))
+			}
+		})
+	}
+}
+
+func TestFreeStandbyWakesOnlyNearTheProjectedRunEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		active   func(started time.Time) Machine
+		elapsed  time.Duration
+		wantWake int
+	}{
+		// Before projection a fresh 120-minute run was not ready after 20
+		// minutes and woke the standby at once, keeping both machines in phase.
+		{name: "fresh free run keeps the standby asleep", active: func(s time.Time) Machine { return freeMachine(testMachineA, s, 120) }, elapsed: 30 * time.Minute, wantWake: 0},
+		{name: "extended free run mid-run keeps the standby asleep", active: func(s time.Time) Machine { return freeMachine(testMachineA, s, 360) }, elapsed: 4 * time.Hour, wantWake: 0},
+		{name: "free run 110 minutes before its end keeps the standby asleep", active: func(s time.Time) Machine { return freeMachine(testMachineA, s, 480) }, elapsed: 370 * time.Minute, wantWake: 0},
+		{name: "free run 104 minutes before its end wakes the standby", active: func(s time.Time) Machine { return freeMachine(testMachineA, s, 480) }, elapsed: 376 * time.Minute, wantWake: 1},
+		{name: "free run past its admission window wakes the standby", active: func(s time.Time) Machine { return freeMachine(testMachineA, s, 480) }, elapsed: 400 * time.Minute, wantWake: 1},
+		{name: "unlimited run never needs the standby", active: func(s time.Time) Machine { return runningMachine(testMachineA, s, -1) }, elapsed: 14 * time.Minute, wantWake: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, testMachineA, testMachineB)
+			cfg.EnableRemoteWrite = true
+			cfg.EnableWake = true
+			started := testNow
+			now := started.Add(tc.elapsed)
+			api := &fakeAPI{
+				getFunc: func(ctx context.Context, id string) (Machine, error) {
+					if id == testMachineA {
+						return tc.active(started), nil
+					}
+					return suspendedMachine(testMachineB, started.Add(-10*time.Minute)), nil
+				},
+				wakeFunc: func(ctx context.Context, id string) (Machine, error) { return Machine{}, nil },
+			}
+			logBuffer := &bytes.Buffer{}
+			controller := newController(cfg, api, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+			defer controller.Close()
+			if err := controller.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if api.wakes != tc.wantWake {
+				t.Fatalf("wakes = %d, want %d; log=%s", api.wakes, tc.wantWake, logBuffer.String())
+			}
+			if tc.wantWake == 1 && (len(api.wakeIDs) != 1 || api.wakeIDs[0] != testMachineB) {
+				t.Fatalf("wake ids = %v", api.wakeIDs)
+			}
+		})
+	}
+}
+
+func TestMachineDecodesTheFreeFlag(t *testing.T) {
+	var m Machine
+	if err := json.Unmarshal([]byte(`{"id":"m_x","free":true}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Free == nil || !*m.Free {
+		t.Fatalf("free = %v", m.Free)
+	}
+	m = Machine{}
+	if err := json.Unmarshal([]byte(`{"id":"m_x"}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Free != nil {
+		t.Fatalf("missing free decoded as %v", *m.Free)
+	}
+}
