@@ -59,6 +59,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// githubCacheDir is shared by every loop process on the host; tests point it
+// at a temporary directory.
+var githubCacheDir = gh.DefaultHostCacheDir
+
 func runLoop(ctx context.Context, profilePath string, runner command.Runner, httpClient gh.HTTPDoer) error {
 	profile, err := config.LoadProfile(profilePath)
 	if err != nil {
@@ -73,7 +77,9 @@ func runLoop(ctx context.Context, profilePath string, runner command.Runner, htt
 	supervisor := loop.Supervisor{
 		ProfilePath: profilePath,
 		Docker:      docker.NewClient(runner),
-		GitHub:      gh.NewClient("", profile.GitHub.TokenEnv, tokenFile, runner, httpClient),
+		// Loops on one host share GitHub reads (conditional GETs and queued-job
+		// snapshots) so the user-wide API quota does not scale with loop count.
+		GitHub: gh.NewClient("", profile.GitHub.TokenEnv, tokenFile, runner, httpClient).WithHostCache(githubCacheDir),
 	}
 
 	return supervisor.Run(ctx)
