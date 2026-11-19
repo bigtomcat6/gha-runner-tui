@@ -1,6 +1,6 @@
 # gha-runner-tui
 
-A terminal dashboard and SSH-friendly CLI for ephemeral GitHub Actions Docker runners, with one systemd loop per profile and a host-wide single-job gate.
+A terminal dashboard and SSH-friendly CLI for ephemeral GitHub Actions Docker runners, with one systemd loop per profile and a configurable host-wide job gate (one job by default).
 
 ## Build and local validation
 
@@ -100,7 +100,7 @@ Rootless supports ordinary Docker build/pull/push/run, Compose and buildx uses; 
 
 ## Queue-driven loop and graceful lifecycle
 
-Each unit runs `gha-ephemeral-loop --config <profile-YAML>`. It first adopts its own retained managed containers and cleans its own terminal leftovers, then polls watched repositories. It reads one page of 100 runs for each of `queued` and `in_progress`, and one page of jobs per run with `filter=latest&per_page=100`; only queued jobs with matching nonempty labels are candidates. There is no pagination or fairness guarantee.
+Each unit runs `gha-ephemeral-loop --config <profile-YAML>`. It first adopts its own retained managed containers and cleans its own terminal leftovers, then polls watched repositories. It reads one page of 100 runs for each of `queued`, `in_progress`, and `pending`, and one page of jobs per run with `filter=latest&per_page=100`; only queued jobs with matching nonempty labels are candidates. A pending run can contain a queued job; runs seen in multiple status queries are deduplicated. There is no pagination or fairness guarantee.
 
 With candidates, the loop takes nonblocking `flock(LOCK_EX|LOCK_NB)` on `/run/gha-runner-tui/host.lock` (directory 0755, file 0600), rechecks all managed containers, then registers and launches at most one runner. Only loops take this lock; its path is not configurable through CLI/YAML. Managed labels are:
 
@@ -110,7 +110,7 @@ io.gha-runner-tui.profile=<profile.name>
 io.gha-runner-tui.runner=<runner name>
 ```
 
-`created`, `running`, `restarting` and `paused` occupy the slot; only `exited`, `dead` and `removing` do not. Unknown states and query errors fail closed. Lock contention or another holder means `waiting-host`; without a current container this is healthy, not a failure. `failed` remains unhealthy. A sleeping ephemeral profile with no container and a deregistered (`gone`) runner can also be healthy. State JSON is diagnostic; Docker supplies live occupancy. CLI `status` shows `SLOT: free`, the holder(s), `WARNING` for multiple holders, or `unknown` on query failure; the TUI does not add another scheduling entry point or slot control.
+`created`, `running`, `restarting` and `paused` occupy the slot; only `exited`, `dead` and `removing` do not. Unknown states and query errors fail closed. Lock contention or a full host capacity means `waiting-host`; without a current container this is healthy, not a failure. `failed` remains unhealthy. A sleeping ephemeral profile with no container and a deregistered (`gone`) runner can also be healthy. State JSON is diagnostic; Docker supplies live occupancy. CLI `status` shows `SLOT: free`, the holder(s), the occupied count for multiple holders, or `unknown` on query failure; the TUI does not add another scheduling entry point or slot control.
 
 While waiting, normal inspect cadence is 15 seconds. A retained `created` container gets 60 seconds from creation before a **non-force** removal attempt; failed/unknown removal retains the slot and rechecks rather than assuming it is free. A runner never seen in GitHub is never automatically force-deleted: it can block the host indefinitely, requiring an explicit operator decision.
 
@@ -147,6 +147,7 @@ gha-runner-tui stop model-router --force
 | `start PROFILE [--config PATH]` | systemctl start. |
 | `stop PROFILE [--force] [--config PATH]` | systemctl stop, then report remaining profile holders; force explicitly removes them with a job-failure warning. |
 | `restart PROFILE [--config PATH]` | systemctl restart, preserving running containers for adoption. |
+| `mode PROFILE [0\|1\|2] [--delay-seconds N] [--config PATH]` | Read or switch local admission mode without restarting the loop. `0` pauses new admission, `1` is normal, `2` delays fallback admission (default 60 seconds). |
 | `create FLAGS [--config PATH]` | Exclusive creation described below. CLI uses `/etc/systemd/system`; `-systemd-unit-dir` is a TUI launch option only. |
 | `migrate [--config PATH]` | Explicit access-mode/GitHub metadata migration; prints per-file results, retains existing `.bak` behavior, returns failure if any migration fails. Does not change credentials or add watch lists/unit drop-ins. |
 | `version` | Shared build-info revision (`-dirty` if modified), VCS time and Go version; unavailable VCS fields show `unknown`. |
@@ -160,6 +161,39 @@ Both binaries share the version formatter:
 gha-runner-tui version
 gha-ephemeral-loop --version
 ```
+
+### Temporary admission mode (CLI)
+
+Run these commands **on the server whose profile you want to control**. Set the temporary high-performance server's matching profiles to `1`, and the permanent fallback server's matching profiles to `2`. Runner labels, repository/group access, OS and architecture must still match the workflows.
+
+```bash
+gha-runner-tui mode PROFILE                          # inspect current mode
+sudo gha-runner-tui mode PROFILE 0                   # pause new jobs
+sudo gha-runner-tui mode PROFILE 1                   # normal admission
+sudo gha-runner-tui mode PROFILE 2                   # fallback after 60s
+sudo gha-runner-tui mode PROFILE 2 --delay-seconds 90  # custom grace period
+gha-runner-tui status --json
+```
+
+The CLI atomically writes `<loop.state_file>.admission.json`, independently of profile YAML and job state. An absent override means mode `1`. The override remains until changed, including across service restarts and host reboots when the state directory is persistent; use mode `1` to restore normal admission. `--delay-seconds` is accepted only while setting mode `2`, in the range 1–86400. Each command affects one local profile; repeat for other matching profiles.
+
+The **updated `gha-ephemeral-loop` binary is required as well as the updated CLI**; older queue loops and legacy organization loops do not read this override. Switching mode on an updated loop needs no service restart. A sleeping loop observes the change on its next queue-poll cycle (normally 30 seconds, with configured jitter); an existing runner is checked on the normal 15-second inspect cadence. A launch already in progress can finish starting, then follows the same drain protection.
+
+Mode `2` starts a runner only after a matching job has remained queued across successful scans for the grace period, measured from this loop's first observation. It re-reads the queue each cycle, drops vanished job IDs and gives new job IDs their own timer. Mode changes, service restarts, queue-read failures and launch attempts reset these in-memory timers. The actual start can be later than the grace period because of polling or an occupied host slot. No host lock is held just to wait out the grace period. This offers a preferred host a head start; it does **not** provide strict cross-host priority or bind a particular GitHub job to a runner.
+
+Mode `0` prevents new runner launches. Existing busy ephemeral runners finish their current job. Existing idle runners are withdrawn using the existing GitHub busy-safe DELETE check: only a successful DELETE permits force cleanup; HTTP 422 retains a runner that accepted a job. Lookup/deletion failures retain the container. Switching an existing runner from normal to delayed mode also drains it when idle, so it cannot bypass the grace period; a new runner that already passed that grace period stays eligible. No mode command calls `systemctl`, Docker kill or Docker remove. Switching takes effect as the loop observes it, so an assignment racing with the switch is allowed to finish.
+
+`status` includes a `MODE` column (`2/60s`, for example), and its JSON includes `admission: {"mode": 2, "delay_seconds": 60}` for each readable policy. Invalid or unreadable overrides block new admission and appear in profile errors rather than silently reverting to normal. Healthy idle states include `paused` and `waiting-delay`; a paused profile can still show `running-job` while draining.
+
+### Host concurrency
+
+All loops on a host read `/etc/gha-runner-tui/host-policy.json` under the shared launch lock. Missing policy retains the original one-job gate. To permit four jobs across all repositories, provision `{"max_jobs":4}` (valid range 1–64); malformed/unreadable policy blocks admission. The capacity check and Docker launch remain serialized. With capacity above one, a successful launch releases the lock before waiting; existing managed containers continue to reserve capacity. Unknown container states block new launches. Startup adoption also releases the gate before monitoring an existing job. Ambiguous launch failures retain the gate until resolved.
+
+Optional `min_root_free_bytes` adds a free-space floor for `/`, for example `{"max_jobs":4,"min_root_free_bytes":5368709120}` sets a 5 GiB floor. Below it, or on a filesystem query error, new launches back off and retry. Existing-container adoption and monitoring continue. The default zero disables this check. This is a pre-launch check, not a reservation for future job writes; bound caches with a separate filesystem.
+
+Each profile remains a single worker. For concurrent jobs from the same repository, create distinct profiles with the same repository/labels/image and unique profile names, service names, runner/container prefixes, state files, and log directories. Every worker shares the host policy. Manage their admission policies together: if extra workers' admission files are symlinked to the first worker's file (the Instabox deployment does this), `mode` on the parent controls the group. Do not set mode individually on those linked workers, as atomic replacement would detach that link. CPU limits are independent of task count: use one parent cgroup for all runner containers and their Docker children, rather than multiplying a per-container CPU limit.
+
+Lowering capacity does not terminate existing jobs; it only blocks new admission until occupancy falls below the new limit. Existing processes must be upgraded before enabling concurrency. A host may retain idle registered runners while GitHub queue observations converge; these consume capacity too. This is a capacity limit, not a fairness guarantee.
 
 ### Create
 
