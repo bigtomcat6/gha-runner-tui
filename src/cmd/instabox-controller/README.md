@@ -183,8 +183,8 @@ anchor = runStartedAt + floor((now - runStartedAt) / 15 minutes) * 15 minutes
 
 (`maxRunMinutes: -1` has no platform end.) `anchor` never exceeds the trusted
 current time. A platform budget of 120 minutes or less is therefore used
-unchanged: a 120-minute run is still only ready in its first 20 minutes. A
-larger platform budget keeps a rolling deadline: the effective deadline is
+unchanged: on a paid machine a 120-minute run is still only ready in its first
+20 minutes. A larger platform budget keeps a rolling deadline: the effective deadline is
 constant inside each 15-minute bucket, the file changes at most once per
 bucket, and it never claims more than 120 minutes from a trusted observation.
 The controller does not trust a missing/invalid `runStartedAt` (including any
@@ -192,6 +192,20 @@ future value) or `maxRunMinutes`: such a machine is not budget-ready and is
 never guessed at. A delivered deadline is considered ready only when the fresh
 GET leaves at least 100 minutes (the guard's admission floor) and at most 120
 minutes.
+
+**Free machines** (`free: true` in the GET response) use 480 instead of a
+positive `maxRunMinutes` below 480. On the free plan each run starts at 120
+minutes and the service extends it, before it ends, while the machine is in use,
+up to 480 minutes per run
+([Runtime on the free plan](https://instabox.sh/docs/machines/auto-pause.md#runtime-on-the-free-plan)).
+The controller therefore projects a free run to `runStartedAt + 480` minutes:
+a fresh run is admitted until 100 minutes before that projected end instead of
+only during its first 20 minutes. This trusts the documented extension rule. A
+run the service does **not** extend (the machine was not in use in the last 30
+minutes before the limit) still pauses at its current limit, and work admitted
+under the projection is paused with it. `maxRunMinutes: 0` and a value of 480
+or more are used as reported. The log line shows the time to the projected end
+as `run-remaining`.
 
 Delivery happens for a new run, a changed effective deadline, or an earlier
 write whose result was not confirmed. Once the same run and effective deadline
@@ -232,9 +246,15 @@ never retries a write blindly; it reads the file back first.
 ## Wake policy (opt-in)
 
 With `enableWake: true`, at most one machine is woken per poll round, and only
-when either no machine is budget-ready, or exactly one is and it has 105
-minutes or less remaining. A candidate must be explicitly recognizable as
-**automatically idle-suspended**:
+when either no machine is budget-ready, or exactly one is and its run has 105
+minutes or less left before its (projected) platform end, which is five
+minutes before it stops admitting. The rolling 120-minute deadline is not used
+for this decision, and a run without a platform end (`maxRunMinutes: -1`)
+never needs a standby. Waking the standby only just before the active machine
+stops admitting makes two machines alternate: each run starts roughly when the
+other one's admission window ends, so their max-run cooldowns do not overlap.
+The trade-off is that both machines are rarely admitting at the same time. A
+candidate must be explicitly recognizable as **automatically idle-suspended**:
 
 - `state` and `desiredState` are `suspended`;
 - `autoSuspendedAt` is present and valid;
