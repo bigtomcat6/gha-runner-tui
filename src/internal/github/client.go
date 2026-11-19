@@ -60,6 +60,9 @@ type Client struct {
 	// readFile is the credential file reader; defaults to os.ReadFile and is
 	// overridable in tests to simulate permission errors without chmod.
 	readFile func(string) ([]byte, error)
+	// cache, when set, shares conditional GETs and queued-job snapshots with
+	// other processes on the host (see hostCache). Nil means direct requests.
+	cache *hostCache
 }
 
 type Runner struct {
@@ -103,6 +106,13 @@ func NewClient(baseURL, tokenEnv, tokenFile string, runner command.Runner, httpC
 		http:      httpClient,
 		readFile:  os.ReadFile,
 	}
+}
+
+// WithHostCache returns a copy of c that shares GitHub reads with the other
+// loop processes on this host through dir. An empty dir disables sharing.
+func (c Client) WithHostCache(dir string) Client {
+	c.cache = newHostCache(dir)
+	return c
 }
 
 // NewGlobalClient builds a client for the un-migrated/global configuration.
@@ -162,6 +172,7 @@ func (c Client) DeleteRunner(ctx context.Context, owner, repo string, id int64) 
 }
 
 func (c Client) CreateRegistrationToken(ctx context.Context, owner, repo string) (string, error) {
+	c.invalidateQueuedJobs(ctx, &Repository{Owner: owner, Name: repo})
 	var payload struct {
 		Token string `json:"token"`
 	}
@@ -178,6 +189,7 @@ func (c Client) CreateRemoveToken(ctx context.Context, owner, repo string) (stri
 }
 
 func (c Client) CreateOrgRegistrationToken(ctx context.Context, org string) (string, error) {
+	c.invalidateQueuedJobs(ctx, nil)
 	var payload struct {
 		Token string `json:"token"`
 	}
@@ -201,78 +213,136 @@ func (c Client) DeleteOrgRunner(ctx context.Context, org string, id int64) error
 // insensitive subset of the requested labels. A queued job can belong to a
 // pending run, so scan pending as well as queued and in_progress runs. Deduping
 // handles runs that change status between queries. Pagination is not followed.
+// With a host cache the unfiltered per-repository scan is shared by every loop
+// on the host for queueShareTTL; each caller still applies its own labels.
 func (c Client) QueuedJobs(ctx context.Context, repos []Repository, labels []string) ([]Job, error) {
 	allowed := map[string]bool{"self-hosted": true}
 	for _, label := range labels {
 		allowed[strings.ToLower(label)] = true
 	}
 
+	var token string
+	if c.cache != nil {
+		var err error
+		if token, err = c.resolveToken(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	var out []Job
 	for _, repo := range repos {
-		seenRuns := map[int64]bool{}
-		seenJobs := map[int64]bool{}
-		for _, status := range []string{"queued", "in_progress", "pending"} {
-			runsQuery := url.Values{}
-			runsQuery.Set("status", status)
-			runsQuery.Set("per_page", "100")
-			runsPath := fmt.Sprintf("/repos/%s/%s/actions/runs?%s", repo.Owner, repo.Name, runsQuery.Encode())
-
-			var runsPayload struct {
-				WorkflowRuns []struct {
-					ID int64 `json:"id"`
-				} `json:"workflow_runs"`
-			}
-			if err := c.requestJSON(ctx, http.MethodGet, runsPath, nil, &runsPayload); err != nil {
-				return nil, err
-			}
-
-			for _, run := range runsPayload.WorkflowRuns {
-				if seenRuns[run.ID] {
-					continue
-				}
-				seenRuns[run.ID] = true
-
-				jobsQuery := url.Values{}
-				jobsQuery.Set("filter", "latest")
-				jobsQuery.Set("per_page", "100")
-				jobsPath := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?%s", repo.Owner, repo.Name, run.ID, jobsQuery.Encode())
-
-				var jobsPayload struct {
-					Jobs []struct {
-						ID     int64    `json:"id"`
-						Status string   `json:"status"`
-						Labels []string `json:"labels"`
-					} `json:"jobs"`
-				}
-				if err := c.requestJSON(ctx, http.MethodGet, jobsPath, nil, &jobsPayload); err != nil {
-					return nil, err
-				}
-
-				for _, job := range jobsPayload.Jobs {
-					if job.Status != "queued" || len(job.Labels) == 0 {
-						continue
-					}
-					matched := true
-					for _, label := range job.Labels {
-						if !allowed[strings.ToLower(label)] {
-							matched = false
-							break
-						}
-					}
-					if !matched || seenJobs[job.ID] {
-						continue
-					}
-					seenJobs[job.ID] = true
-					out = append(out, Job{ID: job.ID, Status: job.Status, Labels: job.Labels})
-				}
+		var (
+			jobs []Job
+			err  error
+		)
+		if c.cache != nil {
+			jobs, err = c.cache.sharedQueue(ctx, c.queueKey(token, repo), func() ([]Job, error) { return c.repoQueuedJobs(ctx, repo) })
+		} else {
+			jobs, err = c.repoQueuedJobs(ctx, repo)
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, job := range jobs {
+			if labelsAllowed(job.Labels, allowed) {
+				out = append(out, job)
 			}
 		}
 	}
 	return out, nil
 }
 
-// FindRunner looks up a runner by exact name for a resolved target. It uses
-// the name query parameter and never falls back to prefix matching.
+func (c Client) queueKey(token string, repo Repository) string {
+	return c.cache.key(c.baseURL, token, "queued-jobs:"+repo.Owner+"/"+repo.Name)
+}
+
+// invalidateQueuedJobs drops the shared queued-job snapshot of repo (all
+// snapshots when repo is nil, for an organization runner) before this loop
+// registers a runner. A loop that claims a queued job thereby makes the next
+// loop rescan instead of reusing a snapshot that still lists that job, so the
+// window for a surplus idle runner stays as short as without sharing.
+func (c Client) invalidateQueuedJobs(ctx context.Context, repo *Repository) {
+	if c.cache == nil {
+		return
+	}
+	if repo == nil {
+		c.cache.invalidateAllQueues()
+		return
+	}
+	token, err := c.resolveToken(ctx)
+	if err != nil {
+		return
+	}
+	c.cache.invalidateQueue(c.queueKey(token, *repo))
+}
+
+// repoQueuedJobs returns every queued job of one repository that carries at
+// least one label, once per job ID, without applying a runner label filter.
+func (c Client) repoQueuedJobs(ctx context.Context, repo Repository) ([]Job, error) {
+	var out []Job
+	seenRuns := map[int64]bool{}
+	seenJobs := map[int64]bool{}
+	for _, status := range []string{"queued", "in_progress", "pending"} {
+		runsQuery := url.Values{}
+		runsQuery.Set("status", status)
+		runsQuery.Set("per_page", "100")
+		runsPath := fmt.Sprintf("/repos/%s/%s/actions/runs?%s", repo.Owner, repo.Name, runsQuery.Encode())
+
+		var runsPayload struct {
+			WorkflowRuns []struct {
+				ID int64 `json:"id"`
+			} `json:"workflow_runs"`
+		}
+		if err := c.requestJSON(ctx, http.MethodGet, runsPath, nil, &runsPayload); err != nil {
+			return nil, err
+		}
+
+		for _, run := range runsPayload.WorkflowRuns {
+			if seenRuns[run.ID] {
+				continue
+			}
+			seenRuns[run.ID] = true
+
+			jobsQuery := url.Values{}
+			jobsQuery.Set("filter", "latest")
+			jobsQuery.Set("per_page", "100")
+			jobsPath := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?%s", repo.Owner, repo.Name, run.ID, jobsQuery.Encode())
+
+			var jobsPayload struct {
+				Jobs []struct {
+					ID     int64    `json:"id"`
+					Status string   `json:"status"`
+					Labels []string `json:"labels"`
+				} `json:"jobs"`
+			}
+			if err := c.requestJSON(ctx, http.MethodGet, jobsPath, nil, &jobsPayload); err != nil {
+				return nil, err
+			}
+
+			for _, job := range jobsPayload.Jobs {
+				if job.Status != "queued" || len(job.Labels) == 0 || seenJobs[job.ID] {
+					continue
+				}
+				seenJobs[job.ID] = true
+				out = append(out, Job{ID: job.ID, Status: job.Status, Labels: job.Labels})
+			}
+		}
+	}
+	return out, nil
+}
+
+func labelsAllowed(labels []string, allowed map[string]bool) bool {
+	if len(labels) == 0 {
+		return false
+	}
+	for _, label := range labels {
+		if !allowed[strings.ToLower(label)] {
+			return false
+		}
+	}
+	return true
+}
+
 func (c Client) FindRunner(ctx context.Context, target config.ResolvedTarget, name string) (*Runner, error) {
 	path := fmt.Sprintf("/repos/%s/%s/actions/runners", target.Owner, target.Repo)
 	if target.Scope == config.TargetScopeOrganization {
@@ -449,14 +519,52 @@ func (c Client) requestJSON(ctx context.Context, method, path string, body any, 
 		req.Header.Set("Content-Type", "application/json")
 	}
 
+	// Conditional GET: revalidate the host-cached copy. GitHub does not count
+	// an authorized 304 against the primary rate limit.
+	conditional := c.cache != nil && method == http.MethodGet && body == nil
+	var (
+		cacheKey string
+		cached   conditionalEntry
+		hasCache bool
+	)
+	if conditional {
+		cacheKey = c.cache.key(c.baseURL, token, method+" "+path)
+		if cached, hasCache = c.cache.loadConditional(cacheKey); hasCache {
+			req.Header.Set("If-None-Match", cached.ETag)
+		}
+	}
+
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= http.StatusBadRequest || (method == http.MethodDelete && resp.StatusCode != http.StatusNoContent) {
+	if resp.StatusCode == http.StatusNotModified && hasCache {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		c.cache.touchConditional(cacheKey)
+		if out == nil {
+			return nil
+		}
+		return json.Unmarshal(cached.Body, out)
+	}
+	if resp.StatusCode >= http.StatusBadRequest || resp.StatusCode == http.StatusNotModified ||
+		(method == http.MethodDelete && resp.StatusCode != http.StatusNoContent) {
 		return &APIError{Method: method, Path: path, StatusCode: resp.StatusCode}
+	}
+
+	if conditional {
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode == http.StatusOK {
+			c.cache.storeConditional(cacheKey, resp.Header.Get("ETag"), data)
+		}
+		if out == nil {
+			return nil
+		}
+		return json.Unmarshal(data, out)
 	}
 
 	if out == nil {

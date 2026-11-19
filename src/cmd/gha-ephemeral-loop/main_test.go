@@ -21,6 +21,18 @@ import (
 
 type runnerFunc func(context.Context, string, ...string) ([]byte, error)
 
+// TestMain keeps runLoop's host-wide GitHub cache out of /run during tests.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "gha-loop-github-cache-")
+	if err != nil {
+		panic(err)
+	}
+	githubCacheDir = dir
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 func TestRunVersionBeforeProfileAndClients(t *testing.T) {
 	for _, args := range [][]string{{"--version"}, {"--version", "--config", "/not/read/profile.yaml"}} {
 		var out, stderr bytes.Buffer
