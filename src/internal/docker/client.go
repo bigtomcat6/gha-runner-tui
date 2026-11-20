@@ -224,6 +224,24 @@ func (c Client) CleanupExited(ctx context.Context, prefix string) ([]string, err
 	return removed, nil
 }
 
+// ReclaimCaches prunes only rebuildable data: unused build cache, dangling
+// (untagged) images, and anonymous volumes no container references. Tagged
+// images, named volumes and containers are never touched. Every step runs;
+// failures are joined.
+func (c Client) ReclaimCaches(ctx context.Context) error {
+	var errs []error
+	for _, args := range [][]string{
+		{"builder", "prune", "--all", "--force"},
+		{"image", "prune", "--force"},
+		{"volume", "prune", "--force"},
+	} {
+		if _, err := c.run(ctx, args...); err != nil {
+			errs = append(errs, fmt.Errorf("docker %s prune: %w", args[0], err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (c Client) Inspect(ctx context.Context, idOrName string) (ContainerDetails, error) {
 	out, err := c.run(ctx, "inspect", idOrName)
 	if err != nil {

@@ -718,3 +718,23 @@ func joinArgs(args []string) string {
 	}
 	return result
 }
+
+func TestReclaimCachesPrunesOnlyRebuildableData(t *testing.T) {
+	var calls []string
+	client := NewClient(dockerRunnerFunc(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		call := strings.Join(args[2:], " ")
+		calls = append(calls, call)
+		if strings.HasPrefix(call, "builder") {
+			return []byte("buildx missing"), errors.New("exit status 1")
+		}
+		return nil, nil
+	}))
+	err := client.ReclaimCaches(context.Background())
+	want := "builder prune --all --force;image prune --force;volume prune --force"
+	if strings.Join(calls, ";") != want {
+		t.Fatalf("calls=%q want %q (no --all on image/volume prune: tagged images and named volumes stay)", calls, want)
+	}
+	if err == nil || !strings.Contains(err.Error(), "builder prune") {
+		t.Fatalf("a failed step must be reported after the rest still run: %v", err)
+	}
+}
