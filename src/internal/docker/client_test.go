@@ -375,16 +375,26 @@ func TestSlotHoldersFiltersNonOccupyingStates(t *testing.T) {
 }
 
 func TestInspectWrapsNotFound(t *testing.T) {
-	client := NewClient(dockerRunnerFunc(func(_ context.Context, _ string, _ ...string) ([]byte, error) {
-		return []byte("Error: No such object: missing"), errors.New("exit status 1")
-	}))
-
-	_, err := client.Inspect(context.Background(), "missing")
-	if !errors.Is(err, ErrContainerNotFound) {
-		t.Fatalf("expected ErrContainerNotFound, got %v", err)
+	cases := map[string]string{
+		"docker before 29": "Error: No such object: missing",
+		// Docker 29 CLI lowercases the message. Missing it left a failed create
+		// holding the host lock forever while inspect stayed "unavailable".
+		"docker 29": "error: no such object: missing",
 	}
-	if strings.Contains(err.Error(), "No such object") {
-		t.Fatalf("raw inspect output leaked: %v", err)
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			client := NewClient(dockerRunnerFunc(func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+				return []byte(out), errors.New("exit status 1")
+			}))
+
+			_, err := client.Inspect(context.Background(), "missing")
+			if !errors.Is(err, ErrContainerNotFound) {
+				t.Fatalf("expected ErrContainerNotFound, got %v", err)
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "no such object") {
+				t.Fatalf("raw inspect output leaked: %v", err)
+			}
+		})
 	}
 }
 
