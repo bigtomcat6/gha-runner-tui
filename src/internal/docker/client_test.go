@@ -738,3 +738,90 @@ func TestReclaimCachesPrunesOnlyRebuildableData(t *testing.T) {
 		t.Fatalf("a failed step must be reported after the rest still run: %v", err)
 	}
 }
+
+func TestDiskReservationsReadsLabelsAndSizes(t *testing.T) {
+	var calls [][]string
+	client := NewClient(dockerRunnerFunc(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls = append(calls, append([]string{}, args...))
+		switch args[2] {
+		case "ps":
+			return []byte("id1\t4294967296\nid2\t0\n"), nil
+		case "container":
+			return []byte("536870912\n0\n"), nil
+		}
+		return nil, fmt.Errorf("unexpected docker args: %v", args)
+	}))
+
+	reservations, err := client.DiskReservations(context.Background())
+	if err != nil {
+		t.Fatalf("DiskReservations returned error: %v", err)
+	}
+	if len(reservations) != 2 {
+		t.Fatalf("expected 2 reservations, got %+v", reservations)
+	}
+	if reservations[0].ID != "id1" || reservations[0].Reserve != 4294967296 || reservations[0].SizeRw != 536870912 {
+		t.Fatalf("unexpected first reservation: %+v", reservations[0])
+	}
+	if reservations[1].ID != "id2" || reservations[1].Reserve != 0 || reservations[1].SizeRw != 0 {
+		t.Fatalf("unexpected second reservation: %+v", reservations[1])
+	}
+
+	wantPS := []string{"--host", "unix:///var/run/docker.sock", "ps", "--filter", "label=io.gha-runner-tui.disk-reserve", "--format", `{{.ID}}\t{{.Label "io.gha-runner-tui.disk-reserve"}}`}
+	wantInspect := []string{"--host", "unix:///var/run/docker.sock", "container", "inspect", "--size", "--format", "{{.SizeRw}}", "id1", "id2"}
+	if len(calls) != 2 || !reflect.DeepEqual(calls[0], wantPS) || !reflect.DeepEqual(calls[1], wantInspect) {
+		t.Fatalf("docker calls mismatch:\n got %v\nwant %v; %v", calls, wantPS, wantInspect)
+	}
+}
+
+func TestDiskReservationsSkipsInspectWhenNoContainerIsLabeled(t *testing.T) {
+	calls := 0
+	client := NewClient(dockerRunnerFunc(func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls > 1 {
+			t.Fatal("inspect must not run when no container is labeled")
+		}
+		return []byte("\n"), nil
+	}))
+
+	reservations, err := client.DiskReservations(context.Background())
+	if err != nil || reservations != nil || calls != 1 {
+		t.Fatalf("reservations=%+v err=%v calls=%d", reservations, err, calls)
+	}
+}
+
+func TestDiskReservationsRejectsMalformedOrPartialOutput(t *testing.T) {
+	cases := []struct {
+		name       string
+		psOut      string
+		inspectOut string
+		inspectErr error
+	}{
+		{name: "missing label column", psOut: "id\n"},
+		{name: "empty label value", psOut: "id\t\n"},
+		{name: "nonnumeric label", psOut: "id\tnope\n"},
+		{name: "size line count mismatch", psOut: "a\t4\nb\t5\n", inspectOut: "536870912\n"},
+		{name: "nonnumeric size", psOut: "a\t4\n", inspectOut: "nope\n"},
+		{name: "extra size line", psOut: "a\t4\n", inspectOut: "1\n2\n"},
+		{name: "inspect failure", psOut: "a\t4\n", inspectErr: errors.New("exit status 1")},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			client := NewClient(dockerRunnerFunc(func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+				calls++
+				if calls == 1 {
+					return []byte(tt.psOut), nil
+				}
+				return []byte(tt.inspectOut), tt.inspectErr
+			}))
+
+			reservations, err := client.DiskReservations(context.Background())
+			if err == nil {
+				t.Fatalf("expected error, got %+v", reservations)
+			}
+			if reservations != nil {
+				t.Fatalf("partial output must not become reservations: %+v", reservations)
+			}
+		})
+	}
+}

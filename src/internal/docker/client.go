@@ -18,6 +18,13 @@ const dockerHost = "unix:///var/run/docker.sock"
 
 const managedLabelFilter = "label=io.gha-runner-tui.managed=true"
 
+// DiskReserveLabel marks a running runner's profile-declared Docker data-root
+// reservation. The value is a decimal byte count; the label is absent when the
+// profile reserves nothing.
+const DiskReserveLabel = "io.gha-runner-tui.disk-reserve"
+
+const diskReserveListFormat = `{{.ID}}\t{{.Label "io.gha-runner-tui.disk-reserve"}}`
+
 const managedListFormat = `{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Label "io.gha-runner-tui.profile"}}\t{{.Label "io.gha-runner-tui.runner"}}`
 
 var ErrContainerNotFound = errors.New("docker container not found")
@@ -240,6 +247,72 @@ func (c Client) ReclaimCaches(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// DiskReservation is one running container's declared disk reserve and its
+// current writable-layer usage. Reserve is the label's decimal byte count;
+// SizeRw is what that container has actually written on top of its image.
+type DiskReservation struct {
+	ID      string
+	Reserve uint64
+	SizeRw  uint64
+}
+
+// DiskReservations lists running containers carrying a disk-reserve label and
+// reads their writable-layer sizes in one inspect call. It returns nil when no
+// labeled container is running. Partial, malformed, or failed output is an
+// error: a launch gate must never treat unknown reservations as zero.
+func (c Client) DiskReservations(ctx context.Context) ([]DiskReservation, error) {
+	out, err := c.run(ctx, "ps", "--filter", "label="+DiskReserveLabel, "--format", diskReserveListFormat)
+	if err != nil {
+		return nil, fmt.Errorf("list disk reservations: %w", err)
+	}
+
+	reservations := make([]DiskReservation, 0)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || parts[1] == "" {
+			return nil, errors.New("unexpected docker disk reservation line")
+		}
+		reserve, parseErr := strconv.ParseUint(parts[1], 10, 64)
+		if parseErr != nil {
+			return nil, errors.New("invalid docker disk reservation label")
+		}
+		reservations = append(reservations, DiskReservation{ID: parts[0], Reserve: reserve})
+	}
+	if len(reservations) == 0 {
+		return nil, nil
+	}
+
+	args := append([]string{"container", "inspect", "--size", "--format", "{{.SizeRw}}"}, reservationIDs(reservations)...)
+	out, err = c.run(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("inspect disk reservation sizes: %w", err)
+	}
+	sizes := strings.Split(strings.TrimRight(string(out), "\r\n"), "\n")
+	if len(sizes) != len(reservations) {
+		return nil, errors.New("docker disk reservation size count mismatch")
+	}
+	for i, line := range sizes {
+		size, parseErr := strconv.ParseUint(strings.TrimRight(strings.TrimSpace(line), "\r"), 10, 64)
+		if parseErr != nil {
+			return nil, errors.New("invalid docker disk reservation size")
+		}
+		reservations[i].SizeRw = size
+	}
+	return reservations, nil
+}
+
+func reservationIDs(reservations []DiskReservation) []string {
+	ids := make([]string, len(reservations))
+	for i, reservation := range reservations {
+		ids[i] = reservation.ID
+	}
+	return ids
 }
 
 func (c Client) Inspect(ctx context.Context, idOrName string) (ContainerDetails, error) {

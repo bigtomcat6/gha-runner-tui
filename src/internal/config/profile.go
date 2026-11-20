@@ -101,6 +101,50 @@ type DockerProfile struct {
 	RemoveAfterExit     bool              `yaml:"remove_after_exit"`
 	Volumes             []string          `yaml:"volumes"`
 	Env                 map[string]string `yaml:"env"`
+	// DiskReserveBytes is this runner's Docker data-root reservation. It is
+	// published as a container label so every loop on the host can count it.
+	DiskReserveBytes uint64 `yaml:"disk_reserve_bytes,omitempty"`
+}
+
+const maxDiskReserveBytes = 1 << 50 // 1 PiB
+
+func validateDiskReserveBytes(value uint64) error {
+	if value > maxDiskReserveBytes {
+		return errors.New("docker.disk_reserve_bytes must not exceed 1 PiB")
+	}
+	return nil
+}
+
+// UnmarshalYAML decodes DockerProfile as before, except that a fractional or
+// out-of-range disk reservation is rejected instead of silently truncated to
+// uint64. Unknown fields stay ignored, and merge keys and aliases resolve as
+// they do for a plain struct decode.
+func (p *DockerProfile) UnmarshalYAML(value *yaml.Node) error {
+	type plain DockerProfile
+	var decoded plain
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	var raw struct {
+		DiskReserveBytes yaml.Node `yaml:"disk_reserve_bytes"`
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	node := &raw.DiskReserveBytes
+	for node.Kind == yaml.AliasNode && node.Alias != nil {
+		node = node.Alias
+	}
+	switch node.Kind {
+	case 0, yaml.ScalarNode:
+		if node.Tag != "" && node.Tag != "!!int" && node.Tag != "!!null" {
+			return errors.New("docker.disk_reserve_bytes must be an integer")
+		}
+	default:
+		return errors.New("docker.disk_reserve_bytes must be an integer")
+	}
+	*p = DockerProfile(decoded)
+	return nil
 }
 
 type LoopConfig struct {
@@ -236,6 +280,9 @@ func (p Profile) Validate() error {
 		return errors.New("docker.container_name_prefix is required")
 	case !isSafeManagedName(p.Docker.ContainerNamePrefix):
 		return errors.New("docker.container_name_prefix must contain only lowercase letters, digits, and hyphens")
+	}
+	if err := validateDiskReserveBytes(p.Docker.DiskReserveBytes); err != nil {
+		return err
 	}
 
 	if target.Scope == TargetScopeOrganization {
