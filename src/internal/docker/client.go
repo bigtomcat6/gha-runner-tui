@@ -227,7 +227,8 @@ func (c Client) CleanupExited(ctx context.Context, prefix string) ([]string, err
 func (c Client) Inspect(ctx context.Context, idOrName string) (ContainerDetails, error) {
 	out, err := c.run(ctx, "inspect", idOrName)
 	if err != nil {
-		if strings.Contains(string(out), "No such object") {
+		// Docker 29 prints "error: no such object"; older CLIs capitalize it.
+		if strings.Contains(strings.ToLower(string(out)), "no such object") {
 			return ContainerDetails{}, fmt.Errorf("%w: %s", ErrContainerNotFound, idOrName)
 		}
 		return ContainerDetails{}, errInspectUnavailable
