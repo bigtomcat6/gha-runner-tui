@@ -10,6 +10,7 @@ import (
 	rand "math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -260,7 +261,7 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 		result.state = state.LoopWaitingHost
 		return result, nil
 	}
-	if err := s.dockerSpaceForLaunch(ctx); err != nil {
+	if err := s.dockerSpaceForLaunch(ctx, p); err != nil {
 		return result, err
 	}
 	if ctx.Err() != nil {
@@ -311,6 +312,9 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 		Name: result.containerName, Image: p.Docker.Image, CPUs: p.Docker.CPUs, Memory: p.Docker.Memory,
 		Volumes: p.Docker.Volumes, Env: runnerEnv(p, result.runnerName, registrationToken),
 		Labels: map[string]string{"io.gha-runner-tui.managed": "true", "io.gha-runner-tui.profile": p.Name, "io.gha-runner-tui.runner": result.runnerName},
+	}
+	if p.Docker.DiskReserveBytes > 0 {
+		spec.Labels[dockerpkg.DiskReserveLabel] = strconv.FormatUint(p.Docker.DiskReserveBytes, 10)
 	}
 	runCtx, cancelRun := context.WithTimeout(context.WithoutCancel(ctx), 120*time.Second)
 	if ctx.Err() != nil {

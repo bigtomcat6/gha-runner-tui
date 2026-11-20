@@ -233,3 +233,59 @@ func TestLoadProfileOptionalSessionDeadlineFile(t *testing.T) {
 		t.Fatalf("configured deadline=%q err=%v", profile.Loop.SessionDeadlineFile, err)
 	}
 }
+
+func TestLoadProfileDiskReserveBytes(t *testing.T) {
+	t.Parallel()
+
+	write := func(t *testing.T, reserve string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "profile.yaml")
+		content := "name: remind-me\nrepo: {owner: me, name: app}\nservice: {name: gha-remind-me.service}\ndocker:\n  container_name_prefix: gha-remind-me\n  disk_reserve_bytes: " + reserve + "\nloop:\n  state_file: /var/lib/gha-runner-tui/state/remind-me.json\n"
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	profile, err := LoadProfile(write(t, "1099511627776"))
+	if err != nil || profile.Docker.DiskReserveBytes != 1099511627776 {
+		t.Fatalf("1 TiB reserve=%d err=%v", profile.Docker.DiskReserveBytes, err)
+	}
+	profile, err = LoadProfile(write(t, "1125899906842624"))
+	if err != nil || profile.Docker.DiskReserveBytes != 1125899906842624 {
+		t.Fatalf("1 PiB reserve=%d err=%v", profile.Docker.DiskReserveBytes, err)
+	}
+	if _, err := LoadProfile(write(t, "1125899906842625")); err == nil || !strings.Contains(err.Error(), "docker.disk_reserve_bytes") {
+		t.Fatalf("expected disk_reserve_bytes cap error, got %v", err)
+	}
+	profile, err = LoadProfile(write(t, "null"))
+	if err != nil || profile.Docker.DiskReserveBytes != 0 {
+		t.Fatalf("null reserve=%d err=%v", profile.Docker.DiskReserveBytes, err)
+	}
+	for _, reserve := range []string{"1.5", "1.0", "1e3", "-0.5"} {
+		if _, err := LoadProfile(write(t, reserve)); err == nil || !strings.Contains(err.Error(), "must be an integer") {
+			t.Fatalf("float reserve %q must be rejected as a non-integer, got %v", reserve, err)
+		}
+	}
+	if _, err := LoadProfile(write(t, "-1")); err == nil {
+		t.Fatalf("negative reserve must be rejected")
+	}
+
+	body := func(docker string) string {
+		return "name: remind-me\nrepo: {owner: me, name: app}\nservice: {name: gha-remind-me.service}\ndocker:\n" + docker + "loop:\n  state_file: /var/lib/gha-runner-tui/state/remind-me.json\n"
+	}
+	unknown := filepath.Join(t.TempDir(), "unknown.yaml")
+	if err := os.WriteFile(unknown, []byte(body("  container_name_prefix: gha-remind-me\n  disk_reserve_bytes: 1024\n  future_option: true\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if profile, err := LoadProfile(unknown); err != nil || profile.Docker.DiskReserveBytes != 1024 {
+		t.Fatalf("unknown docker field must stay ignored: reserve=%d err=%v", profile.Docker.DiskReserveBytes, err)
+	}
+	duplicate := filepath.Join(t.TempDir(), "duplicate.yaml")
+	if err := os.WriteFile(duplicate, []byte(body("  container_name_prefix: gha-remind-me\n  disk_reserve_bytes: 1024\n  disk_reserve_bytes: 2048\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadProfile(duplicate); err == nil || !strings.Contains(err.Error(), "already") {
+		t.Fatalf("duplicate disk_reserve_bytes must stay an error, got %v", err)
+	}
+}
