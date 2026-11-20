@@ -23,8 +23,12 @@ import (
 type Supervisor struct {
 	ProfilePath    string
 	HostPolicyPath string // Optional override of the shared host capacity policy path.
-	Docker         dockerpkg.Client
-	GitHub         gh.Client
+	// ReclaimStampPath overrides the host-wide Docker cache reclaim stamp.
+	ReclaimStampPath string
+	// FreeBytes is injectable for tests; nil uses statfs.
+	FreeBytes func(path string) (uint64, error)
+	Docker    dockerpkg.Client
+	GitHub    gh.Client
 
 	// Now and Sleep are injectable for deterministic tests. A nil Now uses
 	// time.Now; a nil Sleep uses a context-aware timer.
@@ -120,6 +124,12 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			// externally supplied file at the normal poll cadence instead of
 			// growing the error backoff, so updates take effect quickly.
 			result.state = state.LoopBackoff
+			backoff = max(profile.Loop.BackoffSeconds, 1)
+			wait = s.Jitter(settings.poll)
+		case errors.Is(err, errDockerSpace):
+			// Low disk is host capacity, like a full slot: poll normally so
+			// the job can still start here as soon as space returns.
+			result.state = state.LoopWaitingHost
 			backoff = max(profile.Loop.BackoffSeconds, 1)
 			wait = s.Jitter(settings.poll)
 		case err != nil:
@@ -249,6 +259,9 @@ func (s *Supervisor) runCycle(ctx context.Context, p config.Profile, settings lo
 	if unknown || len(holders) >= capacity {
 		result.state = state.LoopWaitingHost
 		return result, nil
+	}
+	if err := s.dockerSpaceForLaunch(ctx); err != nil {
+		return result, err
 	}
 	if ctx.Err() != nil {
 		return result, ctx.Err()
