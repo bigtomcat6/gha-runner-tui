@@ -414,6 +414,10 @@ type Controller struct {
 	loaded         bool
 	lock           *lockHandle
 	roundGetFailed bool
+	// The two maps below are deliberately memory-only: a restart re-observes
+	// the platform and may log the current state once more.
+	platformLogs       map[string]string
+	standbySkipReasons map[string]string
 }
 
 // Close releases the single-instance lock.
@@ -435,6 +439,63 @@ func (c *Controller) logf(format string, args ...any) {
 	if c.Logger != nil {
 		c.Logger.Printf(format, args...)
 	}
+}
+
+// platformPointer renders a nil or empty optional string field as "-".
+func platformPointer(value *string) string {
+	if value == nil || *value == "" {
+		return "-"
+	}
+	return *value
+}
+
+// platformInt renders a nil optional integer as "-" but keeps a legitimate 0.
+func platformInt(value *int) string {
+	if value == nil {
+		return "-"
+	}
+	return strconv.Itoa(*value)
+}
+
+// logPlatformChange logs the whitelisted platform fields once per machine and
+// change. Only decoded Machine fields are used; the response body, headers and
+// key never reach the log.
+func (c *Controller) logPlatformChange(machine Machine) {
+	line := fmt.Sprintf(
+		"machine %s: platform state=%s desired=%s ready=%t hostUnreachable=%t operation=%s runStartedAt=%s maxRunMinutes=%s cooldownUntil=%s cooldownReason=%s autoSuspendedAt=%s",
+		machine.ID,
+		machine.State,
+		machine.DesiredState,
+		machine.Runtime.Ready,
+		machine.Runtime.HostUnreachable,
+		platformPointer(machine.OperationID),
+		platformPointer(machine.RunStartedAt),
+		platformInt(machine.MaxRunMinutes),
+		platformPointer(machine.CooldownUntil),
+		platformPointer(machine.CooldownReason),
+		platformPointer(machine.AutoSuspendedAt),
+	)
+	if c.platformLogs == nil {
+		c.platformLogs = map[string]string{}
+	}
+	if c.platformLogs[machine.ID] == line {
+		return
+	}
+	c.platformLogs[machine.ID] = line
+	c.logf("%s", line)
+}
+
+// logStandbySkip records the latest reason a candidate was not woken. Repeated
+// identical reasons stay quiet until the reason changes or the memory is reset.
+func (c *Controller) logStandbySkip(machineID, reason string) {
+	if c.standbySkipReasons == nil {
+		c.standbySkipReasons = map[string]string{}
+	}
+	if c.standbySkipReasons[machineID] == reason {
+		return
+	}
+	c.standbySkipReasons[machineID] = reason
+	c.logf("machine %s: standby needed but not woken: %s", machineID, reason)
 }
 
 // apiFor returns the client for exactly this machine's account. A missing
@@ -550,6 +611,7 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 			outcomes[i] = outcome
 			continue
 		}
+		c.logPlatformChange(machine)
 		outcome.machine = machine
 		outcome.hasResult = true
 		outcome.state = machine.State
@@ -744,8 +806,10 @@ func (c *Controller) maybeWake(ctx context.Context, outcomes []machineOutcome, a
 	}
 	switch {
 	case len(ready) > 1:
+		c.standbySkipReasons = nil
 		return nil
 	case len(ready) == 1 && (!ready[0].hasRunEnd || ready[0].runRemaining > standbyWakeThreshold):
+		c.standbySkipReasons = nil
 		return nil
 	}
 
@@ -753,10 +817,12 @@ func (c *Controller) maybeWake(ctx context.Context, outcomes []machineOutcome, a
 		if outcome.ready || !outcome.hasResult {
 			continue
 		}
-		cycle, ok := safeWakeCycle(outcome.machine, now)
-		if !ok {
+		cycle, reason := wakeSafety(outcome.machine, now)
+		if reason != "" {
+			c.logStandbySkip(outcome.config.MachineID, reason)
 			continue
 		}
+		delete(c.standbySkipReasons, outcome.config.MachineID)
 		if attempt, exists := c.state.WakeAttempts[cycle]; exists {
 			c.logf("machine %s: wake already attempted for this suspend cycle (%s), not resending", outcome.config.MachineID, attempt.Status)
 			continue
@@ -766,36 +832,43 @@ func (c *Controller) maybeWake(ctx context.Context, outcomes []machineOutcome, a
 	return nil
 }
 
-// safeWakeCycle identifies an automatically idle-paused machine. Manual
-// suspend/stop, cooldowns, active operations, host trouble and any state the
-// controller cannot distinguish cause a skip.
-func safeWakeCycle(machine Machine, now time.Time) (string, bool) {
-	if machine.State != "suspended" || machine.DesiredState != "suspended" {
-		return "", false
+// wakeSafety applies the wake checks for an automatically idle-paused machine
+// in order and returns either its suspend cycle or the reason it is not safe:
+// manual suspend/stop, cooldowns, active operations, host trouble and any state
+// the controller cannot distinguish cause a skip.
+func wakeSafety(machine Machine, now time.Time) (cycle, reason string) {
+	if machine.State != "suspended" {
+		return "", fmt.Sprintf("state=%s", machine.State)
+	}
+	if machine.DesiredState != "suspended" {
+		return "", fmt.Sprintf("desiredState=%s", machine.DesiredState)
 	}
 	if machine.OperationID != nil && *machine.OperationID != "" {
-		return "", false
+		return "", "operation active"
 	}
 	if machine.Runtime.HostUnreachable {
-		return "", false
+		return "", "host unreachable"
 	}
 	if machine.CooldownReason != nil && *machine.CooldownReason != "" {
-		return "", false
+		return "", fmt.Sprintf("cooldownReason=%s", *machine.CooldownReason)
 	}
 	if machine.CooldownUntil != nil && strings.TrimSpace(*machine.CooldownUntil) != "" {
 		until, err := parseAPITime(*machine.CooldownUntil)
-		if err != nil || until.After(now) {
-			return "", false
+		if err != nil {
+			return "", "cooldownUntil invalid"
+		}
+		if until.After(now) {
+			return "", fmt.Sprintf("cooldownUntil=%s not passed", *machine.CooldownUntil)
 		}
 	}
 	if machine.AutoSuspendedAt == nil || strings.TrimSpace(*machine.AutoSuspendedAt) == "" {
-		return "", false
+		return "", "no autoSuspendedAt"
 	}
 	suspendedAt, err := parseAPITime(*machine.AutoSuspendedAt)
 	if err != nil || suspendedAt.After(now.Add(time.Minute)) {
-		return "", false
+		return "", "autoSuspendedAt invalid or in future"
 	}
-	return machine.ID + "|" + suspendedAt.UTC().Format(time.RFC3339Nano), true
+	return machine.ID + "|" + suspendedAt.UTC().Format(time.RFC3339Nano), ""
 }
 
 func (c *Controller) attemptWake(ctx context.Context, machineID, cycle string, now time.Time) error {
