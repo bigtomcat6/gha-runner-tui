@@ -2801,3 +2801,368 @@ func TestMachineDecodesTheFreeFlag(t *testing.T) {
 		t.Fatalf("missing free decoded as %v", *m.Free)
 	}
 }
+
+func TestPlatformStateLogsOnlyWhenTheObservationChanges(t *testing.T) {
+	cfg := testConfig(t, testMachineA)
+	now := testNow
+	started := testNow.Add(-5 * time.Minute)
+	cooldown := now.Add(10 * time.Minute).Format(time.RFC3339)
+	machine := runningMachine(testMachineA, started, 120)
+	machine.CooldownUntil = &cooldown
+	api := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+		return machine, nil
+	}}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+
+	first := "machine " + testMachineA + ": platform state=running desired=running ready=true hostUnreachable=false operation=- runStartedAt=" + *machine.RunStartedAt + " maxRunMinutes=120 cooldownUntil=" + cooldown + " cooldownReason=- autoSuspendedAt=-"
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logBuffer.String(), "platform state="); got != 1 {
+		t.Fatalf("platform logs = %d, want 1; log=%s", got, logBuffer.String())
+	}
+	if !strings.Contains(logBuffer.String(), first) {
+		t.Fatalf("first platform log missing; log=%s", logBuffer.String())
+	}
+
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logBuffer.String(), "platform state="); got != 1 {
+		t.Fatalf("unchanged poll logged %d platform states; log=%s", got, logBuffer.String())
+	}
+
+	cooldown = now.Add(20 * time.Minute).Format(time.RFC3339)
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logBuffer.String(), "platform state="); got != 2 {
+		t.Fatalf("changed poll platform logs = %d, want 2; log=%s", got, logBuffer.String())
+	}
+	changed := "machine " + testMachineA + ": platform state=running desired=running ready=true hostUnreachable=false operation=- runStartedAt=" + *machine.RunStartedAt + " maxRunMinutes=120 cooldownUntil=" + cooldown + " cooldownReason=- autoSuspendedAt=-"
+	if !strings.Contains(logBuffer.String(), changed) {
+		t.Fatalf("changed platform log missing; log=%s", logBuffer.String())
+	}
+}
+
+func TestPlatformStateLogRendersNilEmptyAndZeroFields(t *testing.T) {
+	now := testNow
+	empty := ""
+	zero := 0
+	for _, tc := range []struct {
+		name    string
+		machine Machine
+		want    string
+	}{
+		{
+			name: "nil optional fields render as dashes",
+			machine: Machine{
+				ID:           testMachineA,
+				State:        "suspended",
+				DesiredState: "suspended",
+				Runtime:      Runtime{HostUnreachable: true},
+			},
+			want: "machine " + testMachineA + ": platform state=suspended desired=suspended ready=false hostUnreachable=true operation=- runStartedAt=- maxRunMinutes=- cooldownUntil=- cooldownReason=- autoSuspendedAt=-",
+		},
+		{
+			name: "empty strings render as dashes and zero survives",
+			machine: Machine{
+				ID:              testMachineA,
+				State:           "suspended",
+				DesiredState:    "suspended",
+				OperationID:     &empty,
+				RunStartedAt:    &empty,
+				MaxRunMinutes:   &zero,
+				CooldownUntil:   &empty,
+				CooldownReason:  &empty,
+				AutoSuspendedAt: &empty,
+			},
+			want: "machine " + testMachineA + ": platform state=suspended desired=suspended ready=false hostUnreachable=false operation=- runStartedAt=- maxRunMinutes=0 cooldownUntil=- cooldownReason=- autoSuspendedAt=-",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, testMachineA)
+			machine := tc.machine
+			api := &fakeAPI{getFunc: func(ctx context.Context, id string) (Machine, error) {
+				return machine, nil
+			}}
+			logBuffer := &bytes.Buffer{}
+			controller := newController(cfg, api, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+			defer controller.Close()
+			if err := controller.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(logBuffer.String(), "platform state="); got != 1 {
+				t.Fatalf("platform logs = %d, want 1; log=%s", got, logBuffer.String())
+			}
+			if !strings.Contains(logBuffer.String(), tc.want) {
+				t.Fatalf("platform log missing %q; log=%s", tc.want, logBuffer.String())
+			}
+		})
+	}
+}
+
+func TestStandbySkipReasonLoggedOnceUntilItChanges(t *testing.T) {
+	cfg := testConfig(t, testMachineA, testMachineB)
+	cfg.EnableWake = true
+	started := testNow
+	cooldown := started.Add(5 * time.Minute).Format(time.RFC3339)
+	suspended := suspendedMachine(testMachineB, started.Add(-10*time.Minute))
+	suspended.CooldownReason = stringPtr("abuse_cpu")
+	api := &fakeAPI{
+		getFunc: func(ctx context.Context, id string) (Machine, error) {
+			if id == testMachineA {
+				return runningMachine(testMachineA, started, 60), nil
+			}
+			return suspended, nil
+		},
+		wakeFunc: func(ctx context.Context, id string) (Machine, error) {
+			t.Fatalf("unexpected wake of %s", id)
+			return Machine{}, nil
+		},
+	}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, &fakeWriter{}, func() time.Time { return started }, logBuffer)
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reason := "machine " + testMachineB + ": standby needed but not woken: cooldownReason=abuse_cpu"
+	if got := strings.Count(logBuffer.String(), reason); got != 1 {
+		t.Fatalf("first reason logs = %d; log=%s", got, logBuffer.String())
+	}
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logBuffer.String(), reason); got != 1 {
+		t.Fatalf("same reason logged again: %d; log=%s", got, logBuffer.String())
+	}
+
+	suspended.CooldownReason = nil
+	suspended.CooldownUntil = &cooldown
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	changed := "machine " + testMachineB + ": standby needed but not woken: cooldownUntil=" + cooldown + " not passed"
+	if got := strings.Count(logBuffer.String(), changed); got != 1 {
+		t.Fatalf("changed reason logs = %d; log=%s", got, logBuffer.String())
+	}
+	if strings.Contains(logBuffer.String(), "cooldownReason=abuse_cpu") {
+		t.Fatalf("stale reason logged: %s", logBuffer.String())
+	}
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logBuffer.String(), changed); got != 1 {
+		t.Fatalf("changed reason logged again: %d; log=%s", got, logBuffer.String())
+	}
+}
+
+func TestStandbySkipReasonClearsWhenTheMachineBecomesSafe(t *testing.T) {
+	cfg := testConfig(t, testMachineA, testMachineB)
+	cfg.EnableWake = true
+	started := testNow
+	cooldown := started.Add(5 * time.Minute).Format(time.RFC3339)
+	suspended := suspendedMachine(testMachineB, started.Add(-10*time.Minute))
+	suspended.CooldownUntil = &cooldown
+	api := &fakeAPI{
+		getFunc: func(ctx context.Context, id string) (Machine, error) {
+			if id == testMachineA {
+				return runningMachine(testMachineA, started, 60), nil
+			}
+			return suspended, nil
+		},
+		wakeFunc: func(ctx context.Context, id string) (Machine, error) { return Machine{}, nil },
+	}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, &fakeWriter{}, func() time.Time { return started }, logBuffer)
+	defer controller.Close()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reason := "machine " + testMachineB + ": standby needed but not woken: cooldownUntil=" + cooldown + " not passed"
+	if got := strings.Count(logBuffer.String(), reason); got != 1 {
+		t.Fatalf("reason logs = %d; log=%s", got, logBuffer.String())
+	}
+	if api.wakes != 0 {
+		t.Fatalf("wakes = %d", api.wakes)
+	}
+
+	suspended.CooldownUntil = nil
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if api.wakes != 1 {
+		t.Fatalf("wakes = %d after the cooldown ended; log=%s", api.wakes, logBuffer.String())
+	}
+	if !strings.Contains(logBuffer.String(), "machine "+testMachineB+": waking automatically idle-suspended standby") {
+		t.Fatalf("waking log missing; log=%s", logBuffer.String())
+	}
+	if strings.Contains(logBuffer.String(), "standby needed but not woken") {
+		t.Fatalf("standby skip remained after safety: %s", logBuffer.String())
+	}
+
+	// Passing safety clears the remembered reason even though the wake
+	// attempt is already recorded, so the same reason logs afresh later.
+	suspended.CooldownUntil = &cooldown
+	logBuffer.Reset()
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logBuffer.String(), reason); got != 1 {
+		t.Fatalf("same reason after safety = %d, want clean re-log; log=%s", got, logBuffer.String())
+	}
+}
+
+func TestStandbySkipReasonsResetOnANoStandbyRound(t *testing.T) {
+	cfg := testConfig(t, testMachineA, testMachineB)
+	cfg.EnableRemoteWrite = true
+	cfg.EnableWake = true
+	started := testNow
+	now := started.Add(30 * time.Minute)
+	maxRunA := 480
+	suspended := suspendedMachine(testMachineB, started.Add(-10*time.Minute))
+	suspended.CooldownUntil = stringPtr(now.Add(5 * time.Minute).Format(time.RFC3339))
+	api := &fakeAPI{
+		getFunc: func(ctx context.Context, id string) (Machine, error) {
+			if id == testMachineA {
+				return runningMachine(testMachineA, started, maxRunA), nil
+			}
+			return suspended, nil
+		},
+		wakeFunc: func(ctx context.Context, id string) (Machine, error) { return Machine{}, nil },
+	}
+	logBuffer := &bytes.Buffer{}
+	controller := newController(cfg, api, &fakeWriter{}, func() time.Time { return now }, logBuffer)
+	defer controller.Close()
+
+	// One ready machine with plenty of run left: no standby is needed and no
+	// skip reason is emitted.
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logBuffer.String(), "standby needed but not woken") {
+		t.Fatalf("skip logged without standby need: %s", logBuffer.String())
+	}
+
+	// A is no longer budget-ready, so B's skip reason is logged.
+	maxRunA = 60
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reason := "machine " + testMachineB + ": standby needed but not woken: cooldownUntil=" + *suspended.CooldownUntil + " not passed"
+	if got := strings.Count(logBuffer.String(), reason); got != 1 {
+		t.Fatalf("reason logs = %d; log=%s", got, logBuffer.String())
+	}
+
+	// A is ready again with plenty of run left: the no-standby round clears
+	// the remembered reasons.
+	maxRunA = 480
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logBuffer.String(), reason); got != 1 {
+		t.Fatalf("skip logged in a no-standby round: %d; log=%s", got, logBuffer.String())
+	}
+
+	// The same unchanged reason is logged afresh after the reset.
+	maxRunA = 60
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logBuffer.String(), reason); got != 2 {
+		t.Fatalf("reason after reset = %d, want 2; log=%s", got, logBuffer.String())
+	}
+}
+
+func TestStandbySkipReasonsMatchTheSafetyChecks(t *testing.T) {
+	started := testNow
+	validAuto := started.Add(-10 * time.Minute)
+	future := started.Add(5 * time.Minute).Format(time.RFC3339)
+	for _, tc := range []struct {
+		name    string
+		machine func() Machine
+		want    string
+	}{
+		{name: "state", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.State = "running"
+			return m
+		}, want: "state=running"},
+		{name: "desired state", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.DesiredState = "running"
+			return m
+		}, want: "desiredState=running"},
+		{name: "operation", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.OperationID = stringPtr("op_123")
+			return m
+		}, want: "operation active"},
+		{name: "host", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.Runtime.HostUnreachable = true
+			return m
+		}, want: "host unreachable"},
+		{name: "cooldown reason", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.CooldownReason = stringPtr("abuse_cpu")
+			return m
+		}, want: "cooldownReason=abuse_cpu"},
+		{name: "cooldown not passed", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.CooldownUntil = &future
+			return m
+		}, want: "cooldownUntil=" + future + " not passed"},
+		{name: "invalid cooldown", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.CooldownUntil = stringPtr("later")
+			return m
+		}, want: "cooldownUntil invalid"},
+		{name: "no auto suspend", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.AutoSuspendedAt = nil
+			return m
+		}, want: "no autoSuspendedAt"},
+		{name: "invalid auto suspend", machine: func() Machine {
+			m := suspendedMachine(testMachineB, validAuto)
+			m.AutoSuspendedAt = stringPtr("yesterday")
+			return m
+		}, want: "autoSuspendedAt invalid or in future"},
+		{name: "future auto suspend", machine: func() Machine {
+			return suspendedMachine(testMachineB, started.Add(10*time.Minute))
+		}, want: "autoSuspendedAt invalid or in future"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, testMachineA, testMachineB)
+			cfg.EnableWake = true
+			candidate := tc.machine()
+			api := &fakeAPI{
+				getFunc: func(ctx context.Context, id string) (Machine, error) {
+					if id == testMachineA {
+						return runningMachine(testMachineA, started, 60), nil
+					}
+					return candidate, nil
+				},
+				wakeFunc: func(ctx context.Context, id string) (Machine, error) {
+					t.Fatalf("unexpected wake of %s", id)
+					return Machine{}, nil
+				},
+			}
+			logBuffer := &bytes.Buffer{}
+			controller := newController(cfg, api, &fakeWriter{}, func() time.Time { return started }, logBuffer)
+			defer controller.Close()
+			if err := controller.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			line := "machine " + testMachineB + ": standby needed but not woken: " + tc.want
+			if got := strings.Count(logBuffer.String(), line); got != 1 {
+				t.Fatalf("reason line %q count = %d; log=%s", line, got, logBuffer.String())
+			}
+		})
+	}
+}
