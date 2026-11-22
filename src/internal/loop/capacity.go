@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -46,6 +47,8 @@ type hostPolicy struct {
 	DockerRootDir           string `json:"docker_root_dir"`
 	MinDockerFreeBytes      uint64 `json:"min_docker_free_bytes"`
 	DockerReclaimBelowBytes uint64 `json:"docker_reclaim_below_bytes"`
+	// Opt-in labels whose orphaned volumes and images the reclaim may delete.
+	DockerReclaimLabels []string `json:"docker_reclaim_labels"`
 }
 
 // readHostPolicy returns exists=false (and the legacy single-job capacity)
@@ -75,6 +78,15 @@ func (s *Supervisor) readHostPolicy() (hostPolicy, bool, error) {
 		}
 	} else if !filepath.IsAbs(policy.DockerRootDir) {
 		return hostPolicy{}, true, errors.New("host docker_root_dir must be absolute")
+	}
+	if len(policy.DockerReclaimLabels) > 0 && (policy.DockerRootDir == "" || policy.DockerReclaimBelowBytes == 0) {
+		return hostPolicy{}, true, errors.New("host docker_reclaim_labels requires docker_root_dir and docker_reclaim_below_bytes")
+	}
+	for _, label := range policy.DockerReclaimLabels {
+		// A bare key only. The manager's own labels mark live runner state.
+		if label == "" || strings.ContainsAny(label, "= \t\r\n") || strings.HasPrefix(label, "io.gha-runner-tui") {
+			return hostPolicy{}, true, errors.New("host docker_reclaim_labels must be label keys outside io.gha-runner-tui")
+		}
 	}
 	return policy, true, nil
 }

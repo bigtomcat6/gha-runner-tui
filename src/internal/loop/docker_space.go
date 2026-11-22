@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gha-runner-tui/internal/config"
@@ -36,8 +37,9 @@ func (e *dockerSpaceError) Unwrap() error { return errDockerSpace }
 func gib(n uint64) string { return fmt.Sprintf("%.1fGiB", float64(n)/(1<<30)) }
 
 // dockerSpaceForLaunch runs under the host lock, right before a launch. It
-// prunes only rebuildable Docker data (see Client.ReclaimCaches), never tagged
-// images, named volumes or containers. The launch floor is the greater of the
+// prunes rebuildable Docker data (see Client.ReclaimCaches). Tagged images,
+// named volumes and containers go only under an opt-in reclaim label (see
+// Client.ReclaimLabeled). The launch floor is the greater of the
 // host policy minimum and the profile's disk reservation; running containers
 // that declared a reservation and have not yet written that much count against
 // the remaining free space.
@@ -52,13 +54,24 @@ func (s *Supervisor) dockerSpaceForLaunch(ctx context.Context, p config.Profile)
 	}
 	if free < policy.DockerReclaimBelowBytes && s.reclaimDue() {
 		reclaimCtx, cancel := context.WithTimeout(ctx, dockerReclaimTimeout)
-		reclaimErr := s.Docker.ReclaimCaches(reclaimCtx)
+		var reclaimed []string
+		var reclaimErrs []error
+		// Leftovers first: they are the largest, and their layers then prune.
+		for _, label := range policy.DockerReclaimLabels {
+			removed, labelErr := s.Docker.ReclaimLabeled(reclaimCtx, label, s.now())
+			reclaimed = append(reclaimed, removed...)
+			reclaimErrs = append(reclaimErrs, labelErr)
+		}
+		reclaimErr := errors.Join(append(reclaimErrs, s.Docker.ReclaimCaches(reclaimCtx))...)
 		cancel()
 		before := free
 		if free, err = s.freeBytes(policy.DockerRootDir); err != nil {
 			return fmt.Errorf("check docker disk space: %w", err)
 		}
 		msg := fmt.Sprintf("docker cache reclaim: free %s -> %s", gib(before), gib(free))
+		if len(reclaimed) > 0 {
+			msg += "; removed " + strings.Join(reclaimed, ", ")
+		}
 		if reclaimErr != nil {
 			msg += fmt.Sprintf(" (partial: %v)", reclaimErr)
 		}
