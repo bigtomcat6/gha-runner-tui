@@ -48,6 +48,78 @@ func TestHostPolicyDockerDiskValidation(t *testing.T) {
 	}
 }
 
+func TestHostPolicyReclaimLabelValidation(t *testing.T) {
+	const base = `{"max_jobs":4,"docker_root_dir":"/data/docker","docker_reclaim_below_bytes":1,"docker_reclaim_labels":`
+	for _, tc := range []struct {
+		name, policy string
+		wantErr      bool
+	}{
+		{"label key", base + `["com.example.ci"]}`, false},
+		{"empty list", base + `[]}`, false},
+		{"empty key", base + `[""]}`, true},
+		{"key and value", base + `["com.example.ci=x"]}`, true},
+		{"manager label", base + `["io.gha-runner-tui.managed"]}`, true},
+		{"no threshold", `{"max_jobs":4,"docker_root_dir":"/data/docker","docker_reclaim_labels":["com.example.ci"]}`, true},
+		{"no root", `{"max_jobs":4,"docker_reclaim_labels":["com.example.ci"]}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Supervisor{HostPolicyPath: writeHostPolicy(t, tc.policy)}
+			if _, _, err := s.readHostPolicy(); (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// A job killed by a full disk leaves a named volume. The job that could sweep
+// it cannot start below the floor, so the gate itself has to reclaim it.
+func TestDockerSpaceReclaimsLabeledLeftoverBeforeRefusing(t *testing.T) {
+	now := time.Date(2026, 11, 22, 8, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, labels string
+		wantRefused  bool
+	}{
+		{"opted in", `,"docker_reclaim_labels":["com.example.ci"]`, false},
+		{"default keeps named volumes", ``, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			removed := false
+			var log bytes.Buffer
+			d := dockerpkg.NewClient(loopRunnerFunc(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				switch call := strings.Join(args[2:], " "); {
+				case strings.HasPrefix(call, "volume ls"):
+					return []byte("ci-0123\n"), nil
+				case strings.HasPrefix(call, "volume inspect"):
+					return []byte(`{"Name":"ci-0123","CreatedAt":"2026-11-20T14:05:04Z","Mountpoint":"/data/docker/volumes/ci-0123/_data","Labels":{"com.example.ci":"ci-0123"}}`), nil
+				case call == "volume rm ci-0123":
+					removed = true
+				}
+				return nil, nil
+			}))
+			s := &Supervisor{
+				HostPolicyPath:   writeHostPolicy(t, strings.TrimSuffix(dockerGatePolicy, "}")+tc.labels+"}"),
+				ReclaimStampPath: filepath.Join(t.TempDir(), "reclaim.stamp"),
+				Docker:           d,
+				Now:              func() time.Time { return now },
+				Stderr:           &log,
+				FreeBytes: func(string) (uint64, error) {
+					if removed {
+						return 5 * gibBytes, nil
+					}
+					return gibBytes, nil
+				},
+			}
+			err := s.dockerSpaceForLaunch(context.Background(), loopProfile(t))
+			if errors.Is(err, errDockerSpace) != tc.wantRefused || removed == tc.wantRefused {
+				t.Fatalf("err=%v removed=%t", err, removed)
+			}
+			if removed && !strings.Contains(log.String(), "removed volume ci-0123") {
+				t.Fatalf("removal not logged: %q", log.String())
+			}
+		})
+	}
+}
+
 // dockerGateCycle runs one cycle with one queued job and no other holders.
 // free returns the Docker root free bytes before and after any reclaim.
 func dockerGateCycle(t *testing.T, policy string, stampAge time.Duration, before, after uint64) (cycleResult, error, []string, int, string) {
