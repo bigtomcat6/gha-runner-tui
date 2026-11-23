@@ -51,7 +51,7 @@ func TestReadSessionDeadlineFloorAndErrors(t *testing.T) {
 			path := deadlinePath(t)
 			deadline := now.Add(tc.offset)
 			writeSessionDeadline(t, path, deadline)
-			got, err := readSessionDeadline(path, now)
+			got, err := readSessionDeadline(path, now, sessionDeadlineMinRemaining)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("deadline=%s err=%v", got, err)
 			}
@@ -91,11 +91,11 @@ func TestReadSessionDeadlineUnusableFiles(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			deadline, err := readSessionDeadline(path, now)
+			deadline, err := readSessionDeadline(path, now, sessionDeadlineMinRemaining)
 			if !errors.Is(err, errSessionDeadline) || !deadline.IsZero() {
 				t.Fatalf("deadline=%s err=%v", deadline, err)
 			}
-			if !sessionDeadlineExhausted(path, now) {
+			if !sessionDeadlineExhausted(path, now, sessionDeadlineMinRemaining) {
 				t.Fatal("configured but unusable deadline must enter the protected withdrawal path")
 			}
 		})
@@ -106,7 +106,7 @@ func TestReadSessionDeadlineUnusableFiles(t *testing.T) {
 		if err := os.WriteFile(path, []byte(`{"deadline":"2026-11-17T16:00:00+01:00","note":"keep"}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		got, err := readSessionDeadline(path, now)
+		got, err := readSessionDeadline(path, now, sessionDeadlineMinRemaining)
 		if err != nil || !got.Equal(now.Add(3*time.Hour)) {
 			t.Fatalf("deadline=%s err=%v", got, err)
 		}
@@ -115,7 +115,7 @@ func TestReadSessionDeadlineUnusableFiles(t *testing.T) {
 
 func TestSessionDeadlineExhaustedBoundary(t *testing.T) {
 	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
-	if sessionDeadlineExhausted("", now) {
+	if sessionDeadlineExhausted("", now, sessionDeadlineMinRemaining) {
 		t.Fatal("unconfigured protection must stay inactive")
 	}
 	for _, tc := range []struct {
@@ -131,7 +131,7 @@ func TestSessionDeadlineExhaustedBoundary(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := deadlinePath(t)
 			writeSessionDeadline(t, path, now.Add(tc.offset))
-			if got := sessionDeadlineExhausted(path, now); got != tc.want {
+			if got := sessionDeadlineExhausted(path, now, sessionDeadlineMinRemaining); got != tc.want {
 				t.Fatalf("exhausted=%t want %t", got, tc.want)
 			}
 		})
@@ -142,6 +142,112 @@ func TestSessionDeadlineAdmissionDisabled(t *testing.T) {
 	p := loopProfile(t)
 	if err := sessionDeadlineAdmission(p, time.Now()); err != nil {
 		t.Fatalf("unconfigured profile refused: %v", err)
+	}
+}
+
+func TestSessionDeadlineFloorResolution(t *testing.T) {
+	p := loopProfile(t)
+	if got := p.SessionDeadlineMinRemaining(); got != sessionDeadlineMinRemaining {
+		t.Fatalf("omitted floor=%s, want %s", got, sessionDeadlineMinRemaining)
+	}
+	p.Loop.SessionDeadlineMinRemainingMinutes = 0
+	if got := p.SessionDeadlineMinRemaining(); got != sessionDeadlineMinRemaining {
+		t.Fatalf("zero floor=%s, want %s", got, sessionDeadlineMinRemaining)
+	}
+	p.Loop.SessionDeadlineMinRemainingMinutes = 40
+	if got := p.SessionDeadlineMinRemaining(); got != 40*time.Minute {
+		t.Fatalf("configured floor=%s, want 40m", got)
+	}
+}
+
+func TestReadSessionDeadlineDefaultFloorText(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	path := deadlinePath(t)
+	writeSessionDeadline(t, path, now.Add(sessionDeadlineMinRemaining-time.Minute))
+	_, err := readSessionDeadline(path, now, loopProfile(t).SessionDeadlineMinRemaining())
+	want := "session deadline protection: remaining time is below the 100-minute admission floor"
+	if !errors.Is(err, errSessionDeadline) || err == nil || err.Error() != want {
+		t.Fatalf("err=%v, want %q", err, want)
+	}
+}
+
+func TestSessionDeadlineConfiguredFloorAdmission(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	path := deadlinePath(t)
+	p := loopProfile(t)
+	p.Loop.SessionDeadlineFile = path
+	p.Loop.SessionDeadlineMinRemainingMinutes = 40
+
+	writeSessionDeadline(t, path, now.Add(time.Hour))
+	if err := sessionDeadlineAdmission(p, now); err != nil {
+		t.Fatalf("60 minutes remaining must be admitted: %v", err)
+	}
+	writeSessionDeadline(t, path, now.Add(40*time.Minute))
+	if err := sessionDeadlineAdmission(p, now); err != nil {
+		t.Fatalf("exactly the configured floor must be admitted: %v", err)
+	}
+	writeSessionDeadline(t, path, now.Add(39*time.Minute))
+	err := sessionDeadlineAdmission(p, now)
+	if !errors.Is(err, errSessionDeadline) {
+		t.Fatalf("39 minutes remaining must be refused, got %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "below the 40-minute admission floor") {
+		t.Fatalf("refusal=%v, want the configured 40-minute floor", err)
+	}
+}
+
+func TestSessionDeadlineWaitingUsesConfiguredFloor(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	path := deadlinePath(t)
+	p := loopProfile(t)
+	p.Loop.SessionDeadlineFile = path
+	p.Loop.SessionDeadlineMinRemainingMinutes = 40
+	s := Supervisor{Now: func() time.Time { return now }}
+
+	writeSessionDeadline(t, path, now.Add(time.Hour))
+	if s.sessionDeadlineReached(p) {
+		t.Fatal("60 minutes remaining is above the configured floor and must not withdraw")
+	}
+	writeSessionDeadline(t, path, now.Add(40*time.Minute))
+	if s.sessionDeadlineReached(p) {
+		t.Fatal("exactly the configured floor must not withdraw")
+	}
+	writeSessionDeadline(t, path, now.Add(39*time.Minute))
+	if !s.sessionDeadlineReached(p) {
+		t.Fatal("39 minutes remaining must withdraw at the configured floor")
+	}
+
+	p.Loop.SessionDeadlineMinRemainingMinutes = 0
+	writeSessionDeadline(t, path, now.Add(50*time.Minute))
+	if !s.sessionDeadlineReached(p) {
+		t.Fatal("the default 100-minute floor must still withdraw at 50 minutes")
+	}
+}
+
+func TestWaitDeadlineWithdrawalUsesConfiguredFloor(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	path := deadlinePath(t)
+	p := loopProfile(t)
+	p.Loop.SessionDeadlineFile = path
+	p.Loop.SessionDeadlineMinRemainingMinutes = 40
+	clock := newTestClock(t, now)
+	d := &dockerScript{inspect: [][]byte{runningInspect(now.Format(time.RFC3339), now.Format(time.RFC3339))}}
+	script := &ghScript{list: []ghObs{{found: true, id: 7}}}
+	srv := newGHScript(t, script)
+	defer srv.Close()
+	s := newWaitSupervisor(t, clock, d, srv)
+	writeSessionDeadline(t, path, now.Add(39*time.Minute))
+
+	got, err := s.waitContainer(context.Background(), p, waitInfo(t), 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.forceRemove || got.idleExpired || got.retained || script.deleteCalls != 1 || d.rmN != 0 {
+		t.Fatalf("39 minutes remaining must withdraw at a 40-minute floor: result=%+v delete=%d rm=%d", got, script.deleteCalls, d.rmN)
+	}
+	saved, err := state.LoadLoopState(p.Loop.StateFile)
+	if err != nil || saved.LastError == nil || !strings.Contains(*saved.LastError, "session deadline reached; idle runner withdrawn") {
+		t.Fatalf("diagnostic=%+v err=%v", saved, err)
 	}
 }
 

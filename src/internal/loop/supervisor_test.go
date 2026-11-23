@@ -850,6 +850,9 @@ func writeLoopProfile(t *testing.T, p config.Profile) string {
 	if p.Loop.SessionDeadlineFile != "" {
 		text += fmt.Sprintf("  session_deadline_file: %s\n", p.Loop.SessionDeadlineFile)
 	}
+	if p.Loop.SessionDeadlineMinRemainingMinutes != 0 {
+		text += fmt.Sprintf("  session_deadline_min_remaining_minutes: %d\n", p.Loop.SessionDeadlineMinRemainingMinutes)
+	}
 	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
 		t.Fatal(err)
 	}
