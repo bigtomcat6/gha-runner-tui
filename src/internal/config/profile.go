@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"gopkg.in/yaml.v3"
@@ -154,8 +155,44 @@ type LoopConfig struct {
 	PollIntervalSeconds int    `yaml:"poll_interval_seconds,omitempty"`
 	IdleTimeoutSeconds  int    `yaml:"idle_timeout_seconds,omitempty"`
 	SessionDeadlineFile string `yaml:"session_deadline_file,omitempty"`
-	StateFile           string `yaml:"state_file"`
-	LogDir              string `yaml:"log_dir"`
+	// SessionDeadlineMinRemainingMinutes overrides the 100-minute admission
+	// floor. Zero means the default, so it requires no file on its own.
+	SessionDeadlineMinRemainingMinutes int    `yaml:"session_deadline_min_remaining_minutes,omitempty"`
+	StateFile                          string `yaml:"state_file"`
+	LogDir                             string `yaml:"log_dir"`
+}
+
+const (
+	DefaultSessionDeadlineMinRemainingMinutes = 100
+	MinSessionDeadlineMinRemainingMinutes     = 20
+	MaxSessionDeadlineMinRemainingMinutes     = 480
+)
+
+// SessionDeadlineMinRemaining resolves the profile admission floor. Zero
+// (omitted) keeps the historical 100-minute default.
+func (p Profile) SessionDeadlineMinRemaining() time.Duration {
+	minutes := p.Loop.SessionDeadlineMinRemainingMinutes
+	if minutes == 0 {
+		minutes = DefaultSessionDeadlineMinRemainingMinutes
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func validateSessionDeadline(loop LoopConfig) error {
+	minutes := loop.SessionDeadlineMinRemainingMinutes
+	if minutes == 0 {
+		return nil
+	}
+	if loop.SessionDeadlineFile == "" {
+		return errors.New("loop.session_deadline_min_remaining_minutes requires loop.session_deadline_file")
+	}
+	switch {
+	case minutes < MinSessionDeadlineMinRemainingMinutes:
+		return fmt.Errorf("loop.session_deadline_min_remaining_minutes must be at least %d", MinSessionDeadlineMinRemainingMinutes)
+	case minutes > MaxSessionDeadlineMinRemainingMinutes:
+		return fmt.Errorf("loop.session_deadline_min_remaining_minutes must be at most %d", MaxSessionDeadlineMinRemainingMinutes)
+	}
+	return nil
 }
 
 type ProfileLoadError struct {
@@ -282,6 +319,9 @@ func (p Profile) Validate() error {
 		return errors.New("docker.container_name_prefix must contain only lowercase letters, digits, and hyphens")
 	}
 	if err := validateDiskReserveBytes(p.Docker.DiskReserveBytes); err != nil {
+		return err
+	}
+	if err := validateSessionDeadline(p.Loop); err != nil {
 		return err
 	}
 

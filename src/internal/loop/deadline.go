@@ -3,6 +3,7 @@ package loop
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -10,9 +11,10 @@ import (
 	"gha-runner-tui/internal/config"
 )
 
-// sessionDeadlineMinRemaining is 90 minutes of work plus a 10-minute buffer.
-// A configured deadline with less remaining is not enough to admit new work.
-const sessionDeadlineMinRemaining = 100 * time.Minute
+// sessionDeadlineMinRemaining is the default admission floor: 90 minutes of
+// work plus a 10-minute buffer. Profiles may override it within the validated
+// range; zero keeps this default.
+const sessionDeadlineMinRemaining = config.DefaultSessionDeadlineMinRemainingMinutes * time.Minute
 
 // errSessionDeadline marks an expected refusal: the optional protection is
 // enabled but cannot prove enough remaining time.
@@ -37,7 +39,7 @@ type sessionDeadlinePayload struct {
 // unreadable, invalid, expired, or below-floor deadlines refuse. The returned
 // deadline is zero when the file cannot be trusted at all; a non-zero deadline
 // with an error means the time was parsed but is no longer usable.
-func readSessionDeadline(path string, now time.Time) (time.Time, error) {
+func readSessionDeadline(path string, now time.Time, floor time.Duration) (time.Time, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -61,8 +63,8 @@ func readSessionDeadline(path string, now time.Time) (time.Time, error) {
 	switch {
 	case remaining <= 0:
 		return deadline, &sessionDeadlineError{reason: "deadline has expired"}
-	case remaining < sessionDeadlineMinRemaining:
-		return deadline, &sessionDeadlineError{reason: "remaining time is below the 100-minute admission floor"}
+	case remaining < floor:
+		return deadline, &sessionDeadlineError{reason: fmt.Sprintf("remaining time is below the %d-minute admission floor", int(floor/time.Minute))}
 	}
 	return deadline, nil
 }
@@ -74,7 +76,7 @@ func sessionDeadlineAdmission(p config.Profile, now time.Time) error {
 	if p.Loop.SessionDeadlineFile == "" {
 		return nil
 	}
-	_, err := readSessionDeadline(p.Loop.SessionDeadlineFile, now)
+	_, err := readSessionDeadline(p.Loop.SessionDeadlineFile, now, p.SessionDeadlineMinRemaining())
 	return err
 }
 
@@ -90,11 +92,11 @@ func (s *Supervisor) sessionDeadlineAdmission(p config.Profile) error {
 // floor. A configured-but-unknown deadline must fail closed into the protected
 // withdrawal path rather than fall back to zero-DELETE removal. Only an
 // unconfigured path stays inactive.
-func sessionDeadlineExhausted(path string, now time.Time) bool {
+func sessionDeadlineExhausted(path string, now time.Time, floor time.Duration) bool {
 	if path == "" {
 		return false
 	}
-	_, err := readSessionDeadline(path, now)
+	_, err := readSessionDeadline(path, now, floor)
 	return err != nil
 }
 
@@ -104,5 +106,5 @@ func (s *Supervisor) sessionDeadlineReached(p config.Profile) bool {
 	if p.Loop.SessionDeadlineFile == "" {
 		return false
 	}
-	return sessionDeadlineExhausted(p.Loop.SessionDeadlineFile, s.now())
+	return sessionDeadlineExhausted(p.Loop.SessionDeadlineFile, s.now(), p.SessionDeadlineMinRemaining())
 }

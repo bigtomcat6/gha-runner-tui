@@ -234,6 +234,52 @@ func TestLoadProfileOptionalSessionDeadlineFile(t *testing.T) {
 	}
 }
 
+func TestLoadProfileSessionDeadlineMinRemaining(t *testing.T) {
+	t.Parallel()
+
+	write := func(t *testing.T, extra string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "profile.yaml")
+		content := "name: remind-me\nrepo: {owner: me, name: app}\nservice: {name: gha-remind-me.service}\ndocker: {container_name_prefix: gha-remind-me}\nloop:\n  state_file: /var/lib/gha-runner-tui/state/remind-me.json\n" + extra
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	fileLine := "  session_deadline_file: /run/gha-runner-tui/session-deadline.json\n"
+	for _, tc := range []struct {
+		name    string
+		extra   string
+		want    int
+		wantErr string
+	}{
+		{name: "omitted default", extra: fileLine, want: 0},
+		{name: "explicit zero default", extra: fileLine + "  session_deadline_min_remaining_minutes: 0\n", want: 0},
+		{name: "zero without file", extra: "  session_deadline_min_remaining_minutes: 0\n", want: 0},
+		{name: "minimum inclusive", extra: fileLine + "  session_deadline_min_remaining_minutes: 20\n", want: 20},
+		{name: "maximum inclusive", extra: fileLine + "  session_deadline_min_remaining_minutes: 480\n", want: 480},
+		{name: "configured", extra: fileLine + "  session_deadline_min_remaining_minutes: 40\n", want: 40},
+		{name: "below minimum", extra: fileLine + "  session_deadline_min_remaining_minutes: 19\n", wantErr: "at least 20"},
+		{name: "above maximum", extra: fileLine + "  session_deadline_min_remaining_minutes: 481\n", wantErr: "at most 480"},
+		{name: "negative", extra: fileLine + "  session_deadline_min_remaining_minutes: -5\n", wantErr: "at least 20"},
+		{name: "missing file", extra: "  session_deadline_min_remaining_minutes: 40\n", wantErr: "requires loop.session_deadline_file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile, err := LoadProfile(write(t, tc.extra))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected %q error, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil || profile.Loop.SessionDeadlineMinRemainingMinutes != tc.want {
+				t.Fatalf("minutes=%d err=%v", profile.Loop.SessionDeadlineMinRemainingMinutes, err)
+			}
+		})
+	}
+}
+
 func TestLoadProfileDiskReserveBytes(t *testing.T) {
 	t.Parallel()
 
