@@ -13,6 +13,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ManagedBy values. An empty managed_by is local.
+const (
+	ManagedByLocal = "local"
+	ManagedByFleet = "fleet"
+)
+
 type Profile struct {
 	Name        string            `yaml:"name"`
 	Target      TargetConfig      `yaml:"target,omitempty"`
@@ -23,7 +29,16 @@ type Profile struct {
 	Runner      RunnerConfig      `yaml:"runner"`
 	Docker      DockerProfile     `yaml:"docker"`
 	Loop        LoopConfig        `yaml:"loop"`
+	ManagedBy   string            `yaml:"managed_by,omitempty"`
 	Source      string            `yaml:"-"`
+}
+
+// EffectiveManagedBy resolves the stored value, where empty means local.
+func (p Profile) EffectiveManagedBy() string {
+	if p.ManagedBy == ManagedByFleet {
+		return ManagedByFleet
+	}
+	return ManagedByLocal
 }
 
 type RepoConfig struct {
@@ -323,6 +338,11 @@ func (p Profile) Validate() error {
 	}
 	if err := validateSessionDeadline(p.Loop); err != nil {
 		return err
+	}
+	switch p.ManagedBy {
+	case "", ManagedByLocal, ManagedByFleet:
+	default:
+		return errors.New("managed_by must be local or fleet")
 	}
 
 	if target.Scope == TargetScopeOrganization {

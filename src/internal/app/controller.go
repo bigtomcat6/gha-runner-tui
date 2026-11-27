@@ -49,14 +49,25 @@ func (m RunnerManager) LookupProfile(name string) (config.Profile, error) {
 }
 
 func (m RunnerManager) Migrate(ctx context.Context) ([]config.ProfileMigrationResult, error) {
+	_ = ctx
 	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
 	if err != nil {
 		return nil, err
 	}
-	results, accessErr := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir)
-	githubResults, githubErr := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{TokenEnv: cfg.GitHub.TokenEnv, EnvFile: cfg.GitHub.EnvFile})
-	results = append(results, githubResults...)
-	errs := []error{accessErr, githubErr}
+	var results []config.ProfileMigrationResult
+	var migrationErr, accessErr, githubErr error
+	err = m.withFleetLock(func() error {
+		results, accessErr = config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir)
+		githubResults, err := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{TokenEnv: cfg.GitHub.TokenEnv, EnvFile: cfg.GitHub.EnvFile})
+		githubErr = err
+		results = append(results, githubResults...)
+		return nil
+	})
+	if err != nil {
+		return results, err
+	}
+	migrationErr = errors.Join(accessErr, githubErr)
+	errs := []error{migrationErr}
 	for _, result := range results {
 		if result.Status == config.ProfileMigrationFailed {
 			errs = append(errs, fmt.Errorf("%s: %s", result.Path, result.Message))
@@ -116,13 +127,16 @@ type GitHubAdminClient interface {
 type RunnerManager struct {
 	ConfigPath     string
 	SystemdUnitDir string
-	Runner         command.Runner
-	Service        Service
-	Systemd        systemdpkg.Client
-	Docker         dockerpkg.Client
-	GitHub         gh.Client
-	GitHubAdmin    GitHubAdminClient
-	openNewFile    func(string, int, os.FileMode) (*os.File, error)
+	// LockPath overrides the exclusive apply lock. Production leaves it empty
+	// so the CLI uses /run/gha-runner-tui/apply.lock.
+	LockPath    string
+	Runner      command.Runner
+	Service     Service
+	Systemd     systemdpkg.Client
+	Docker      dockerpkg.Client
+	GitHub      gh.Client
+	GitHubAdmin GitHubAdminClient
+	openNewFile func(string, int, os.FileMode) (*os.File, error)
 }
 
 type CreateProfileInput struct {
@@ -296,22 +310,27 @@ func (m RunnerManager) SyncRunnerGroup(ctx context.Context, profile config.Profi
 }
 
 func (m RunnerManager) SyncProfilePath(ctx context.Context, profilePath string) error {
-	if _, err := config.MigrateProfileAccessMode(profilePath); err != nil {
-		return err
-	}
 	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
 	if err != nil {
 		return err
 	}
-	if _, err := config.MigrateProfileGitHubConfig(profilePath, config.GitHubProfile{
-		TokenEnv: cfg.GitHub.TokenEnv,
-		EnvFile:  cfg.GitHub.EnvFile,
-	}); err != nil {
+	var profile config.Profile
+	lockErr := m.withFleetLock(func() error {
+		if _, err := config.MigrateProfileAccessMode(profilePath); err != nil {
+			return err
+		}
+		if _, err := config.MigrateProfileGitHubConfig(profilePath, config.GitHubProfile{
+			TokenEnv: cfg.GitHub.TokenEnv,
+			EnvFile:  cfg.GitHub.EnvFile,
+		}); err != nil {
+			return err
+		}
+		var err error
+		profile, err = config.LoadProfile(profilePath)
 		return err
-	}
-	profile, err := config.LoadProfile(profilePath)
-	if err != nil {
-		return err
+	})
+	if lockErr != nil {
+		return lockErr
 	}
 	return m.SyncRunnerGroup(ctx, profile)
 }
@@ -322,13 +341,20 @@ func (m RunnerManager) SyncConfigProfiles(ctx context.Context) error {
 		return err
 	}
 
-	if _, err := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir); err != nil {
+	// Migration writes are serialized with every other managed write. The
+	// GitHub runner-group calls happen after the lock is released so a slow
+	// network call never blocks local applies.
+	err = m.withFleetLock(func() error {
+		if _, err := config.MigrateProfilesAccessMode(cfg.Paths.ProfilesDir); err != nil {
+			return err
+		}
+		_, err := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{
+			TokenEnv: cfg.GitHub.TokenEnv,
+			EnvFile:  cfg.GitHub.EnvFile,
+		})
 		return err
-	}
-	if _, err := config.MigrateProfilesGitHubConfig(cfg.Paths.ProfilesDir, config.GitHubProfile{
-		TokenEnv: cfg.GitHub.TokenEnv,
-		EnvFile:  cfg.GitHub.EnvFile,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 
@@ -340,6 +366,11 @@ func (m RunnerManager) SyncConfigProfiles(ctx context.Context) error {
 		return profileErrors[0]
 	}
 	for _, profile := range profiles {
+		if profile.EffectiveManagedBy() == config.ManagedByFleet {
+			// The center owns fleet profiles; bulk local sync must not touch
+			// their runner groups. An explicit per-profile sync still may.
+			continue
+		}
 		if err := m.SyncRunnerGroup(ctx, profile); err != nil {
 			return err
 		}
@@ -491,6 +522,15 @@ func (m RunnerManager) killContainers(ctx context.Context, containers []dockerpk
 }
 
 func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInput) (err error) {
+	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
+	if err != nil {
+		return err
+	}
+	normalized, err := normalizeCreateInput(cfg, input)
+	if err != nil {
+		// Validation needs no lock and must keep its exit-2 classification.
+		return err
+	}
 	var created []string
 	defer func() {
 		if err == nil {
@@ -503,15 +543,12 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 			err = fmt.Errorf("%w; permission denied; run create with sudo (sudo gha-runner-tui create ...)", err)
 		}
 	}()
-	cfg, err := config.LoadGlobalConfig(m.ConfigPath)
-	if err != nil {
-		return err
-	}
-	input, err = normalizeCreateInput(cfg, input)
-	if err != nil {
-		return err
-	}
+	return m.withFleetLock(func() error {
+		return m.createProfileLocked(ctx, cfg, normalized, &created)
+	})
+}
 
+func (m RunnerManager) createProfileLocked(ctx context.Context, cfg config.GlobalConfig, input CreateProfileInput, created *[]string) error {
 	dockerAccess, err := resolveDockerAccessForCreate(cfg, input.DockerAccess)
 	if err != nil {
 		return err
@@ -595,7 +632,7 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 	if err != nil {
 		return err
 	}
-	serviceData, err := renderServiceFile(serviceTemplateData{
+	serviceData, err := renderServiceFileWithConfig(cfg, serviceTemplateData{
 		ProfileName:       profile.Name,
 		GitHubEnvFile:     profile.GitHub.EnvFile,
 		LoopBinaryPath:    cfg.Systemd.LoopBinaryPath,
@@ -619,11 +656,11 @@ func (m RunnerManager) CreateProfile(ctx context.Context, input CreateProfileInp
 	if err := m.writeNewManagedFile(ctx, profilePath, profileData, 0o640); err != nil {
 		return fmt.Errorf("YAML creation: %w", err)
 	}
-	created = append(created, profilePath)
+	*created = append(*created, profilePath)
 	if err := m.writeNewManagedFile(ctx, servicePath, serviceData, 0o644); err != nil {
 		return fmt.Errorf("unit creation: %w", err)
 	}
-	created = append(created, servicePath)
+	*created = append(*created, servicePath)
 
 	if err := m.Systemd.DaemonReload(ctx); err != nil {
 		return err
@@ -787,6 +824,32 @@ func renderServiceFile(data serviceTemplateData) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// renderServiceFileWithConfig uses systemd.unit_template when configured.
+// The configured file is read and parsed before any caller writes anything,
+// so a broken template cannot leave a partial profile behind.
+func renderServiceFileWithConfig(cfg config.GlobalConfig, data serviceTemplateData) ([]byte, error) {
+	if strings.TrimSpace(cfg.Systemd.UnitTemplate) == "" {
+		return renderServiceFile(data)
+	}
+	path := cfg.Systemd.UnitTemplate
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("systemd.unit_template must be an absolute path: %s", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read unit template %s: %w", path, err)
+	}
+	tmpl, err := template.New("systemd-service").Parse(string(raw))
+	if err != nil {
+		return nil, fmt.Errorf("parse unit template %s: %w", path, err)
+	}
+	buf := bytes.NewBuffer(nil)
+	if err := tmpl.Execute(buf, data); err != nil {
+		return nil, fmt.Errorf("render unit template %s: %w", path, err)
+	}
+	return buf.Bytes(), nil
+}
+
 func (m RunnerManager) ensureDir(ctx context.Context, path string) error {
 	if err := os.MkdirAll(path, 0o755); err == nil {
 		return nil
@@ -804,10 +867,15 @@ func (m RunnerManager) ensureDir(ctx context.Context, path string) error {
 }
 
 func (m RunnerManager) writeNewManagedFile(_ context.Context, path string, data []byte, perm os.FileMode) error {
-	open := m.openNewFile
-	if open == nil {
-		open = os.OpenFile
+	if m.openNewFile == nil {
+		// Publish a fully written, fsynced temporary file without replacing an
+		// existing path. A crash cannot leave an empty or partial managed file.
+		if err := writeNewFileAtomic(filepath.Dir(path), filepath.Base(path), data, perm); err != nil {
+			return fmt.Errorf("create %q: %w", path, err)
+		}
+		return nil
 	}
+	open := m.openNewFile
 	f, err := open(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return fmt.Errorf("create %q: %w", path, err)

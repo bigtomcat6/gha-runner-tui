@@ -159,7 +159,7 @@ func TestMigrateExplicitPreservesBackupAndReportsAllFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m := RunnerManager{ConfigPath: cfgPath}
+	m := RunnerManager{ConfigPath: cfgPath, LockPath: filepath.Join(root, "apply.lock")}
 	results, err := m.Migrate(context.Background())
 	if err == nil {
 		t.Fatal("bad YAML must fail operation")
@@ -388,6 +388,7 @@ func createFixture(t *testing.T) (RunnerManager, *scriptedRunner, config.GlobalC
 	m := NewRunnerManager(cfgPath, systemd.NewClient(r), docker.NewClient(r), gh.Client{})
 	m.Runner = r
 	m.SystemdUnitDir = filepath.Join(root, "units")
+	m.LockPath = filepath.Join(root, "apply.lock")
 	input := CreateProfileInput{Name: "model-router", RepoOwner: "me", RepoName: "model-router", RunnerLabels: []string{"self-hosted", "linux", "x64"}, DockerImage: "runner:test", ServiceName: "gha-model-router.service", ContainerNamePrefix: "gha-model-router", CPUs: "0.8", Memory: "512m"}
 	return m, r, cfg, input
 }
@@ -850,6 +851,7 @@ loop:
 		docker.NewClient(command.OSRunner{}),
 		gh.NewClient("", "", "", nil, nil),
 	)
+	manager.LockPath = filepath.Join(root, "apply.lock")
 	manager.GitHubAdmin = github
 
 	if err := manager.SyncConfigProfiles(context.Background()); err != nil {
@@ -912,6 +914,7 @@ loop:
 		docker.NewClient(command.OSRunner{}),
 		gh.NewClient("", "", "", nil, nil),
 	)
+	manager.LockPath = filepath.Join(root, "apply.lock")
 	manager.GitHubAdmin = github
 
 	if err := manager.SyncConfigProfiles(context.Background()); err != nil {
@@ -1167,6 +1170,7 @@ docker:
 		gh.NewClient("", "", "", nil, nil),
 	)
 	manager.SystemdUnitDir = systemdDir
+	manager.LockPath = filepath.Join(root, "apply.lock")
 
 	err := manager.CreateProfile(context.Background(), CreateProfileInput{
 		Scope:        config.TargetScopeOrganization,
@@ -1258,6 +1262,7 @@ docker:
 		gh.NewClient("", "", "", nil, nil),
 	)
 	manager.SystemdUnitDir = systemdDir
+	manager.LockPath = filepath.Join(root, "apply.lock")
 
 	err := manager.CreateProfile(context.Background(), CreateProfileInput{
 		Name:                "remind-me-swift",
@@ -1383,6 +1388,7 @@ docker:
 				gh.NewClient("", "", "", nil, nil),
 			)
 			manager.SystemdUnitDir = systemdDir
+			manager.LockPath = filepath.Join(root, "apply.lock")
 			tt.input.CPUs = "0.8"
 			tt.input.Memory = "512m"
 
@@ -1431,6 +1437,7 @@ docker:
 		gh.NewClient("", "", "", nil, nil),
 	)
 	manager.SystemdUnitDir = systemdDir
+	manager.LockPath = filepath.Join(root, "apply.lock")
 
 	err := manager.CreateProfile(context.Background(), CreateProfileInput{
 		Name:                "remind-me-swift",
@@ -1488,6 +1495,7 @@ docker:
 		gh.NewClient("", "", "", nil, nil),
 	)
 	manager.SystemdUnitDir = systemdDir
+	manager.LockPath = filepath.Join(root, "apply.lock")
 
 	err := manager.CreateProfile(context.Background(), CreateProfileInput{
 		DockerAccess:        "host-socket",
@@ -1551,6 +1559,7 @@ docker:
 		gh.NewClient("", "", "", nil, nil),
 	)
 	manager.SystemdUnitDir = systemdDir
+	manager.LockPath = filepath.Join(root, "apply.lock")
 
 	err := manager.CreateProfile(context.Background(), CreateProfileInput{
 		DockerAccess:        "host-socket",

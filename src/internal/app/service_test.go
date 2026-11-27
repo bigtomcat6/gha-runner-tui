@@ -687,3 +687,62 @@ func TestLoadProfileRejectsMissingGitHubFactoryOrClient(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadDashboardNoGitHubSkipsRequestsAndHealthUsesLocalEvidence(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("paths:\n  profiles_dir: "+dir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "p.yaml"), []byte("name: p\nrepo: {owner: me, name: app}\nservice: {name: gha-p.service}\ndocker: {container_name_prefix: gha-p}\nloop: {state_file: /tmp/missing.json}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := Service{
+		ConfigPath: cfgPath,
+		Systemd:    fakeSystemd{status: systemdpkg.ServiceStatus{Active: state.SystemdActive, Enabled: true}},
+		Docker:     fakeDocker{container: dockerpkg.ContainerInfo{Name: "c", State: state.ContainerRunning}},
+		NoGitHub:   true,
+		GitHubForProfile: func(config.GlobalConfig, config.Profile) GitHubClient {
+			t.Fatal("NoGitHub called the GitHub factory")
+			return nil
+		},
+	}
+	d, err := s.LoadDashboard(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Profiles) != 1 || d.Profiles[0].GitHubState != state.GitHubSkipped || d.Profiles[0].BusyState != state.BusySkipped || d.Profiles[0].Health != state.HealthHealthy {
+		t.Fatalf("snapshot=%+v", d.Profiles)
+	}
+	if len(d.Profiles[0].Errors) != 0 {
+		t.Fatalf("NoGitHub errors=%v", d.Profiles[0].Errors)
+	}
+}
+
+func TestMigrateAndSyncFailClosedWhenApplyLockIsHeld(t *testing.T) {
+	h := newFleetHarness(t)
+	raw := "name: p\nrepo: {owner: me, name: app}\nservice: {name: gha-p.service}\ndocker:\n  container_name_prefix: gha-p\n  volumes: [/var/run/docker.sock:/var/run/docker.sock]\n"
+	path := filepath.Join(h.profiles, "p.yaml")
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := holdFleetLock(h.manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := h.manager.Migrate(context.Background()); !errors.Is(err, ErrFleetLocked) {
+		t.Fatalf("migrate lock: %v", err)
+	}
+	if err := h.manager.SyncProfilePath(context.Background(), path); !errors.Is(err, ErrFleetLocked) {
+		t.Fatalf("sync profile lock: %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != raw {
+		t.Fatalf("locked migration rewrote: %s", after)
+	}
+}

@@ -269,6 +269,7 @@ func newCLIFixture(t *testing.T) *cliFixture {
 	f.manager.Service.LegacyServiceDir = f.units
 	// Status exercises per-profile failure without credentials or real HTTP.
 	f.manager.Service.GitHubForProfile = nil
+	f.manager.LockPath = filepath.Join(f.root, "apply.lock")
 	f.profile(t, "p")
 	return f
 }
@@ -287,9 +288,14 @@ func (f *cliFixture) profile(t *testing.T, name string) {
 
 func (f *cliFixture) run(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
+	return f.runInput(t, "", args...)
+}
+
+func (f *cliFixture) runInput(t *testing.T, stdin string, args ...string) (int, string, string) {
+	t.Helper()
 	args = append(args, "--config", f.cfg)
 	var stdout, stderr bytes.Buffer
-	code := runCLI(context.Background(), args, &stdout, &stderr, func(c, u string) app.RunnerManager {
+	code := runCLIWithInput(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, func(c, u string) app.RunnerManager {
 		if c != f.cfg || u != "/etc/systemd/system" {
 			t.Fatalf("manager config=%s units=%s", c, u)
 		}
@@ -450,7 +456,7 @@ func TestWriteStatusStrictDTOAndText(t *testing.T) {
 	if err := writeStatus(&out, d, true); err != nil {
 		t.Fatal(err)
 	}
-	want := `{"slot_holders":[{"profile":"p","container":"c","runner":"r","state":"created"}],"slot_error":null,"profiles":[{"name":"p","service":{"active":"active","enabled":true},"loop":{"state":"running-job","last_transition_at":"2026-10-07T00:00:00Z","last_error":"loop problem"},"container":{"name":"c","state":"created"},"github":{"state":"online","busy":"yes"},"health":"running","errors":["first","second"]}],"profile_errors":[{"path":"bad.yaml","error":"bad YAML"}]}` + "\n"
+	want := `{"slot_holders":[{"profile":"p","container":"c","runner":"r","state":"created"}],"slot_error":null,"profiles":[{"name":"p","service":{"active":"active","enabled":true},"loop":{"state":"running-job","last_transition_at":"2026-10-07T00:00:00Z","last_error":"loop problem"},"container":{"name":"c","state":"created"},"github":{"state":"online","busy":"yes"},"health":"running","restart_pending":false,"errors":["first","second"]}],"profile_errors":[{"path":"bad.yaml","error":"bad YAML"}]}` + "\n"
 	if out.String() != want {
 		t.Fatalf("JSON= %s want %s", out.String(), want)
 	}
@@ -841,7 +847,7 @@ func TestCLILifecycleFailureDoesNotEscalate(t *testing.T) {
 		if cmd == "stop" {
 			args = append(args, "--force")
 		}
-		if code, out, stderr := f.run(t, args...); code != 1 || out != "" || !strings.Contains(stderr, "systemctl failed") || len(f.calls) != 1 {
+		if code, out, stderr := f.run(t, args...); code != 3 || out != "" || !strings.Contains(stderr, "systemctl failed") || len(f.calls) != 1 {
 			t.Fatalf("%s code=%d out=%q err=%q calls=%v", cmd, code, out, stderr, f.calls)
 		}
 	}

@@ -30,6 +30,7 @@ const (
 	GitHubOffline GitHubStatus = "offline"
 	GitHubGone    GitHubStatus = "gone"
 	GitHubUnknown GitHubStatus = "unknown"
+	GitHubSkipped GitHubStatus = "skipped"
 )
 
 type BusyStatus string
@@ -39,6 +40,7 @@ const (
 	BusyNo      BusyStatus = "no"
 	BusyUnknown BusyStatus = "unknown"
 	BusyNA      BusyStatus = "-"
+	BusySkipped BusyStatus = "skipped"
 )
 
 type CombinedHealth string
@@ -117,6 +119,25 @@ func ResolveHealth(in HealthInputs) CombinedHealth {
 
 	if (in.Loop == LoopWaitingHost || in.Loop == LoopPaused || in.Loop == LoopWaitingDelay) && in.Container == ContainerNone {
 		return HealthHealthy
+	}
+
+	// With GitHub skipped, health reflects only local evidence. A running
+	// container is working (busy is unknowable); an idle sleeping loop is
+	// healthy; otherwise the local-state fallbacks below decide.
+	if in.GitHub == GitHubSkipped {
+		if in.Container == ContainerRunning {
+			return HealthHealthy
+		}
+		if in.Loop == LoopSleeping && in.Container == ContainerNone {
+			return HealthHealthy
+		}
+		if !in.StatePresent && in.Systemd == SystemdActive {
+			return HealthWarning
+		}
+		if !in.StatePresent && in.Systemd == SystemdInactive {
+			return HealthUnknown
+		}
+		return HealthUnknown
 	}
 
 	if in.GitHub == GitHubGone && in.Container == ContainerExited && in.LastExitCode != nil && *in.LastExitCode != 0 {
