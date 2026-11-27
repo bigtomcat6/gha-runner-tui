@@ -261,8 +261,19 @@ mkdir -p "$dir/actual"
   echo "CALL $key"
   for arg in "$@"; do printf 'ARG %s\n' "$arg"; done
 } >> "$dir/$target.argv.log"
-cat > "$dir/actual/$key.stdin"
 base="$dir/$key"
+if [ -f "$base.late_read" ]; then
+  exec 3<&0
+  (
+    sleep "$(cat "$base.late_read")"
+    cat > "$dir/actual/$key.stdin" || exit 1
+    (printf 'late stdout\n') && : > "$base.stdout_open"
+    (printf 'late stderr\n' >&2) && : > "$base.stderr_open"
+    : > "$base.late_done"
+  ) <&3 3<&- &
+  exit 0
+fi
+cat > "$dir/actual/$key.stdin"
 if [ -f "$base.timeout" ]; then
   exec sleep "$(cat "$base.timeout")"
 fi

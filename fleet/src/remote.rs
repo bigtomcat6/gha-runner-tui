@@ -1,8 +1,9 @@
 //! Running the node CLI over SSH.
 
-use std::io::{Read, Write};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::io::{self, ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::HostConfig;
@@ -38,7 +39,7 @@ pub enum RemoteError {
     SshClientFailure {
         stderr: String,
     },
-    /// Waiting for the local ssh process failed after it was spawned.
+    /// Waiting for or communicating with the local ssh process failed.
     Wait(String),
 }
 
@@ -81,107 +82,40 @@ pub fn execute(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    let deadline = Instant::now() + Duration::from_secs(host.timeout_seconds);
     let mut child = command
         .spawn()
         .map_err(|e| RemoteError::Spawn(format!("spawn ssh: {e}")))?;
-    let mut child_stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let input = stdin.map(|s| s.as_bytes().to_vec());
-    let (writer_done_tx, writer_done_rx) = mpsc::channel();
-    let _writer = std::thread::spawn(move || {
-        if let Some(input) = input {
-            if let Some(stdin) = child_stdin.as_mut() {
-                let _ = stdin.write_all(&input);
-            }
-        }
-        drop(child_stdin);
-        let _ = writer_done_tx.send(());
-    });
-    let stdout_rx = stdout.map(|mut pipe| {
-        let (tx, rx) = mpsc::channel();
-        let _ = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            let _ = tx.send(buf);
-        });
-        rx
-    });
-    let stderr_rx = stderr.map(|mut pipe| {
-        let (tx, rx) = mpsc::channel();
-        let _ = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            let _ = tx.send(buf);
-        });
-        rx
-    });
-
-    let timeout = Duration::from_secs(host.timeout_seconds);
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    break None;
-                }
-                std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RemoteError::Wait(format!("wait for ssh: {e}")));
-            }
-        }
-    };
-
-    let timed_out = status.is_none();
-    if timed_out {
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let status = exchange(
+        &mut child,
+        stdin.unwrap_or_default().as_bytes(),
+        deadline,
+        &mut stdout_bytes,
+        &mut stderr_bytes,
+    );
+    if !matches!(status, Ok(Some(_))) {
+        // The pipes are already closed. Only signal our direct child, and
+        // don't extend the deadline waiting for the OS to reap it.
         let _ = child.kill();
-    }
-    let _ = child.wait();
-
-    // The ssh child can exit while a descendant still holds its stdout/stderr
-    // pipes open. Waiting for those readers must share the same deadline as
-    // the child; a timed-out reader thread is detached, never joined forever.
-    let mut pipes_timed_out = false;
-    let stdout_bytes = match stdout_rx {
-        Some(rx) => match recv_until(&rx, deadline) {
-            Some(bytes) => bytes,
-            None => {
-                pipes_timed_out = true;
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
-    let stderr_bytes = match stderr_rx {
-        Some(rx) => match recv_until(&rx, deadline) {
-            Some(bytes) => bytes,
-            None => {
-                pipes_timed_out = true;
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
-    if recv_until(&writer_done_rx, deadline).is_none() {
-        pipes_timed_out = true;
+        if matches!(child.try_wait(), Ok(None)) {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
     let stderr_text = String::from_utf8_lossy(&stderr_bytes).into_owned();
-
-    if timed_out || pipes_timed_out {
+    let Some(status) =
+        status.map_err(|e| RemoteError::Wait(format!("communicate with ssh: {e}")))?
+    else {
         return Err(RemoteError::Timeout {
             seconds: host.timeout_seconds,
             stderr: stderr_text,
         });
-    }
-    let status: ExitStatus = status.expect("checked above");
+    };
     let Some(exit_code) = status.code() else {
-        return Err(RemoteError::Signal(signal_of(&status)));
+        return Err(RemoteError::Signal(status.signal()));
     };
     if exit_code == SSH_CLIENT_FAILURE_EXIT_CODE {
         return Err(RemoteError::SshClientFailure {
@@ -204,28 +138,132 @@ pub fn execute(
     })
 }
 
-/// Wait for a worker result only until the shared deadline. On expiry the
-/// caller treats the pipes as incomplete; the reader thread stays detached.
-fn recv_until<T>(rx: &Receiver<T>, deadline: Instant) -> Option<T> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return rx.try_recv().ok();
+/// Own all pipe ends here so they close on timeout, even if an SSH descendant
+/// keeps the other ends open after the direct child exits.
+fn exchange(
+    child: &mut Child,
+    mut input: &[u8],
+    deadline: Instant,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+) -> io::Result<Option<ExitStatus>> {
+    let mut stdin_pipe = child.stdin.take().filter(|_| !input.is_empty());
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    for fd in [
+        pipe_fd(&stdin_pipe),
+        pipe_fd(&stdout_pipe),
+        pipe_fd(&stderr_pipe),
+    ] {
+        if fd >= 0 {
+            set_nonblocking(fd)?;
+        }
     }
-    match rx.recv_timeout(remaining) {
-        Ok(value) => Some(value),
-        Err(_) => rx.try_recv().ok(),
+
+    let mut status = None;
+    let mut buffer = [0; 16 * 1024];
+    while Instant::now() < deadline {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if stdin_pipe.is_none()
+            && stdout_pipe.is_none()
+            && stderr_pipe.is_none()
+            && status.is_some()
+        {
+            return Ok(status);
+        }
+
+        let mut fds = [
+            libc::pollfd {
+                fd: pipe_fd(&stdin_pipe),
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pipe_fd(&stdout_pipe),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pipe_fd(&stderr_pipe),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // Wake periodically to check the child even if no fd becomes ready.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait_ms = remaining.as_millis().clamp(1, 10) as libc::c_int;
+        // SAFETY: poll receives a live array of exactly fds.len() entries.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait_ms) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Some(pipe) = stdin_pipe.as_mut().filter(|_| fds[0].revents != 0) {
+            match pipe.write(&input[..input.len().min(buffer.len())]) {
+                Ok(0) => stdin_pipe = None,
+                Ok(n) => {
+                    input = &input[n..];
+                    if input.is_empty() {
+                        stdin_pipe = None;
+                    }
+                }
+                // The node can reject before reading all input. Keep its reply.
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => stdin_pipe = None,
+                Err(e) if retry_io(&e) => (),
+                Err(e) => return Err(e),
+            }
+        }
+        if fds[1].revents != 0 {
+            read_pipe(&mut stdout_pipe, stdout, &mut buffer)?;
+        }
+        if fds[2].revents != 0 {
+            read_pipe(&mut stderr_pipe, stderr, &mut buffer)?;
+        }
     }
+    Ok(None)
 }
 
-#[cfg(unix)]
-fn signal_of(status: &ExitStatus) -> Option<i32> {
-    use std::os::unix::process::ExitStatusExt;
-    status.signal()
+fn pipe_fd(pipe: &Option<impl AsRawFd>) -> libc::c_int {
+    pipe.as_ref().map_or(-1, AsRawFd::as_raw_fd)
 }
 
-#[cfg(not(unix))]
-fn signal_of(_status: &ExitStatus) -> Option<i32> {
-    None
+fn set_nonblocking(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: fd is a live parent-owned pipe end; these commands take no
+    // pointer arguments and only change the flags on that end.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn retry_io(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted)
+}
+
+fn read_pipe(
+    pipe: &mut Option<impl Read>,
+    output: &mut Vec<u8>,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    if let Some(reader) = pipe {
+        match reader.read(buffer) {
+            Ok(0) => *pipe = None,
+            Ok(n) => output.extend_from_slice(&buffer[..n]),
+            Err(e) if retry_io(&e) => (),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 pub fn stderr_tail(stderr: &str) -> Option<String> {

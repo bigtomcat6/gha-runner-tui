@@ -123,9 +123,7 @@ pub fn plan_import(
         }
         let file_name = format!("{}.yaml", profile.name);
         let case_collision = existing.iter().find(|(existing_name, _)| {
-            existing_name.ends_with(".yaml")
-                && existing_name.eq_ignore_ascii_case(&file_name)
-                && existing_name != &file_name
+            existing_name != &file_name && existing_name.eq_ignore_ascii_case(&file_name)
         });
         if let Some((existing_name, _)) = case_collision {
             return Err(format!(
@@ -239,10 +237,11 @@ pub fn commit_import(root: &Path, host: &str, plan: &ImportPlan) -> Result<(), S
         }
         staged.push((temp_path, final_path));
     }
-    for (temp, final_path) in staged {
-        if let Err(e) = fs::rename(&temp, &final_path) {
+    for (i, (temp, final_path)) in staged.iter().enumerate() {
+        if let Err(e) = fs::rename(temp, final_path) {
+            remove_staged(&staged[i..]);
             return Err(format!(
-                "rename {} to {}: {e}; some staged files may remain",
+                "rename {} to {}: {e}; earlier renames were not rolled back",
                 temp.display(),
                 final_path.display()
             ));
@@ -387,23 +386,60 @@ mod tests {
 
     #[test]
     fn rejects_differing_case_existing_file_without_mutation() {
-        let root = temp_dir("case-existing");
-        let dir = root.join("hosts").join("s1").join("profiles");
+        for name in ["Alpha.yaml", "alpha.YAML", "Alpha.YaMl"] {
+            let root = temp_dir("case-existing");
+            let dir = root.join("hosts/s1/profiles");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), "keep me\n").unwrap();
+            let profiles = vec![profile("alpha", "fleet", "new\n")];
+            let result = plan_import(&root, "s1", &profiles, true);
+            let contents = fs::read_to_string(dir.join(name)).unwrap();
+            let names: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            fs::remove_dir_all(root).unwrap();
+            assert!(
+                matches!(&result, Err(err) if err.contains("differs only by case")),
+                "{name}: {result:?}"
+            );
+            assert_eq!(contents, "keep me\n");
+            assert_eq!(names, vec![name]);
+        }
+    }
+
+    #[test]
+    fn rename_failure_cleans_unrenamed_staging_files_for_retry() {
+        let root = temp_dir("stage-rename-failure");
+        let dir = root.join("hosts/s1/profiles");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("Alpha.yaml"), "keep me\n").unwrap();
-        let profiles = vec![profile("alpha", "fleet", "new\n")];
-        let err = plan_import(&root, "s1", &profiles, true).unwrap_err();
-        assert!(err.contains("differs only by case"), "{err}");
-        assert_eq!(
-            fs::read_to_string(dir.join("Alpha.yaml")).unwrap(),
-            "keep me\n"
-        );
-        let names: Vec<String> = fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        let foreign = dir.join(".foreign.yaml.gha-fleet-tmp");
+        fs::write(&foreign, "not ours\n").unwrap();
+        let profiles = [
+            profile("a", "fleet", "a\n"),
+            profile("b", "fleet", "b\n"),
+            profile("c", "fleet", "c\n"),
+        ];
+        let plan = plan_import(&root, "s1", &profiles, false).unwrap();
+        // A regular staging file cannot be renamed over a directory on Unix.
+        let blocker = dir.join("b.yaml");
+        fs::create_dir(&blocker).unwrap();
+        let err = commit_import(&root, "s1", &plan).unwrap_err();
+        let leftovers: Vec<_> = [".b.yaml.gha-fleet-tmp", ".c.yaml.gha-fleet-tmp"]
+            .into_iter()
+            .filter(|name| dir.join(name).exists())
             .collect();
-        assert_eq!(names, vec!["Alpha.yaml".to_string()]);
+        let committed = fs::read_to_string(dir.join("a.yaml")).unwrap();
+        let foreign_contents = fs::read_to_string(foreign).unwrap();
+        fs::remove_dir(blocker).unwrap();
+        let retry = plan_import(&root, "s1", &profiles, false)
+            .and_then(|plan| commit_import(&root, "s1", &plan));
         fs::remove_dir_all(root).unwrap();
+        assert!(err.starts_with("rename "), "{err}");
+        assert_eq!(committed, "a\n");
+        assert_eq!(foreign_contents, "not ours\n");
+        assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
+        retry.unwrap();
     }
 
     #[cfg(unix)]

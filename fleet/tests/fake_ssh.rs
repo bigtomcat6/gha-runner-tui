@@ -938,6 +938,66 @@ fn descendant_holding_pipes_returns_at_the_deadline_as_unknown() {
     assert!(error.contains("timed out"), "{error}");
 }
 
+#[test]
+fn deadline_closes_pipes_before_descendant_reads_approved_bundle() {
+    let env = TestEnv::new(vec![
+        FakeHost {
+            timeout_seconds: 1,
+            ..FakeHost::new("s1")
+        },
+        FakeHost::new("s2"),
+    ]);
+    let bundle = format!(
+        "name: alpha\nmanaged_by: fleet\n# {}\n",
+        "x".repeat(900_000)
+    );
+    env.write_profile("s1", "alpha", &bundle).write_profile(
+        "s2",
+        "alpha",
+        "name: alpha\nmanaged_by: fleet\n",
+    );
+    for host in ["s1", "s2"] {
+        env.write_response_file(host, "apply.preview", &common::fixture("plan-mixed.json"))
+            .write_response_file(host, "apply.execute", &common::fixture("execute-ok.json"));
+    }
+    // Keep the center process alive while the late reader starts, so exiting
+    // the center cannot hide a leaked writer thread by closing its pipes.
+    env.write_sleep("s2", "apply.execute", 3.0);
+    let responses = env.response_dir();
+    std::fs::write(responses.join("s1.apply.execute.late_read"), "2").unwrap();
+
+    let output = env.run_yes(&["apply", "--yes"], &[]);
+    let text = stdout(&output);
+    assert_eq!(code(&output), 3, "{text}\n{}", stderr(&output));
+    assert!(
+        text.contains("s1: unknown") && text.contains("timed out"),
+        "{text}"
+    );
+    assert!(text.contains("s2: applied"), "{text}");
+    assert_eq!(env.actual_stdin("s1", "apply.preview"), bundle);
+    assert!(
+        common::wait_for(Duration::from_secs(2), || responses
+            .join("s1.apply.execute.late_done")
+            .exists()),
+        "late reader did not finish draining to EOF"
+    );
+    let received = env.actual_stdin("s1", "apply.execute");
+    assert!(
+        received.len() < bundle.len() && bundle.starts_with(&received),
+        "late reader received {} of {} approved bytes",
+        received.len(),
+        bundle.len()
+    );
+    for stream in ["stdout", "stderr"] {
+        assert!(
+            !responses
+                .join(format!("s1.apply.execute.{stream}_open"))
+                .exists(),
+            "center still held the {stream} read end after the deadline"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn prune_refuses_mixed_regular_and_symlinked_profiles_before_ssh() {
