@@ -2,11 +2,17 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use crate::config::HostConfig;
 
 pub const CONNECT_TIMEOUT_SECONDS: u64 = 10;
+
+/// OpenSSH uses 255 for its own failures, and also forwards a remote command
+/// that itself exited 255. The status alone therefore cannot prove that the
+/// remote command did not run.
+pub const SSH_CLIENT_FAILURE_EXIT_CODE: i32 = 255;
 
 #[derive(Debug, Clone)]
 pub struct RawReply {
@@ -17,6 +23,7 @@ pub struct RawReply {
 
 #[derive(Debug, Clone)]
 pub enum RemoteError {
+    /// `ssh` could not be started locally; no remote command was dispatched.
     Spawn(String),
     Timeout {
         seconds: u64,
@@ -25,8 +32,14 @@ pub enum RemoteError {
     Signal(Option<i32>),
     /// The node's stdout could not be decoded or was not valid UTF-8.
     InvalidOutput(String),
-    /// Provably failed before the remote command could run.
-    PreDispatch(String),
+    /// ssh itself exited 255. ssh shares its stderr with the remote command and
+    /// reports remote exit 255 the same way, so no output can prove that the
+    /// remote command never started. Every 255 stays unknown.
+    SshClientFailure {
+        stderr: String,
+    },
+    /// Waiting for the local ssh process failed after it was spawned.
+    Wait(String),
 }
 
 /// Single-quote an argv element for the remote POSIX shell.
@@ -76,51 +89,51 @@ pub fn execute(
     let stderr = child.stderr.take();
 
     let input = stdin.map(|s| s.as_bytes().to_vec());
-    let writer = std::thread::spawn(move || {
+    let (writer_done_tx, writer_done_rx) = mpsc::channel();
+    let _writer = std::thread::spawn(move || {
         if let Some(input) = input {
             if let Some(stdin) = child_stdin.as_mut() {
                 let _ = stdin.write_all(&input);
             }
         }
         drop(child_stdin);
+        let _ = writer_done_tx.send(());
     });
-    let stdout_reader = stdout.map(|mut pipe| {
-        std::thread::spawn(move || {
+    let stdout_rx = stdout.map(|mut pipe| {
+        let (tx, rx) = mpsc::channel();
+        let _ = std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
+            let _ = tx.send(buf);
+        });
+        rx
     });
-    let stderr_reader = stderr.map(|mut pipe| {
-        std::thread::spawn(move || {
+    let stderr_rx = stderr.map(|mut pipe| {
+        let (tx, rx) = mpsc::channel();
+        let _ = std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
+            let _ = tx.send(buf);
+        });
+        rx
     });
 
     let timeout = Duration::from_secs(host.timeout_seconds);
-    let started = Instant::now();
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if started.elapsed() >= timeout {
+                let now = Instant::now();
+                if now >= deadline {
                     break None;
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
             }
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = writer.join();
-                if let Some(reader) = stdout_reader {
-                    let _ = reader.join();
-                }
-                if let Some(reader) = stderr_reader {
-                    let _ = reader.join();
-                }
-                return Err(RemoteError::Spawn(format!("wait for ssh: {e}")));
+                return Err(RemoteError::Wait(format!("wait for ssh: {e}")));
             }
         }
     };
@@ -130,16 +143,37 @@ pub fn execute(
         let _ = child.kill();
     }
     let _ = child.wait();
-    let _ = writer.join();
-    let stdout_bytes = stdout_reader
-        .map(|reader| reader.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr_bytes = stderr_reader
-        .map(|reader| reader.join().unwrap_or_default())
-        .unwrap_or_default();
+
+    // The ssh child can exit while a descendant still holds its stdout/stderr
+    // pipes open. Waiting for those readers must share the same deadline as
+    // the child; a timed-out reader thread is detached, never joined forever.
+    let mut pipes_timed_out = false;
+    let stdout_bytes = match stdout_rx {
+        Some(rx) => match recv_until(&rx, deadline) {
+            Some(bytes) => bytes,
+            None => {
+                pipes_timed_out = true;
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    let stderr_bytes = match stderr_rx {
+        Some(rx) => match recv_until(&rx, deadline) {
+            Some(bytes) => bytes,
+            None => {
+                pipes_timed_out = true;
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    if recv_until(&writer_done_rx, deadline).is_none() {
+        pipes_timed_out = true;
+    }
     let stderr_text = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
-    if timed_out {
+    if timed_out || pipes_timed_out {
         return Err(RemoteError::Timeout {
             seconds: host.timeout_seconds,
             stderr: stderr_text,
@@ -149,6 +183,11 @@ pub fn execute(
     let Some(exit_code) = status.code() else {
         return Err(RemoteError::Signal(signal_of(&status)));
     };
+    if exit_code == SSH_CLIENT_FAILURE_EXIT_CODE {
+        return Err(RemoteError::SshClientFailure {
+            stderr: stderr_text,
+        });
+    }
     let stdout_text = match String::from_utf8(stdout_bytes) {
         Ok(text) => text,
         Err(_) => {
@@ -157,9 +196,6 @@ pub fn execute(
             ))
         }
     };
-    if exit_code == 255 && stdout_text.is_empty() && proves_pre_dispatch(&stderr_text) {
-        return Err(RemoteError::PreDispatch(stderr_text));
-    }
 
     Ok(RawReply {
         exit_code,
@@ -168,23 +204,17 @@ pub fn execute(
     })
 }
 
-/// Positive evidence that ssh never reached the remote command. Exit 255 with
-/// no output alone does not prove it: only a recognized client-side
-/// connect/authentication failure is treated as pre-dispatch. An ambiguous
-/// 255 (for example, a session that authenticated and then dropped) stays
-/// `unknown`.
-fn proves_pre_dispatch(stderr: &str) -> bool {
-    const NEEDLES: &[&str] = &[
-        "ssh: Could not resolve hostname",
-        "ssh: connect to host",
-        "No route to host",
-        "Network is unreachable",
-        "Permission denied (",
-        "Host key verification failed",
-        "kex_exchange_identification:",
-        "ssh_exchange_identification:",
-    ];
-    NEEDLES.iter().any(|needle| stderr.contains(needle))
+/// Wait for a worker result only until the shared deadline. On expiry the
+/// caller treats the pipes as incomplete; the reader thread stays detached.
+fn recv_until<T>(rx: &Receiver<T>, deadline: Instant) -> Option<T> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return rx.try_recv().ok();
+    }
+    match rx.recv_timeout(remaining) {
+        Ok(value) => Some(value),
+        Err(_) => rx.try_recv().ok(),
+    }
 }
 
 #[cfg(unix)]
@@ -211,7 +241,7 @@ pub fn stderr_tail(stderr: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{proves_pre_dispatch, shell_quote};
+    use super::shell_quote;
 
     #[test]
     fn quotes_plain_and_embedded_single_quotes() {
@@ -219,22 +249,5 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(shell_quote("$(x)"), "'$(x)'");
-    }
-
-    #[test]
-    fn only_named_client_failures_prove_pre_dispatch() {
-        for line in [
-            "ssh: Could not resolve hostname s1: nodename nor servname provided",
-            "ssh: connect to host s1 port 22: Connection refused",
-            "Permission denied (publickey).",
-            "Host key verification failed.",
-            "kex_exchange_identification: Connection closed by remote host",
-        ] {
-            assert!(proves_pre_dispatch(line), "{line}");
-        }
-        assert!(!proves_pre_dispatch(""));
-        assert!(!proves_pre_dispatch(
-            "debug1: Authenticated to s1 ([10.0.0.1]:22)"
-        ));
     }
 }

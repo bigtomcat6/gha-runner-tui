@@ -31,17 +31,23 @@ pub fn read_host_dir(dir: &Path) -> Result<(BundleState, Bundle), String> {
         fs::read_dir(dir).map_err(|e| format!("read directory {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("read directory {}: {e}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
         let file_type = entry
             .file_type()
             .map_err(|e| format!("stat {}: {e}", entry.path().display()))?;
-        if !file_type.is_file() {
+        if file_type.is_file() {
+            if name.ends_with(".yaml") {
+                files.push((name, entry.path()));
+            }
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".yaml") {
-            continue;
+        if name.ends_with(".yaml") {
+            return Err(format!(
+                "profile {} is not a regular file; symlinks and other special files \
+                 are refused in the expected-state directory",
+                entry.path().display()
+            ));
         }
-        files.push((name, entry.path()));
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -177,5 +183,39 @@ mod tests {
         fs::write(dir.join("big.yaml"), text).unwrap();
         assert!(read_host_dir(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_regular_yaml_entries() {
+        let dir = temp_dir("kinds");
+        fs::write(dir.join("ok.yaml"), "name: ok\nmanaged_by: fleet\n").unwrap();
+        fs::write(dir.join("ignored.txt"), "x").unwrap();
+        fs::create_dir(dir.join("directory.yaml")).unwrap();
+        let err = read_host_dir(&dir).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(err.contains("directory.yaml"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_yaml_entries() {
+        let dir = temp_dir("symlink");
+        let target = dir.parent().unwrap().join(format!(
+            "{}-target.yaml",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&target, "name: linked\nmanaged_by: fleet\n").unwrap();
+        fs::write(
+            dir.join("regular.yaml"),
+            "name: regular\nmanaged_by: fleet\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("linked.yaml")).unwrap();
+        let err = read_host_dir(&dir).unwrap_err();
+        assert!(err.contains("linked.yaml"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_file(target).unwrap();
     }
 }

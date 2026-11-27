@@ -72,11 +72,24 @@ impl Gate {
         let url = format!("{}/v1/machines/{}", self.base, machine_id);
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(API_TIMEOUT_SECONDS)))
+            // Never follow redirects: a redirect could carry X-API-Key to a
+            // different origin. Seeing every status here also lets us reject
+            // non-2xx before reading any response body.
+            .http_status_as_error(false)
+            .max_redirects(0)
             .build();
         let agent: ureq::Agent = config.into();
         let response = agent.get(&url).header("X-API-Key", &key).call();
         match response {
             Ok(mut response) => {
+                let status = response.status();
+                if !(200..=299).contains(&status.as_u16()) {
+                    return GateOutcome::Error(format!(
+                        "host {}: instabox API returned HTTP {}",
+                        host.name,
+                        status.as_u16()
+                    ));
+                }
                 let body = match response.body_mut().read_to_string() {
                     Ok(body) => body,
                     Err(e) => {
@@ -111,10 +124,6 @@ impl Gate {
                     GateOutcome::Asleep(format!("asleep({state})"))
                 }
             }
-            Err(ureq::Error::StatusCode(code)) => GateOutcome::Error(format!(
-                "host {}: instabox API returned HTTP {code}",
-                host.name
-            )),
             Err(e) => GateOutcome::Error(format!(
                 "host {}: instabox API request failed: {e}",
                 host.name

@@ -144,6 +144,18 @@ impl TestEnv {
         self
     }
 
+    /// Let the fake ssh exit while a descendant keeps its stdout/stderr pipes
+    /// open for the given number of seconds.
+    pub fn write_hold_pipe(&self, host: &str, key: &str, seconds: f64) -> &Self {
+        let dir = self.response_dir();
+        fs::write(
+            dir.join(format!("{host}.{key}.hold_pipe")),
+            seconds.to_string(),
+        )
+        .unwrap();
+        self
+    }
+
     pub fn actual_stdin(&self, host: &str, key: &str) -> String {
         let path = self
             .response_dir()
@@ -255,6 +267,10 @@ if [ -f "$base.timeout" ]; then
   exec sleep "$(cat "$base.timeout")"
 fi
 if [ -f "$base.sleep" ]; then sleep "$(cat "$base.sleep")"; fi
+if [ -f "$base.hold_pipe" ]; then
+  sleep "$(cat "$base.hold_pipe")" &
+  exit 0
+fi
 if [ -f "$base.stderr" ]; then cat "$base.stderr" >&2; fi
 if [ -f "$base.stdout" ]; then cat "$base.stdout"; fi
 if [ -f "$base.exit" ]; then exit "$(cat "$base.exit")"; fi
@@ -309,9 +325,23 @@ pub struct MockApi {
 
 impl MockApi {
     pub fn start(body: &str) -> Self {
+        Self::start_response("200 OK", "", body)
+    }
+
+    pub fn start_status(status_line: &str, body: &str) -> Self {
+        Self::start_response(status_line, "", body)
+    }
+
+    pub fn start_redirect(location: &str) -> Self {
+        Self::start_response("302 Found", &format!("Location: {location}\r\n"), "")
+    }
+
+    fn start_response(status_line: &str, extra_headers: &str, body: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock api");
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
+        let status_line = status_line.to_string();
+        let extra_headers = extra_headers.to_string();
         let body = body.to_string();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -321,7 +351,13 @@ impl MockApi {
             while !stop_for_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        handle_request(stream, &body, &requests_for_thread);
+                        handle_request(
+                            stream,
+                            &status_line,
+                            &extra_headers,
+                            &body,
+                            &requests_for_thread,
+                        );
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -353,7 +389,13 @@ impl Drop for MockApi {
     }
 }
 
-fn handle_request(mut stream: TcpStream, body: &str, requests: &Arc<Mutex<Vec<String>>>) {
+fn handle_request(
+    mut stream: TcpStream,
+    status_line: &str,
+    extra_headers: &str,
+    body: &str,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
     let mut request = String::new();
     let mut buffer = [0_u8; 1024];
@@ -385,7 +427,7 @@ fn handle_request(mut stream: TcpStream, body: &str, requests: &Arc<Mutex<Vec<St
         .unwrap()
         .push(request.lines().next().unwrap_or("").to_string());
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );

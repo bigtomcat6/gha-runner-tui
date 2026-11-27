@@ -257,11 +257,11 @@ fn timeout_invalid_json_and_ambiguous_disconnect_are_unknown_exit_3() {
     let s1_error = host_error(&json, "s1").unwrap();
     assert!(s1_error.contains("timed out"), "{s1_error}");
     let s3_error = host_error(&json, "s3").unwrap();
-    assert!(s3_error.contains("exit 255"), "{s3_error}");
+    assert!(s3_error.contains("255"), "{s3_error}");
 }
 
 #[test]
-fn pre_dispatch_255_is_unreachable_but_not_unknown() {
+fn refused_connection_255_stays_unknown() {
     let env = TestEnv::new(vec![FakeHost::new("s1")]);
     env.write_stderr(
         "s1",
@@ -270,9 +270,11 @@ fn pre_dispatch_255_is_unreachable_but_not_unknown() {
     )
     .write_exit("s1", "status", 255);
     let output = env.run_yes(&["status", "--json"], &[]);
-    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    assert_eq!(code(&output), 3, "stderr: {}", stderr(&output));
     let json = parse_hosts_json(&stdout(&output));
-    assert_eq!(host_reachability(&json, "s1"), "unreachable");
+    assert_eq!(host_reachability(&json, "s1"), "unknown");
+    let error = host_error(&json, "s1").unwrap();
+    assert!(error.contains("255"), "{error}");
 }
 
 #[test]
@@ -607,7 +609,7 @@ fn ambiguous_255_without_evidence_is_unknown_not_unreachable() {
 }
 
 #[test]
-fn apply_does_not_report_unreachable_hosts_as_applied() {
+fn apply_does_not_report_unknown_hosts_as_applied() {
     let env = TestEnv::new(vec![FakeHost::new("s1"), FakeHost::new("s2")]);
     env.write_profile(
         "s1",
@@ -628,10 +630,10 @@ fn apply_does_not_report_unreachable_hosts_as_applied() {
     )
     .write_exit("s2", "apply.preview", 255);
     let output = env.run_yes(&["apply", "--yes"], &[]);
-    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    assert_eq!(code(&output), 3, "stderr: {}", stderr(&output));
     let text = stdout(&output);
     assert!(text.contains("s1: applied"), "{text}");
-    assert!(text.contains("s2: unreachable"), "{text}");
+    assert!(text.contains("s2: unknown"), "{text}");
     assert!(!text.contains("s2: applied"), "{text}");
 }
 
@@ -827,4 +829,227 @@ fn status_cached_unknown_snapshot_exits_3_but_missing_snapshot_exits_0() {
     let json = parse_hosts_json(&stdout(&output));
     assert_eq!(host_reachability(&json, "s1"), "unknown");
     assert_eq!(host_reachability(&json, "s2"), "unknown");
+}
+
+#[test]
+fn valid_status_json_with_255_is_still_unknown() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    env.write_response("s1", "status", STATUS_JSON)
+        .write_exit("s1", "status", 255);
+    let output = env.run_yes(&["status", "--host", "s1", "--json"], &[]);
+    assert_eq!(code(&output), 3, "stderr: {}", stderr(&output));
+    let json = parse_hosts_json(&stdout(&output));
+    assert_eq!(host_reachability(&json, "s1"), "unknown");
+    let error = host_error(&json, "s1").unwrap();
+    assert!(error.contains("255"), "{error}");
+}
+
+#[test]
+fn valid_preview_json_with_255_is_unknown_and_executes_nothing() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    env.write_profile(
+        "s1",
+        "a-create",
+        "name: a-create\nservice:\n  name: a-create\nmanaged_by: fleet\n",
+    )
+    .write_response_file("s1", "apply.preview", &common::fixture("plan-mixed.json"))
+    .write_exit("s1", "apply.preview", 255);
+    let output = env.run_yes(&["apply", "--yes", "--host", "s1"], &[]);
+    assert_eq!(code(&output), 3, "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("s1: unknown"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!env.argv_log("s1").contains("CALL s1.apply.execute"));
+}
+
+#[test]
+fn valid_execute_json_with_255_is_unknown_and_not_applied() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    env.write_profile(
+        "s1",
+        "a-create",
+        "name: a-create\nservice:\n  name: a-create\nmanaged_by: fleet\n",
+    )
+    .write_response_file("s1", "apply.preview", &common::fixture("plan-mixed.json"))
+    .write_response_file("s1", "apply.execute", &common::fixture("execute-ok.json"))
+    .write_exit("s1", "apply.execute", 255);
+    let output = env.run_yes(&["apply", "--yes", "--host", "s1"], &[]);
+    assert_eq!(code(&output), 3, "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("s1: unknown"), "{text}");
+    assert!(text.contains("may have partially executed"), "{text}");
+    assert!(!text.contains("s1: applied"), "{text}");
+    assert_eq!(
+        env.argv_log("s1").matches("CALL s1.apply.execute").count(),
+        1,
+        "unknown must not be retried"
+    );
+}
+
+#[test]
+fn valid_export_json_with_255_is_unknown_and_writes_nothing() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    env.write_response_file("s1", "export", &common::fixture("export-complete.json"))
+        .write_exit("s1", "export", 255);
+    let output = env.run_yes(&["import", "--host", "s1"], &[]);
+    assert_eq!(code(&output), 3, "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("unknown"), "{}", stdout(&output));
+    assert!(!env.profiles_dir("s1").exists());
+}
+
+#[test]
+fn locally_unspawnable_ssh_is_unreachable_not_unknown() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    let empty = env.root().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let path = empty.to_string_lossy().into_owned();
+    let output = env.run_yes(
+        &["status", "--host", "s1", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    let json = parse_hosts_json(&stdout(&output));
+    assert_eq!(host_reachability(&json, "s1"), "unreachable");
+    let error = host_error(&json, "s1").unwrap();
+    assert!(error.contains("could not be started"), "{error}");
+}
+
+#[test]
+fn descendant_holding_pipes_returns_at_the_deadline_as_unknown() {
+    let env = TestEnv::new(vec![FakeHost {
+        timeout_seconds: 1,
+        ..FakeHost::new("s1")
+    }]);
+    env.write_response("s1", "status", STATUS_JSON)
+        .write_hold_pipe("s1", "status", 6.0);
+    let started = Instant::now();
+    let output = env.run_yes(&["status", "--host", "s1", "--json"], &[]);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "command waited for the descendant pipe: {elapsed:?}"
+    );
+    assert_eq!(code(&output), 3, "stderr: {}", stderr(&output));
+    let json = parse_hosts_json(&stdout(&output));
+    assert_eq!(host_reachability(&json, "s1"), "unknown");
+    let error = host_error(&json, "s1").unwrap();
+    assert!(error.contains("timed out"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_refuses_mixed_regular_and_symlinked_profiles_before_ssh() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    env.write_profile("s1", "a", "name: a\nmanaged_by: fleet\n");
+    let dir = env.profiles_dir("s1");
+    let target = env.root().join("linked-profile.yaml");
+    std::fs::write(&target, "name: linked\nmanaged_by: fleet\n").unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("b.yaml")).unwrap();
+    let output = env.run_yes(&["plan", "--prune", "--host", "s1"], &[]);
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not a regular file"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(env.argv_log("s1").is_empty(), "must refuse before SSH");
+}
+
+#[test]
+fn import_refuses_case_colliding_existing_file_without_mutation() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    env.write_response_file("s1", "export", &common::fixture("export-complete.json"));
+    let dir = env.profiles_dir("s1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ALPHA.yaml"), "keep\n").unwrap();
+
+    let output = env.run_yes(&["import", "--host", "s1"], &[]);
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("refusing import"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("ALPHA.yaml")).unwrap(),
+        "keep\n"
+    );
+    assert!(!dir.join("beta.yaml").exists());
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["ALPHA.yaml".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn import_refuses_symlinked_staging_path_without_mutation() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    env.write_response_file("s1", "export", &common::fixture("export-complete.json"));
+    let dir = env.profiles_dir("s1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let victim = env.root().join("staging-victim.txt");
+    std::fs::write(&victim, "do not touch\n").unwrap();
+    let staging = dir.join(".alpha.yaml.gha-fleet-tmp");
+    std::os::unix::fs::symlink(&victim, &staging).unwrap();
+
+    let output = env.run_yes(&["import", "--host", "s1"], &[]);
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("import failed"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not touch\n");
+    assert!(std::fs::symlink_metadata(&staging)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!dir.join("alpha.yaml").exists());
+    assert!(!dir.join("beta.yaml").exists());
+}
+
+#[test]
+fn gate_refuses_redirect_without_forwarding_the_key() {
+    let target = MockApi::start(r#"{"state":"running"}"#);
+    let redirect = MockApi::start_redirect(&format!("{}/v1/machines/m_s1", target.base));
+    let env = TestEnv::new(vec![FakeHost::gated("s1", "m_s1", "S1_KEY")]);
+    let envs = [
+        ("S1_KEY", "dummy-key"),
+        ("GHA_FLEET_INSTABOX_API_BASE", redirect.base.as_str()),
+    ];
+    let output = env.run_yes(&["status", "--host", "s1", "--json"], &envs);
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    let json = parse_hosts_json(&stdout(&output));
+    assert_eq!(host_reachability(&json, "s1"), "error");
+    let error = host_error(&json, "s1").unwrap();
+    assert!(error.contains("HTTP 302"), "{error}");
+    assert_eq!(redirect.requests().len(), 1);
+    assert!(
+        target.requests().is_empty(),
+        "redirect target must never be contacted: {:?}",
+        target.requests()
+    );
+    assert!(env.argv_log("s1").is_empty());
+}
+
+#[test]
+fn gate_rejects_non_2xx_before_reading_the_body() {
+    let api = MockApi::start_status("500 Internal Server Error", r#"{"state":"running"}"#);
+    let env = TestEnv::new(vec![FakeHost::gated("s1", "m_s1", "S1_KEY")]);
+    let envs = [
+        ("S1_KEY", "dummy-key"),
+        ("GHA_FLEET_INSTABOX_API_BASE", api.base.as_str()),
+    ];
+    let output = env.run_yes(&["status", "--host", "s1", "--json"], &envs);
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    let json = parse_hosts_json(&stdout(&output));
+    assert_eq!(host_reachability(&json, "s1"), "error");
+    let error = host_error(&json, "s1").unwrap();
+    assert!(error.contains("HTTP 500"), "{error}");
+    assert_eq!(api.requests().len(), 1);
+    assert!(env.argv_log("s1").is_empty());
 }

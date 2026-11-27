@@ -61,10 +61,9 @@ fn access(ctx: &Context, host: &HostConfig) -> (Access, Option<String>) {
 
 fn reachability_of_remote_error(error: &RemoteError) -> Reachability {
     match error {
-        RemoteError::PreDispatch(stderr) => Reachability::Unreachable(format!(
-            "ssh failed before dispatch: {}",
-            remote::stderr_tail(stderr).unwrap_or_else(|| "no error output".into())
-        )),
+        RemoteError::Spawn(message) => {
+            Reachability::Unreachable(format!("ssh could not be started locally: {message}"))
+        }
         RemoteError::Timeout { seconds, stderr } => Reachability::Unknown(append_stderr(
             format!("ssh timed out after {seconds}s; the result is unknown"),
             stderr,
@@ -77,22 +76,26 @@ fn reachability_of_remote_error(error: &RemoteError) -> Reachability {
                 Reachability::Unknown("ssh terminated abnormally; the result is unknown".into())
             }
         },
-        RemoteError::Spawn(message) => Reachability::Error(message.clone()),
+        RemoteError::Wait(message) => Reachability::Unknown(format!(
+            "{message}; the ssh child may have run the command, so the result is unknown"
+        )),
         RemoteError::InvalidOutput(message) => {
             Reachability::Unknown(format!("node stdout is invalid: {message}"))
         }
+        RemoteError::SshClientFailure { stderr } => Reachability::Unknown(append_stderr(
+            format!(
+                "ssh exited {}; the remote command may have started and the result is unknown",
+                remote::SSH_CLIENT_FAILURE_EXIT_CODE
+            ),
+            stderr,
+        )),
     }
 }
 
 fn invalid_json(host: &HostConfig, raw: &RawReply) -> String {
-    let cause = if raw.exit_code == 255 {
-        "ssh exited 255 without proof that the command never started; the result is unknown"
-    } else {
-        "the node did not print a valid JSON object"
-    };
     append_stderr(
         format!(
-            "{cause} for host {} (exit {}); the result is unknown",
+            "the node did not print a valid JSON object for host {} (exit {}); the result is unknown",
             host.name, raw.exit_code
         ),
         &raw.stderr,
@@ -1699,4 +1702,32 @@ pub fn validate_glob(glob: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_255_is_unknown_and_only_local_spawn_failure_is_unreachable() {
+        let client_failure = RemoteError::SshClientFailure {
+            stderr: "Permission denied (publickey).\n".into(),
+        };
+        assert!(matches!(
+            reachability_of_remote_error(&client_failure),
+            Reachability::Unknown(_)
+        ));
+
+        let spawn = RemoteError::Spawn("spawn ssh: No such file or directory".into());
+        assert!(matches!(
+            reachability_of_remote_error(&spawn),
+            Reachability::Unreachable(_)
+        ));
+
+        let wait = RemoteError::Wait("wait for ssh: interrupted".into());
+        assert!(matches!(
+            reachability_of_remote_error(&wait),
+            Reachability::Unknown(_)
+        ));
+    }
 }

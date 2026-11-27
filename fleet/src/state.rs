@@ -89,7 +89,14 @@ pub fn plan_import(
     force: bool,
 ) -> Result<ImportPlan, String> {
     let dir = root.join("hosts").join(host).join("profiles");
+    let existing = read_existing_entries(&dir)?;
+    // Profile names are used as file-name stems. A case-insensitive filesystem
+    // would map two names that differ only by case (and the predictable staging
+    // names) onto one file, so refuse both duplicate exports and an existing
+    // local file whose name differs only by case from the requested one.
+
     let mut names = std::collections::BTreeSet::new();
+    let mut folded_names = std::collections::BTreeMap::new();
     let mut writes = Vec::new();
     for profile in profiles {
         validate_profile_name(&profile.name)?;
@@ -99,6 +106,14 @@ pub fn plan_import(
                 profile.name
             ));
         }
+        let folded = profile.name.to_ascii_lowercase();
+        if let Some(previous) = folded_names.insert(folded, profile.name.clone()) {
+            return Err(format!(
+                "export for host {host} contains profile names {:?} and {:?} that differ \
+                 only by case; case-insensitive filesystems cannot store both",
+                previous, profile.name
+            ));
+        }
         if profile.owner != "fleet" {
             return Err(format!(
                 "export for host {host} returned profile {:?} with owner {:?}; \
@@ -106,7 +121,20 @@ pub fn plan_import(
                 profile.name, profile.owner
             ));
         }
-        let path = dir.join(format!("{}.yaml", profile.name));
+        let file_name = format!("{}.yaml", profile.name);
+        let case_collision = existing.iter().find(|(existing_name, _)| {
+            existing_name.ends_with(".yaml")
+                && existing_name.eq_ignore_ascii_case(&file_name)
+                && existing_name != &file_name
+        });
+        if let Some((existing_name, _)) = case_collision {
+            return Err(format!(
+                "local file {} differs only by case from the exported file {file_name}; \
+                 refusing import on a case-insensitive filesystem",
+                dir.join(existing_name).display()
+            ));
+        }
+        let path = dir.join(&file_name);
         let action = match fs::read_to_string(&path) {
             Ok(existing) if existing == profile.yaml => ImportAction::Unchanged,
             Ok(_) => {
@@ -129,35 +157,47 @@ pub fn plan_import(
     }
 
     let mut local_only = Vec::new();
-    match fs::read_dir(&dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
-                if !entry
-                    .file_type()
-                    .map_err(|e| format!("stat {}: {e}", entry.path().display()))?
-                    .is_file()
-                {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(stem) = name.strip_suffix(".yaml") else {
-                    continue;
-                };
-                if !names.contains(stem) {
-                    local_only.push(stem.to_string());
-                }
-            }
+    for (name, is_file) in &existing {
+        if !is_file {
+            continue;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("read {}: {e}", dir.display())),
+        let Some(stem) = name.strip_suffix(".yaml") else {
+            continue;
+        };
+        if !names.contains(stem) {
+            local_only.push(stem.to_string());
+        }
     }
     local_only.sort();
     Ok(ImportPlan { writes, local_only })
 }
 
+fn read_existing_entries(dir: &Path) -> Result<Vec<(String, bool)>, String> {
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut found = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_file = entry
+                    .file_type()
+                    .map_err(|e| format!("stat {}: {e}", entry.path().display()))?
+                    .is_file();
+                found.push((name, is_file));
+            }
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(found)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("read {}: {e}", dir.display())),
+    }
+}
+
 /// Stage all writes as temporary files, then rename them into place. This
 /// keeps a failed preflight from touching any existing expected-state file.
+/// Staging files are created exclusively: an existing file or symlink at the
+/// staging path is refused, never followed or truncated, and cleanup only
+/// removes staging files this invocation created.
 pub fn commit_import(root: &Path, host: &str, plan: &ImportPlan) -> Result<(), String> {
     if plan.writes.is_empty() {
         fs::create_dir_all(root.join("hosts").join(host).join("profiles"))
@@ -173,16 +213,27 @@ pub fn commit_import(root: &Path, host: &str, plan: &ImportPlan) -> Result<(), S
         }
         let final_path = dir.join(format!("{}.yaml", write.name));
         let temp_path = dir.join(format!(".{}.yaml.gha-fleet-tmp", write.name));
-        let write_result = (|| -> std::io::Result<()> {
-            let mut file = fs::File::create(&temp_path)?;
-            file.write_all(write.yaml.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        if let Err(e) = write_result {
-            for (path, _) in &staged {
-                let _ = fs::remove_file(path);
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                remove_staged(&staged);
+                return Err(format!(
+                    "create staging file {}: {e}; it is a leftover or a symlink and was \
+                     not overwritten or removed",
+                    temp_path.display()
+                ));
             }
+        };
+        let write_result = file
+            .write_all(write.yaml.as_bytes())
+            .and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(e) = write_result {
+            remove_staged(&staged);
             let _ = fs::remove_file(&temp_path);
             return Err(format!("write {}: {e}", temp_path.display()));
         }
@@ -198,6 +249,12 @@ pub fn commit_import(root: &Path, host: &str, plan: &ImportPlan) -> Result<(), S
         }
     }
     Ok(())
+}
+
+fn remove_staged(staged: &[(PathBuf, PathBuf)]) {
+    for (path, _) in staged {
+        let _ = fs::remove_file(path);
+    }
 }
 
 pub fn snapshot_path(state_dir: &Path, host: &str) -> PathBuf {
@@ -312,6 +369,83 @@ mod tests {
         assert!(plan_import(&root, "s1", &profiles, false).is_err());
         let profiles = vec![profile("a", "local", "x")];
         assert!(plan_import(&root, "s1", &profiles, false).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_case_only_duplicates_before_any_write() {
+        let root = temp_dir("case-dupe");
+        let profiles = vec![
+            profile("Alpha", "fleet", "x\n"),
+            profile("alpha", "fleet", "y\n"),
+        ];
+        let err = plan_import(&root, "s1", &profiles, false).unwrap_err();
+        assert!(err.contains("differ"), "{err}");
+        assert!(!root.join("hosts/s1/profiles").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_differing_case_existing_file_without_mutation() {
+        let root = temp_dir("case-existing");
+        let dir = root.join("hosts").join("s1").join("profiles");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Alpha.yaml"), "keep me\n").unwrap();
+        let profiles = vec![profile("alpha", "fleet", "new\n")];
+        let err = plan_import(&root, "s1", &profiles, true).unwrap_err();
+        assert!(err.contains("differs only by case"), "{err}");
+        assert_eq!(
+            fs::read_to_string(dir.join("Alpha.yaml")).unwrap(),
+            "keep me\n"
+        );
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["Alpha.yaml".to_string()]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_refuses_symlink_without_following_or_removing_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("stage-symlink");
+        let dir = root.join("hosts").join("s1").join("profiles");
+        fs::create_dir_all(&dir).unwrap();
+        let victim = root.join("victim.txt");
+        fs::write(&victim, "do not touch\n").unwrap();
+        let temp = dir.join(".a.yaml.gha-fleet-tmp");
+        symlink(&victim, &temp).unwrap();
+
+        let profiles = vec![profile("a", "fleet", "a\n")];
+        let plan = plan_import(&root, "s1", &profiles, false).unwrap();
+        let err = commit_import(&root, "s1", &plan).unwrap_err();
+        assert!(err.contains("staging file"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "do not touch\n");
+        assert!(fs::symlink_metadata(&temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!dir.join("a.yaml").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staging_refuses_preexisting_temp_file_without_removing_it() {
+        let root = temp_dir("stage-file");
+        let dir = root.join("hosts").join("s1").join("profiles");
+        fs::create_dir_all(&dir).unwrap();
+        let temp = dir.join(".b.yaml.gha-fleet-tmp");
+        fs::write(&temp, "not ours\n").unwrap();
+
+        let profiles = vec![profile("b", "fleet", "b\n")];
+        let plan = plan_import(&root, "s1", &profiles, false).unwrap();
+        let err = commit_import(&root, "s1", &plan).unwrap_err();
+        assert!(err.contains("staging file"), "{err}");
+        assert_eq!(fs::read_to_string(&temp).unwrap(), "not ours\n");
+        assert!(!dir.join("b.yaml").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -25,7 +25,9 @@ hosts/<host>/profiles/*.yaml
 ```
 
 Each profile file is the node's original profile text and must carry a
-top-level `managed_by: fleet` line. The center builds the node bundle from
+top-level `managed_by: fleet` line. Every `.yaml` entry must be a regular file;
+symlinks and other special files are refused before any SSH, so a prune cannot
+silently drop a profile from the bundle. The center builds the node bundle from
 these files: sorted by file name, documents separated by a single `---` line,
 each document ending in a newline, at most 1 MiB.
 
@@ -73,10 +75,12 @@ host. Runtime and adopt `--match` values are limited to
   uses the preview plan id. It never triggers a restart.
 - `import [--force]` — `export --owner fleet --json`. Every selected export
   must have `complete=true`; otherwise nothing is written. Names are validated
-  before use as file names, duplicates and non-fleet ownership are refused,
-  and existing different files are refused unless `--force`. All new contents
-  are staged as temporary files and renamed only after the whole run
-  preflights. Local-only files are reported and never deleted.
+  before use as file names, duplicates (including names that differ only by
+  case) and non-fleet ownership are refused, and existing different files are
+  refused unless `--force`. An existing local file whose name differs only by
+  case from an exported name also refuses the import. All new contents are
+  staged with exclusive-create temporary files and renamed only after the whole
+  run preflights. Local-only files are reported and never deleted.
 - `mode --match GLOB 0|1|2 [--delay-seconds N]`,
   `start|stop|restart --match GLOB` — forwarded to the node; the center never
   offers `--force`.
@@ -96,12 +100,13 @@ for reads, and `applied`, `rejected`, `partial`, `unknown`, `asleep`,
 
 Classification follows the node contract strictly:
 
-- `unreachable` only when failure is provably before dispatch: SSH exit 255,
-  empty stdout, and stderr showing a recognized client-side connect or
-  authentication failure (for example `ssh: connect to host ...`,
-  `Host key verification failed`, `Permission denied (...)`). Exit 255 with no
-  such evidence is ambiguous and is `unknown`.
-- timeout (ssh killed), child death by signal, invalid/truncated JSON, or an
+- `unreachable` only when ssh could not be started locally, which proves no
+  remote command was dispatched. Every SSH exit 255 is `unknown`: ssh shares
+  its stderr with the remote command and also reports a remote command that
+  itself exited 255, so no stderr text or stdout can prove dispatch did not
+  happen. Valid-looking JSON is ignored when the ssh status is 255.
+- timeout (ssh killed), a stdout/stderr pipe not closed by the deadline even
+  after the child exited, child death by signal, invalid/truncated JSON, or an
   unexpected node reply is `unknown`.
 - `unknown` is never retried, because it does not mean "nothing ran". The
   message suggests the read-only follow-up: `plan` after `apply`, a fresh
