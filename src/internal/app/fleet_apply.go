@@ -310,8 +310,14 @@ func (m RunnerManager) prepareApplyTarget(ctx context.Context, cfg config.Global
 		if t.intent.ProfileSHA != doc.SHA {
 			return t, []string{"pending " + t.intent.Operation + " intent was approved for different profile content; repair required"}
 		}
-		if t.intent.Operation == "apply-update" && t.diskPresent && t.disk.SHA != t.intent.ProfileSHA && t.disk.SHA != t.intent.OriginalProfile {
-			return t, []string{"profile changed outside the approved update; repair required"}
+		if t.intent.Operation == "apply-update" {
+			// Restart-only recovery must still match the unit approved for the update.
+			if t.intent.UnitPath != unitPath || t.intent.UnitEvidence != t.entry.UnitEvidence {
+				return t, []string{"unit evidence changed since the pending update; repair required"}
+			}
+			if t.diskPresent && t.disk.SHA != t.intent.ProfileSHA && t.disk.SHA != t.intent.OriginalProfile {
+				return t, []string{"profile changed outside the approved update; repair required"}
+			}
 		}
 	}
 	if t.hasIntent && t.intent.Operation == "apply-create" {
@@ -408,8 +414,11 @@ func (m RunnerManager) prepareApplyTarget(ctx context.Context, cfg config.Global
 			return t, []string{fmt.Sprintf("unit reads %s, not %s", evidence.ConfigPath, profilePath)}
 		}
 	case "not-found":
-		if evidence.UnitFile != "absent" || evidence.DropInDir != "absent" {
-			return t, []string{"unit LoadState is not-found but files exist"}
+		if !evidence.confirmedAbsent() {
+			return t, []string{"unit LoadState is not-found but unit paths are present"}
+		}
+		if t.entry.Marker != "" && !t.hasIntent {
+			return t, []string{"unit not found but restart marker has no matching update intent; repair required"}
 		}
 		t.entry.Message = "unit not installed"
 	default:
@@ -471,7 +480,7 @@ func executeTargets(ctx context.Context, m RunnerManager, cfg config.GlobalConfi
 		case FleetActionRestart:
 			result, err = m.executeRestartTarget(ctx, cfg, t)
 		case FleetActionUnchanged:
-			result, err = m.executeUnchangedTarget(cfg, t)
+			result, err = m.executeUnchangedTarget(ctx, cfg, t)
 		case FleetActionDelete:
 			result, err = m.executeDeleteTarget(ctx, cfg, t)
 		default:
@@ -492,9 +501,9 @@ func executeTargets(ctx context.Context, m RunnerManager, cfg config.GlobalConfi
 	return results
 }
 
-func (m RunnerManager) executeUnchangedTarget(cfg config.GlobalConfig, t fleetTarget) (FleetResult, error) {
+func (m RunnerManager) executeUnchangedTarget(ctx context.Context, cfg config.GlobalConfig, t fleetTarget) (FleetResult, error) {
 	if t.hasIntent {
-		if err := removeIntent(cfg, t.entry.Name); err != nil {
+		if err := m.clearApplyIntent(ctx, cfg, t); err != nil {
 			return t.result(FleetActionUnchanged), err
 		}
 	}
@@ -571,9 +580,6 @@ func verifyExistingContent(path string, want []byte) error {
 }
 
 func (m RunnerManager) executeUpdateTarget(ctx context.Context, cfg config.GlobalConfig, t fleetTarget) (FleetResult, error) {
-	if t.hasIntent && (t.intent.ProfileSHA != t.doc.SHA || t.intent.UnitEvidence != t.entry.UnitEvidence) {
-		return t.result(FleetActionUpdate), errors.New("pending update intent no longer matches the approved inputs")
-	}
 	if !t.hasIntent {
 		in := fleetIntent{Operation: "apply-update", Name: t.entry.Name, Owner: t.doc.Profile.EffectiveManagedBy(),
 			ProfilePath: t.entry.Path, UnitPath: t.unitPath, Service: t.entry.Service,
@@ -598,33 +604,50 @@ func (m RunnerManager) executeUpdateTarget(ctx context.Context, cfg config.Globa
 	}
 	result := FleetResult{Name: t.entry.Name, Action: FleetActionUpdate, RestartNeeded: t.entry.RestartNeeded, Outcome: FleetOutcomeDone, Restart: FleetRestartNone}
 	if !t.entry.RestartNeeded {
-		return result, removeIntent(cfg, t.entry.Name)
+		return result, m.clearApplyIntent(ctx, cfg, t)
 	}
 	return m.finishRestart(ctx, cfg, t, result)
 }
 
-func (m RunnerManager) finishRestart(ctx context.Context, cfg config.GlobalConfig, t fleetTarget, result FleetResult) (FleetResult, error) {
-	info, err := m.Systemd.Show(ctx, t.entry.Service)
+func (e unitEvidence) confirmedAbsent() bool {
+	return e.LoadState == "not-found" && e.UnitFile == "absent" && e.DropInDir == "absent" &&
+		e.Fragment == "" && e.ConfigPath == "" && len(e.dropInPaths) == 0
+}
+
+func (m RunnerManager) verifyApplyUnitAbsent(ctx context.Context, cfg config.GlobalConfig, t fleetTarget) error {
+	evidence, err := collectUnitEvidence(ctx, m, cfg, t.entry.Service, t.entry.Path)
 	if err != nil {
-		result.Restart = FleetRestartFailed
-		return result, fmt.Errorf("cannot read current ActiveState for %s; restart marker retained: %w", t.entry.Service, err)
+		return fmt.Errorf("cannot confirm %s is still absent: %w", t.entry.Service, err)
 	}
-	if info.LoadState != "loaded" {
-		result.Restart = FleetRestartFailed
-		return result, fmt.Errorf("unexpected LoadState %q for %s; restart marker retained", info.LoadState, t.entry.Service)
+	if !evidence.confirmedAbsent() {
+		return fmt.Errorf("%s is no longer confirmed absent; repair required", t.entry.Service)
 	}
-	switch info.ActiveState {
-	case "active", "activating", "reloading":
-		if err := m.Systemd.RestartNoBlock(ctx, t.entry.Service); err != nil {
+	return nil
+}
+
+func (m RunnerManager) clearApplyIntent(ctx context.Context, cfg config.GlobalConfig, t fleetTarget) error {
+	if t.evidence.confirmedAbsent() {
+		if err := m.verifyApplyUnitAbsent(ctx, cfg, t); err != nil {
+			return err
+		}
+	}
+	return removeIntent(cfg, t.entry.Name)
+}
+
+func (m RunnerManager) finishRestart(ctx context.Context, cfg config.GlobalConfig, t fleetTarget, result FleetResult) (FleetResult, error) {
+	if t.evidence.confirmedAbsent() {
+		if err := m.verifyApplyUnitAbsent(ctx, cfg, t); err != nil {
 			result.Restart = FleetRestartFailed
+			return result, fmt.Errorf("restart marker retained: %w", err)
+		}
+		result.Restart = FleetRestartSkipped
+		result.Message = t.entry.Message
+	} else {
+		restart, err := m.restartLoadedUnit(ctx, t.entry.Service)
+		result.Restart = restart
+		if err != nil {
 			return result, err
 		}
-		result.Restart = FleetRestartQueued
-	case "inactive", "failed", "deactivating":
-		result.Restart = FleetRestartSkipped
-	default:
-		result.Restart = FleetRestartFailed
-		return result, fmt.Errorf("unexpected ActiveState %q for %s; restart marker retained", info.ActiveState, t.entry.Service)
 	}
 	if err := removeRestartMarker(cfg, t.entry.Name); err != nil {
 		result.Restart = FleetRestartFailed
@@ -637,11 +660,32 @@ func (m RunnerManager) finishRestart(ctx context.Context, cfg config.GlobalConfi
 	return result, nil
 }
 
+func (m RunnerManager) restartLoadedUnit(ctx context.Context, service string) (string, error) {
+	info, err := m.Systemd.Show(ctx, service)
+	if err != nil {
+		return FleetRestartFailed, fmt.Errorf("cannot read current ActiveState for %s; restart marker retained: %w", service, err)
+	}
+	if info.LoadState != "loaded" {
+		return FleetRestartFailed, fmt.Errorf("unexpected LoadState %q for %s; restart marker retained", info.LoadState, service)
+	}
+	switch info.ActiveState {
+	case "active", "activating", "reloading":
+		if err := m.Systemd.RestartNoBlock(ctx, service); err != nil {
+			return FleetRestartFailed, err
+		}
+		return FleetRestartQueued, nil
+	case "inactive", "failed", "deactivating":
+		return FleetRestartSkipped, nil
+	default:
+		return FleetRestartFailed, fmt.Errorf("unexpected ActiveState %q for %s; restart marker retained", info.ActiveState, service)
+	}
+}
+
 func (m RunnerManager) executeRestartTarget(ctx context.Context, cfg config.GlobalConfig, t fleetTarget) (FleetResult, error) {
 	result := FleetResult{Name: t.entry.Name, Action: FleetActionRestart, RestartNeeded: true, Outcome: FleetOutcomeDone, Restart: FleetRestartNone}
 	if !RestartPending(cfg, t.entry.Name) {
 		if t.hasIntent {
-			if err := removeIntent(cfg, t.entry.Name); err != nil {
+			if err := m.clearApplyIntent(ctx, cfg, t); err != nil {
 				result.Restart = FleetRestartFailed
 				return result, err
 			}
@@ -699,6 +743,9 @@ func (m RunnerManager) prepareDeleteTarget(ctx context.Context, cfg config.Globa
 	if err != nil {
 		return t, []string{err.Error()}
 	}
+	if hasIntent && in.UnitPath != unitPath {
+		return t, []string{"unit path does not match the delete intent; repair required"}
+	}
 	t.unitPath = unitPath
 	evidence, err := collectUnitEvidence(ctx, m, cfg, disk.Profile.Service.Name, disk.Path)
 	if err != nil {
@@ -726,14 +773,14 @@ func (m RunnerManager) prepareDeleteTarget(ctx context.Context, cfg config.Globa
 		if message := deleteArchiveDirProblem(cfg, in.ArchiveDir); message != "" {
 			return t, []string{message}
 		}
-		state, err := inspectDeleteArtifacts(cfg, in, evidence)
+		state, err := inspectDeleteArtifacts(cfg, in, evidence, true)
 		if err != nil {
 			return t, []string{err.Error()}
 		}
-		if state.anyLive() || len(state.duplicates) > 0 {
-			t.entry.Message = "resuming interrupted delete"
-		} else {
+		if state.allArchived() {
 			t.entry.Message = "resuming archived delete; completing daemon-reload"
+		} else {
+			t.entry.Message = "resuming interrupted delete"
 		}
 		return t, nil
 	}
@@ -780,15 +827,16 @@ func deleteArchiveDirProblem(cfg config.GlobalConfig, dir string) string {
 }
 
 type deleteArtifactState struct {
-	profileLive bool
-	unitLive    bool
-	dropInsLive bool
-	markerLive  bool
-	duplicates  []string
+	profileLive     bool
+	unitLive        bool
+	dropInsLive     bool
+	markerLive      bool
+	duplicates      []string
+	foreignFragment string
 }
 
-func (s deleteArtifactState) anyLive() bool {
-	return s.profileLive || s.unitLive || s.dropInsLive || s.markerLive
+func (s deleteArtifactState) allArchived() bool {
+	return !s.profileLive && !s.unitLive && !s.dropInsLive && !s.markerLive && len(s.duplicates) == 0
 }
 
 func verifyFileSHA(path, want, label string) error {
@@ -815,9 +863,9 @@ func unitContentKnown(value string) bool {
 
 // inspectDeleteArtifacts verifies each planned artifact independently. Every
 // artifact must be exactly live or archived; a live copy whose verified
-// archive copy already exists is a duplicate safe to remove. Any content or
-// systemd identity change fails closed.
-func inspectDeleteArtifacts(cfg config.GlobalConfig, in fleetIntent, evidence unitEvidence) (deleteArtifactState, error) {
+// archive copy already exists is a duplicate safe to remove. Once everything
+// is archived, a verified foreign fragment can remain loaded.
+func inspectDeleteArtifacts(cfg config.GlobalConfig, in fleetIntent, evidence unitEvidence, allowForeign bool) (deleteArtifactState, error) {
 	var state deleteArtifactState
 	if in.ArchiveDir == "" {
 		return state, errors.New("delete intent has no archive destination; repair required")
@@ -913,10 +961,6 @@ func inspectDeleteArtifacts(cfg config.GlobalConfig, in fleetIntent, evidence un
 		state.dropInsLive = false
 		state.duplicates = append(state.duplicates, dropInDir)
 	}
-	if message := deleteUnitIdentityProblem(in, evidence, unitLive); message != "" {
-		return state, errors.New(message)
-	}
-
 	markerLive := RestartPending(cfg, in.Name)
 	markerArchived := fileExists(archivePath(in.Name))
 	if in.HadMarker {
@@ -931,7 +975,37 @@ func inspectDeleteArtifacts(cfg config.GlobalConfig, in fleetIntent, evidence un
 		state.markerLive = false
 		state.duplicates = append(state.duplicates, restartPendingPath(cfg, in.Name))
 	}
+	if allowForeign && state.allArchived() && in.HadUnit && evidence.LoadState == "loaded" && evidence.Fragment != in.UnitPath {
+		if err := verifyForeignDeleteFragment(cfg, in, evidence); err != nil {
+			return state, err
+		}
+		state.foreignFragment = evidence.Fragment
+	} else if message := deleteUnitIdentityProblem(in, evidence, unitLive); message != "" {
+		return state, errors.New(message)
+	}
 	return state, nil
+}
+
+func verifyForeignDeleteFragment(cfg config.GlobalConfig, in fleetIntent, evidence unitEvidence) error {
+	path := evidence.Fragment
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(path) != in.Service || evidence.FragmentSHA == "" {
+		return fmt.Errorf("cannot verify foreign fragment %q; repair required", path)
+	}
+	fragment, err := os.Lstat(path)
+	if err != nil || !fragment.Mode().IsRegular() {
+		return fmt.Errorf("cannot verify foreign fragment %q; repair required", path)
+	}
+	archived, err := os.Lstat(filepath.Join(in.ArchiveDir, filepath.Base(in.UnitPath)))
+	if err != nil || os.SameFile(fragment, archived) {
+		return fmt.Errorf("cannot distinguish foreign fragment %q from the archive; repair required", path)
+	}
+	// Absence here must be confirmed, not inferred from a failed stat.
+	for _, live := range []string{in.ProfilePath, in.UnitPath, in.UnitPath + ".d", restartPendingPath(cfg, in.Name)} {
+		if _, err := os.Lstat(live); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("cannot confirm %s is absent after archive; repair required", live)
+		}
+	}
+	return nil
 }
 
 func deleteUnitIdentityProblem(in fleetIntent, evidence unitEvidence, unitLive bool) string {
@@ -1104,7 +1178,7 @@ func (m RunnerManager) executeDeleteTarget(ctx context.Context, cfg config.Globa
 	if err != nil {
 		return result, err
 	}
-	state, err := inspectDeleteArtifacts(cfg, t.intent, evidence)
+	state, err := inspectDeleteArtifacts(cfg, t.intent, evidence, t.hasIntent)
 	if err != nil {
 		return result, err
 	}
@@ -1160,16 +1234,19 @@ func (m RunnerManager) executeDeleteTarget(ctx context.Context, cfg config.Globa
 		if err != nil {
 			return result, err
 		}
-		if postEvidence.LoadState != "not-found" {
-			return result, fmt.Errorf("unit LoadState is %s after archive; repair required", postEvidence.LoadState)
-		}
 	}
-	post, err := inspectDeleteArtifacts(cfg, t.intent, postEvidence)
+	post, err := inspectDeleteArtifacts(cfg, t.intent, postEvidence, true)
 	if err != nil {
 		return result, err
 	}
-	if post.anyLive() || len(post.duplicates) > 0 {
+	if !post.allArchived() {
 		return result, errors.New("delete did not archive every artifact; repair required")
+	}
+	if t.intent.HadUnit && postEvidence.LoadState != "not-found" && post.foreignFragment == "" {
+		return result, fmt.Errorf("unit LoadState is %s after archive; repair required", postEvidence.LoadState)
+	}
+	if post.foreignFragment != "" {
+		result.Message = strings.TrimSpace(result.Message + fmt.Sprintf(" foreign unit at %s left untouched", post.foreignFragment))
 	}
 	if t.force {
 		if _, err := m.ForceRemoveProfile(ctx, t.disk.Profile); err != nil {

@@ -44,6 +44,7 @@ type fleetRunner struct {
 	showErr        map[int]error
 	showOutput     map[int][]byte
 	activeOverride map[int]string
+	onShow         func(int)
 	onReload       func()
 	showCount      int
 }
@@ -57,6 +58,9 @@ func (r *fleetRunner) Run(_ context.Context, name string, args ...string) ([]byt
 		service := args[len(args)-1]
 		r.shows = append(r.shows, call)
 		r.showCount++
+		if r.onShow != nil {
+			r.onShow(r.showCount)
+		}
 		if err := r.showErr[r.showCount]; err != nil {
 			return r.showOutput[r.showCount], err
 		}
@@ -1249,20 +1253,150 @@ func TestDeleteFailsClosedWhenInterruptedArtifactIdentityDiverges(t *testing.T) 
 	}
 }
 
-func TestDeleteRetainsIntentWhenReloadExposesReplacementUnit(t *testing.T) {
+func TestDeleteFinalizesWithVendorFragmentAfterArchive(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("interrupted=%t", interrupted), func(t *testing.T) {
+			h := newFleetHarness(t)
+			profilePath := h.writeProfile("p", h.profileRaw("p"))
+			h.writeUnit("p", fleetUnit{loadState: "loaded"})
+			vendorPath := filepath.Join(h.root, "gha-p.service")
+			vendorContent := []byte("[Service]\nExecStart=/bin/vendor\n")
+			if err := os.WriteFile(vendorPath, vendorContent, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			h.systemd.onReload = func() {
+				h.systemd.units["gha-p.service"] = fleetUnit{loadState: "loaded", fragment: vendorPath, noExec: true}
+			}
+			wantCalls := []string{"systemctl stop gha-p.service", "systemctl disable gha-p.service", "systemctl daemon-reload"}
+			input := DeleteInput{Name: "p", Owner: config.ManagedByFleet}
+			if interrupted {
+				h.systemd.showErr = map[int]error{3: errors.New("cannot read post-reload status")}
+				if report, err := h.manager.Delete(context.Background(), input); err == nil || report.Complete || !slices.Equal(h.systemd.calls, wantCalls) {
+					t.Fatalf("interrupted delete=%+v err=%v calls=%v", report, err, h.systemd.calls)
+				}
+				h.systemd.calls = nil
+				wantCalls = []string{"systemctl daemon-reload"}
+			}
+			report, err := h.manager.Delete(context.Background(), input)
+			if err != nil || !report.Complete || !strings.Contains(report.Results[0].Message, vendorPath) {
+				t.Fatalf("vendor fallback delete=%+v err=%v", report, err)
+			}
+			if !slices.Equal(h.systemd.calls, wantCalls) {
+				t.Fatalf("systemd calls=%v, want %v", h.systemd.calls, wantCalls)
+			}
+			if raw, err := os.ReadFile(vendorPath); err != nil || string(raw) != string(vendorContent) {
+				t.Fatalf("vendor file was touched: %q, %v", raw, err)
+			}
+			unitPath := filepath.Join(h.units, "gha-p.service")
+			for _, path := range []string{profilePath, unitPath, intentPath(h.cfg, "p")} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("%s remains: %v", path, err)
+				}
+			}
+			for _, name := range []string{"p.yaml", "gha-p.service"} {
+				paths, err := filepath.Glob(filepath.Join(backupDir(h.cfg), "deleted-p-*", name))
+				if err != nil || len(paths) != 1 {
+					t.Fatalf("archive of %s: %v, %v", name, paths, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDeleteRetainsIntentWhenReloadRecreatesManagedFragment(t *testing.T) {
 	h := newFleetHarness(t)
 	h.writeProfile("p", h.profileRaw("p"))
 	h.writeUnit("p", fleetUnit{loadState: "loaded"})
 	h.systemd.onReload = func() {
-		h.writeUnit("p", fleetUnit{loadState: "loaded", fragment: filepath.Join(h.root, "gha-p.service"),
-			config: filepath.Join(h.profiles, "other.yaml")})
+		// Even an identical file at the managed path is not a vendor fallback.
+		h.writeUnit("p", fleetUnit{loadState: "loaded"})
 	}
 	report, err := h.manager.Delete(context.Background(), DeleteInput{Name: "p", Owner: config.ManagedByFleet})
 	if err == nil || report.Complete || report.Results[0].Outcome != FleetOutcomeFailed {
-		t.Fatalf("delete completed with a replacement unit: %+v err=%v", report, err)
+		t.Fatalf("delete completed with recreated managed unit: %+v err=%v", report, err)
 	}
-	if _, err := os.Stat(intentPath(h.cfg, "p")); err != nil {
-		t.Fatalf("intent removed despite loaded unit: %v", err)
+	for _, path := range []string{filepath.Join(h.units, "gha-p.service"), intentPath(h.cfg, "p")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("%s was removed: %v", path, err)
+		}
+	}
+}
+
+func TestApplyUpdateSkipsRestartForConfirmedAbsentUnit(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("interrupted=%t", interrupted), func(t *testing.T) {
+			h := newFleetHarness(t)
+			profilePath := h.writeProfile("p", strings.Replace(h.profileRaw("p"), "image:test", "image:old", 1))
+			input := ApplyInput{Bundle: h.bundle("p"), Owner: config.ManagedByFleet}
+			if interrupted {
+				h.systemd.showErr = map[int]error{2: errors.New("dbus unavailable")}
+				if report, err := h.manager.Apply(context.Background(), input); !errors.Is(err, ErrFleetPartial) || report.Results[0].Restart != FleetRestartFailed {
+					t.Fatalf("read failure=%+v err=%v", report, err)
+				}
+				for _, path := range []string{restartPendingPath(h.cfg, "p"), intentPath(h.cfg, "p")} {
+					if _, err := os.Stat(path); err != nil {
+						t.Fatalf("missing recovery evidence %s: %v", path, err)
+					}
+				}
+			}
+			report, err := h.manager.Apply(context.Background(), input)
+			if err != nil || !report.Complete || report.Results[0].Restart != FleetRestartSkipped {
+				t.Fatalf("absent unit apply=%+v err=%v", report, err)
+			}
+			if len(h.systemd.calls) != 0 {
+				t.Fatalf("absent unit apply called systemd: %v", h.systemd.calls)
+			}
+			if raw, err := os.ReadFile(profilePath); err != nil || string(raw) != string(input.Bundle) {
+				t.Fatalf("profile update: %q, %v", raw, err)
+			}
+			for _, path := range []string{restartPendingPath(h.cfg, "p"), intentPath(h.cfg, "p")} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("%s remains: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyRestartPreservesEvidenceWhenUnitAbsenceChanges(t *testing.T) {
+	for _, wasLoaded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("was-loaded=%t", wasLoaded), func(t *testing.T) {
+			h := newFleetHarness(t)
+			h.writeProfile("p", strings.Replace(h.profileRaw("p"), "image:test", "image:old", 1))
+			if wasLoaded {
+				h.writeUnit("p", fleetUnit{loadState: "loaded"})
+			}
+			unitPath := filepath.Join(h.units, "gha-p.service")
+			h.systemd.onShow = func(n int) {
+				if n != 2 {
+					return
+				}
+				if wasLoaded {
+					h.removeUnit("p")
+					if err := os.Remove(unitPath); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(unitPath, []byte("[Service]\n"), 0o644); err != nil {
+					// The new file is not visible to systemd until reload.
+					t.Fatal(err)
+				}
+			}
+			input := ApplyInput{Bundle: h.bundle("p"), Owner: config.ManagedByFleet}
+			if report, err := h.manager.Apply(context.Background(), input); !errors.Is(err, ErrFleetPartial) || report.Complete || report.Results[0].Restart != FleetRestartFailed {
+				t.Fatalf("changed absence=%+v err=%v", report, err)
+			}
+			if report, err := h.manager.Apply(context.Background(), input); !errors.Is(err, ErrFleetRejected) || report.Complete {
+				t.Fatalf("changed absence retry=%+v err=%v", report, err)
+			}
+			if len(h.systemd.calls) != 0 {
+				t.Fatalf("changed absence called systemd: %v", h.systemd.calls)
+			}
+			for _, path := range []string{restartPendingPath(h.cfg, "p"), intentPath(h.cfg, "p")} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("missing recovery evidence %s: %v", path, err)
+				}
+			}
+		})
 	}
 }
 
