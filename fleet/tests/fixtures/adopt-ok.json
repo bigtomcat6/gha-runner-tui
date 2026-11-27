@@ -1,0 +1,23 @@
+{
+  "phase": "execute",
+  "plan_id": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "complete": true,
+  "results": [
+    {
+      "name": "alpha",
+      "action": "adopt",
+      "restart_needed": false,
+      "outcome": "done",
+      "restart": "none",
+      "message": "unit not installed"
+    },
+    {
+      "name": "beta",
+      "action": "unchanged",
+      "restart_needed": false,
+      "outcome": "done",
+      "restart": "none",
+      "message": ""
+    }
+  ]
+}

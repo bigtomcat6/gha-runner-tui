@@ -1,0 +1,47 @@
+{
+  "phase": "plan",
+  "plan_id": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "complete": false,
+  "results": [
+    {
+      "name": "a-create",
+      "action": "create",
+      "restart_needed": true,
+      "outcome": "planned",
+      "restart": "none",
+      "message": ""
+    },
+    {
+      "name": "b-update-restart",
+      "action": "update",
+      "restart_needed": true,
+      "outcome": "planned",
+      "restart": "none",
+      "message": ""
+    },
+    {
+      "name": "c-update-format",
+      "action": "update",
+      "restart_needed": false,
+      "outcome": "planned",
+      "restart": "none",
+      "message": ""
+    },
+    {
+      "name": "d-unchanged",
+      "action": "unchanged",
+      "restart_needed": false,
+      "outcome": "planned",
+      "restart": "none",
+      "message": ""
+    },
+    {
+      "name": "e-restart",
+      "action": "restart",
+      "restart_needed": true,
+      "outcome": "planned",
+      "restart": "none",
+      "message": "restart pending"
+    }
+  ]
+}

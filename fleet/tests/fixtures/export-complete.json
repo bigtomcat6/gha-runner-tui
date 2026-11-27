@@ -1,0 +1,18 @@
+{
+  "complete": true,
+  "profiles": [
+    {
+      "name": "alpha",
+      "path": "/etc/gha-runner-tui/profiles-live-20261117/alpha.yaml",
+      "owner": "fleet",
+      "yaml": "name: alpha\nservice:\n  name: alpha\nmanaged_by: fleet\n"
+    },
+    {
+      "name": "beta",
+      "path": "/etc/gha-runner-tui/profiles-live-20261117/beta.yaml",
+      "owner": "fleet",
+      "yaml": "name: beta\nservice:\n  name: beta\nmanaged_by: fleet\n"
+    }
+  ],
+  "errors": []
+}

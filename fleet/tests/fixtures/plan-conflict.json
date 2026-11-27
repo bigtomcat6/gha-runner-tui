@@ -1,0 +1,23 @@
+{
+  "phase": "plan",
+  "plan_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "complete": false,
+  "results": [
+    {
+      "name": "a-conflict",
+      "action": "conflict",
+      "restart_needed": false,
+      "outcome": "planned",
+      "restart": "none",
+      "message": "profile is owned by local; adopt it to fleet first"
+    },
+    {
+      "name": "b-unchanged",
+      "action": "unchanged",
+      "restart_needed": false,
+      "outcome": "planned",
+      "restart": "none",
+      "message": ""
+    }
+  ]
+}
