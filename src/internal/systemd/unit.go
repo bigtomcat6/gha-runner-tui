@@ -34,7 +34,9 @@ func (u UnitInfo) ConfigPath() (string, error) {
 func (c Client) Show(ctx context.Context, service string) (UnitInfo, error) {
 	out, err := c.runner.Run(ctx, "systemctl", "show", "-p", "ExecStart", "-p", "LoadState", "-p", "ActiveState", "-p", "FragmentPath", "-p", "DropInPaths", service)
 	if err != nil {
-		if info, parseErr := ParseUnitShow(string(out)); parseErr == nil && info.LoadState != "" {
+		// An absent unit can be reported with a nonzero exit. Other output
+		// from a failed command is not reliable status evidence.
+		if info, parseErr := ParseUnitShow(string(out)); parseErr == nil && info.LoadState == "not-found" {
 			return info, nil
 		}
 		return UnitInfo{}, err

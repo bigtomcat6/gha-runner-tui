@@ -15,6 +15,50 @@ import (
 	"gha-runner-tui/internal/config"
 )
 
+// writeNewFileAtomic writes data beside the target, fsyncs the temporary file,
+// publishes it without replacing an existing path, and fsyncs the directory.
+// The temporary file is created in the destination directory so link and
+// rename stay on one filesystem. An interruption leaves either no target or a
+// complete target, never a partial file under the managed name.
+func writeNewFileAtomic(dir, name string, data []byte, perm os.FileMode) error {
+	return writeNewFileAtomicWith(dir, name, data, perm, os.Link)
+}
+
+func writeNewFileAtomicWith(dir, name string, data []byte, perm os.FileMode, link func(string, string) error) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".new-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	target := filepath.Join(dir, name)
+	if err := link(tmpName, target); err != nil {
+		return err
+	}
+	if err := os.Remove(tmpName); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
 // writeFileAtomic writes data beside the target, fsyncs the temporary file,
 // renames it over the target, and fsyncs the directory. Existing files keep
 // their permission bits and, when the process may do so, their owner.

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -36,10 +37,15 @@ type fleetUnit struct {
 }
 
 type fleetRunner struct {
-	units    map[string]fleetUnit
-	calls    []string
-	shows    []string
-	failCall map[string]error
+	units          map[string]fleetUnit
+	calls          []string
+	shows          []string
+	failCall       map[string]error
+	showErr        map[int]error
+	showOutput     map[int][]byte
+	activeOverride map[int]string
+	onReload       func()
+	showCount      int
 }
 
 func (r *fleetRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -50,6 +56,10 @@ func (r *fleetRunner) Run(_ context.Context, name string, args ...string) ([]byt
 	if name == "systemctl" && len(args) > 1 && args[0] == "show" {
 		service := args[len(args)-1]
 		r.shows = append(r.shows, call)
+		r.showCount++
+		if err := r.showErr[r.showCount]; err != nil {
+			return r.showOutput[r.showCount], err
+		}
 		unit, ok := r.units[service]
 		if !ok {
 			unit = fleetUnit{loadState: "not-found"}
@@ -59,6 +69,9 @@ func (r *fleetRunner) Run(_ context.Context, name string, args ...string) ([]byt
 		}
 		if unit.active == "" {
 			unit.active = "active"
+		}
+		if override, ok := r.activeOverride[r.showCount]; ok {
+			unit.active = override
 		}
 		var out strings.Builder
 		fmt.Fprintf(&out, "LoadState=%s\nActiveState=%s\n", unit.loadState, unit.active)
@@ -74,6 +87,16 @@ func (r *fleetRunner) Run(_ context.Context, name string, args ...string) ([]byt
 	r.calls = append(r.calls, call)
 	if err := r.failCall[call]; err != nil {
 		return []byte("failed"), err
+	}
+	if name == "systemctl" && len(args) > 0 && args[0] == "daemon-reload" {
+		for service, unit := range r.units {
+			if unit.fragment != "" && !fileExists(unit.fragment) {
+				delete(r.units, service)
+			}
+		}
+		if r.onReload != nil {
+			r.onReload()
+		}
 	}
 	return []byte("ok\n"), nil
 }
@@ -864,6 +887,434 @@ func TestContractFixtureShapes(t *testing.T) {
 		if !reflect.DeepEqual(gotJSON, wantJSON) {
 			t.Fatalf("%s: fixture=%s generated=%s", path, want, data)
 		}
+	}
+}
+
+func TestUnitEvidenceDigestBindsEffectiveDropInPaths(t *testing.T) {
+	base := unitEvidence{Service: "gha-p.service", LoadState: "loaded", Fragment: "/etc/systemd/system/gha-p.service",
+		FragmentSHA: "fragment", ConfigPath: "/etc/gha-runner-tui/p.yaml", UnitFile: "unit", DropInDir: "dropins",
+		DropIns: []string{"zz.conf\x00file\x00abc"}, dropInPaths: []string{"/etc/systemd/system/gha-p.service.d/zz.conf"}}
+	changed := base
+	changed.dropInPaths = []string{"/usr/lib/systemd/system/gha-p.service.d/vendor.conf"}
+	if base.digest() == changed.digest() {
+		t.Fatal("effective drop-in paths are not bound into unit evidence")
+	}
+}
+
+func TestWriteNewFileAtomicNeverPublishesPartialFileAndNeverReplaces(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "p.yaml")
+	interrupted := errors.New("interrupted before publication")
+	err := writeNewFileAtomicWith(dir, "p.yaml", []byte("complete"), 0o640, func(old, new string) error {
+		if data, readErr := os.ReadFile(old); readErr != nil || string(data) != "complete" {
+			t.Fatalf("temporary file was not fully written: %q %v", data, readErr)
+		}
+		return interrupted
+	})
+	if !errors.Is(err, interrupted) {
+		t.Fatalf("interrupted publication: %v", err)
+	}
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial target published: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("temporary file remains: %v %v", entries, err)
+	}
+	if err := writeNewFileAtomic(dir, "p.yaml", []byte("complete"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("published file: %v %v", info, err)
+	}
+	if err := writeNewFileAtomic(dir, "p.yaml", []byte("other"), 0o600); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("existing target was replaceable: %v", err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "complete" {
+		t.Fatalf("existing target changed: %q %v", data, err)
+	}
+}
+
+func TestFleetLockPathIsSharedForAllUIDs(t *testing.T) {
+	m := RunnerManager{ConfigPath: "/tmp/ignored-config.yaml"}
+	if got := fleetLockPath(m); got != DefaultApplyLockPath {
+		t.Fatalf("default lock path=%s, want %s", got, DefaultApplyLockPath)
+	}
+	override := filepath.Join(t.TempDir(), "apply.lock")
+	m.LockPath = override
+	if got := fleetLockPath(m); got != override {
+		t.Fatalf("override lock path=%s, want %s", got, override)
+	}
+}
+
+func TestFleetLockAccessFailureProvidesSudoHint(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write any lock directory")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	m := RunnerManager{LockPath: filepath.Join(dir, "apply.lock")}
+	err := m.withFleetLock(func() error {
+		t.Fatal("lock body ran without the lock")
+		return nil
+	})
+	if !errors.Is(err, ErrFleetRejected) || !strings.Contains(err.Error(), "sudo") || !strings.Contains(err.Error(), "write access") {
+		t.Fatalf("lock access failure=%v", err)
+	}
+}
+
+func TestApplyPruneRevalidatesUnitAfterEarlierDaemonReload(t *testing.T) {
+	h := newFleetHarness(t)
+	h.writeProfile("z-retarget", h.profileRaw("z-retarget"))
+	unitPath := filepath.Join(h.units, "gha-z-retarget.service")
+	dropDir := unitPath + ".d"
+	if err := os.MkdirAll(dropDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fleetConfig := filepath.Join(h.profiles, "z-retarget.yaml")
+	localConfig := filepath.Join(h.root, "local", "z-retarget.yaml")
+	if err := os.WriteFile(filepath.Join(dropDir, "zz.conf"), []byte("[Service]\nExecStart=/bin/loop --config "+localConfig+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.writeUnit("z-retarget", fleetUnit{loadState: "loaded", active: "active", config: fleetConfig, dropIns: filepath.Join(dropDir, "zz.conf")})
+	// A create earlier in the batch reloads systemd; the edited drop-in now
+	// retargets the pruned unit to the local profile.
+	h.systemd.onReload = func() {
+		h.systemd.units["gha-z-retarget.service"] = fleetUnit{loadState: "loaded", active: "active",
+			fragment: unitPath, config: localConfig, dropIns: filepath.Join(dropDir, "zz.conf")}
+	}
+	bundle := h.bundle("a-create")
+	plan, err := h.manager.Apply(context.Background(), ApplyInput{Bundle: bundle, Owner: config.ManagedByFleet, Prune: true, DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := h.manager.Apply(context.Background(), ApplyInput{Bundle: bundle, Owner: config.ManagedByFleet, Prune: true, ExpectPlan: plan.PlanID})
+	if !errors.Is(err, ErrFleetPartial) || report.Complete {
+		t.Fatalf("retargeted prune=%+v err=%v", report, err)
+	}
+	results := fleetNames(report.Results)
+	if results["a-create"].Outcome != FleetOutcomeDone || results["z-retarget"].Outcome != FleetOutcomeFailed {
+		t.Fatalf("results=%+v", report.Results)
+	}
+	for _, call := range h.systemd.calls {
+		if strings.Contains(call, "gha-z-retarget") {
+			t.Fatalf("destructive call for retargeted unit: %s", call)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(h.profiles, "z-retarget.yaml")); err != nil {
+		t.Fatalf("retargeted profile was archived: %v", err)
+	}
+	if _, err := os.Stat(unitPath); err != nil {
+		t.Fatalf("retargeted unit was archived: %v", err)
+	}
+	archives, _ := filepath.Glob(filepath.Join(backupDir(h.cfg), "deleted-z-retarget-*"))
+	if len(archives) != 0 {
+		t.Fatalf("retargeted unit created an archive: %v", archives)
+	}
+}
+
+func TestDeleteResumesPartiallyArchivedDeleteWithoutStop(t *testing.T) {
+	testResumeDeleteWithArchivedArtifacts(t, []string{"p.yaml", "gha-p.service"}, []string{"systemctl daemon-reload"})
+}
+
+func TestDeleteResumesWithOnlyDropInsArchived(t *testing.T) {
+	testResumeDeleteWithArchivedArtifacts(t, []string{"gha-p.service.d"}, []string{
+		"systemctl stop gha-p.service", "systemctl disable gha-p.service", "systemctl daemon-reload",
+	})
+}
+
+func testResumeDeleteWithArchivedArtifacts(t *testing.T, archived, wantCalls []string) {
+	t.Helper()
+	h := newFleetHarness(t)
+	raw := h.profileRaw("p")
+	profilePath := h.writeProfile("p", raw)
+	unitPath := filepath.Join(h.units, "gha-p.service")
+	dropDir := unitPath + ".d"
+	if err := os.MkdirAll(dropDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropDir, "zz.conf"), []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(filepath.Dir(h.state), "restart-pending", "p")
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath, []byte("p\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	h.writeUnit("p", fleetUnit{loadState: "loaded", active: "active", dropIns: filepath.Join(dropDir, "zz.conf")})
+	evidence, err := collectUnitEvidence(context.Background(), h.manager, h.cfg, "gha-p.service", profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveDir := filepath.Join(backupDir(h.cfg), "deleted-p-"+evidence.digest()[:12])
+	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	intent := fleetIntent{Operation: "delete", Name: "p", Owner: config.ManagedByFleet,
+		ProfilePath: profilePath, UnitPath: unitPath, Service: "gha-p.service",
+		ProfileSHA: shaOfBytes([]byte(raw)), UnitEvidence: evidence.digest(),
+		OriginalUnit: evidence.UnitFile, OriginalDropIns: evidence.DropInDir,
+		HadUnit: true, HadDropIns: true, HadMarker: true, ArchiveDir: archiveDir,
+		FragmentPath: evidence.Fragment, EffectiveConfig: evidence.ConfigPath}
+	if err := writeIntent(h.cfg, intent); err != nil {
+		t.Fatal(err)
+	}
+	// Interruption before all artifacts were archived and before daemon-reload.
+	for _, path := range []string{profilePath, unitPath, dropDir, markerPath} {
+		if name := filepath.Base(path); slices.Contains(archived, name) {
+			if err := os.Rename(path, filepath.Join(archiveDir, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	report, err := h.manager.Delete(context.Background(), DeleteInput{Name: "p", Owner: config.ManagedByFleet})
+	if err != nil || !report.Complete || report.Phase != FleetPhaseExecute {
+		t.Fatalf("resume delete=%+v err=%v", report, err)
+	}
+	if !reflect.DeepEqual(h.systemd.calls, wantCalls) {
+		t.Fatalf("resume delete calls=%v", h.systemd.calls)
+	}
+	for _, name := range []string{"p.yaml", "gha-p.service", "gha-p.service.d", "p"} {
+		if _, err := os.Stat(filepath.Join(archiveDir, name)); err != nil {
+			t.Fatalf("archive missing %s: %v", name, err)
+		}
+	}
+	for _, path := range []string{profilePath, unitPath, dropDir, markerPath} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s remains", path)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(h.state), "fleet-intents", "p.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("intent remains: %v", err)
+	}
+}
+
+func TestDeleteCompletesArchivedIntentAfterInterruptedReload(t *testing.T) {
+	h := newFleetHarness(t)
+	raw := h.profileRaw("p")
+	profilePath := h.writeProfile("p", raw)
+	unitPath := filepath.Join(h.units, "gha-p.service")
+	dropDir := unitPath + ".d"
+	if err := os.MkdirAll(dropDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropDir, "zz.conf"), []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(filepath.Dir(h.state), "restart-pending", "p")
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath, []byte("p\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	h.writeUnit("p", fleetUnit{loadState: "loaded", active: "active", dropIns: filepath.Join(dropDir, "zz.conf")})
+	evidence, err := collectUnitEvidence(context.Background(), h.manager, h.cfg, "gha-p.service", profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveDir := filepath.Join(backupDir(h.cfg), "deleted-p-"+evidence.digest()[:12])
+	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	intent := fleetIntent{Operation: "delete", Name: "p", Owner: config.ManagedByFleet,
+		ProfilePath: profilePath, UnitPath: unitPath, Service: "gha-p.service",
+		ProfileSHA: shaOfBytes([]byte(raw)), UnitEvidence: evidence.digest(),
+		OriginalUnit: evidence.UnitFile, OriginalDropIns: evidence.DropInDir,
+		HadUnit: true, HadDropIns: true, HadMarker: true, ArchiveDir: archiveDir,
+		FragmentPath: evidence.Fragment, EffectiveConfig: evidence.ConfigPath}
+	if err := writeIntent(h.cfg, intent); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{profilePath, unitPath, dropDir, markerPath} {
+		if err := os.Rename(path, filepath.Join(archiveDir, filepath.Base(path))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.systemd.failCall["systemctl daemon-reload"] = errors.New("reload interrupted")
+	if report, err := h.manager.Delete(context.Background(), DeleteInput{Name: "p", Owner: config.ManagedByFleet}); err == nil || report.Complete {
+		t.Fatalf("interrupted reload=%+v err=%v", report, err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(h.state), "fleet-intents", "p.json")); err != nil {
+		t.Fatalf("intent was removed before reload recovery: %v", err)
+	}
+	h.systemd.failCall = map[string]error{}
+	h.systemd.calls = nil
+	report, err := h.manager.Delete(context.Background(), DeleteInput{Name: "p", Owner: config.ManagedByFleet})
+	if err != nil || !report.Complete {
+		t.Fatalf("reload recovery=%+v err=%v", report, err)
+	}
+	if !reflect.DeepEqual(h.systemd.calls, []string{"systemctl daemon-reload"}) {
+		t.Fatalf("recovery calls=%v", h.systemd.calls)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(h.state), "fleet-intents", "p.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("intent remains after recovery: %v", err)
+	}
+}
+
+func TestDeleteFailsClosedWhenInterruptedArtifactIdentityDiverges(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		tamper func(h *fleetHarness, archiveDir, dropDir string)
+	}{
+		{
+			name: "live drop-ins",
+			tamper: func(h *fleetHarness, archiveDir, dropDir string) {
+				if err := os.WriteFile(filepath.Join(dropDir, "extra.conf"), []byte("[Service]\n"), 0o644); err != nil {
+					h.t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "archived unit",
+			tamper: func(h *fleetHarness, archiveDir, dropDir string) {
+				if err := os.WriteFile(filepath.Join(archiveDir, "gha-p.service"), []byte("changed"), 0o644); err != nil {
+					h.t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "replacement unit",
+			tamper: func(h *fleetHarness, _, dropDir string) {
+				h.writeUnit("p", fleetUnit{loadState: "loaded", fragment: filepath.Join(h.root, "gha-p.service"),
+					config: filepath.Join(h.profiles, "other.yaml"), dropIns: filepath.Join(dropDir, "zz.conf")})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFleetHarness(t)
+			raw := h.profileRaw("p")
+			profilePath := h.writeProfile("p", raw)
+			unitPath := filepath.Join(h.units, "gha-p.service")
+			dropDir := unitPath + ".d"
+			if err := os.MkdirAll(dropDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dropDir, "zz.conf"), []byte("[Service]\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			markerPath := filepath.Join(filepath.Dir(h.state), "restart-pending", "p")
+			if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(markerPath, []byte("p\n"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			h.writeUnit("p", fleetUnit{loadState: "loaded", active: "active", dropIns: filepath.Join(dropDir, "zz.conf")})
+			evidence, err := collectUnitEvidence(context.Background(), h.manager, h.cfg, "gha-p.service", profilePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			archiveDir := filepath.Join(backupDir(h.cfg), "deleted-p-"+evidence.digest()[:12])
+			if err := os.MkdirAll(archiveDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			intent := fleetIntent{Operation: "delete", Name: "p", Owner: config.ManagedByFleet,
+				ProfilePath: profilePath, UnitPath: unitPath, Service: "gha-p.service",
+				ProfileSHA: shaOfBytes([]byte(raw)), UnitEvidence: evidence.digest(),
+				OriginalUnit: evidence.UnitFile, OriginalDropIns: evidence.DropInDir,
+				HadUnit: true, HadDropIns: true, HadMarker: true, ArchiveDir: archiveDir,
+				FragmentPath: evidence.Fragment, EffectiveConfig: evidence.ConfigPath}
+			if err := writeIntent(h.cfg, intent); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(profilePath, filepath.Join(archiveDir, "p.yaml")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(unitPath, filepath.Join(archiveDir, "gha-p.service")); err != nil {
+				t.Fatal(err)
+			}
+			tc.tamper(h, archiveDir, dropDir)
+			report, err := h.manager.Delete(context.Background(), DeleteInput{Name: "p", Owner: config.ManagedByFleet})
+			if !errors.Is(err, ErrFleetRejected) || report.Complete {
+				t.Fatalf("diverged resume=%+v err=%v", report, err)
+			}
+			if len(h.systemd.calls) != 0 {
+				t.Fatalf("diverged resume called systemd: %v", h.systemd.calls)
+			}
+			if _, err := os.Stat(dropDir); err != nil {
+				t.Fatalf("drop-ins were moved after divergence: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(filepath.Dir(h.state), "fleet-intents", "p.json")); err != nil {
+				t.Fatalf("intent removed after divergence: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeleteRetainsIntentWhenReloadExposesReplacementUnit(t *testing.T) {
+	h := newFleetHarness(t)
+	h.writeProfile("p", h.profileRaw("p"))
+	h.writeUnit("p", fleetUnit{loadState: "loaded"})
+	h.systemd.onReload = func() {
+		h.writeUnit("p", fleetUnit{loadState: "loaded", fragment: filepath.Join(h.root, "gha-p.service"),
+			config: filepath.Join(h.profiles, "other.yaml")})
+	}
+	report, err := h.manager.Delete(context.Background(), DeleteInput{Name: "p", Owner: config.ManagedByFleet})
+	if err == nil || report.Complete || report.Results[0].Outcome != FleetOutcomeFailed {
+		t.Fatalf("delete completed with a replacement unit: %+v err=%v", report, err)
+	}
+	if _, err := os.Stat(intentPath(h.cfg, "p")); err != nil {
+		t.Fatalf("intent removed despite loaded unit: %v", err)
+	}
+}
+
+func TestRestartExecutionActiveStateFailureRetainsMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*fleetRunner)
+	}{
+		{"transient", func(r *fleetRunner) { r.showErr = map[int]error{2: errors.New("dbus unavailable")} }},
+		{"partial output", func(r *fleetRunner) {
+			r.showErr = map[int]error{2: errors.New("dbus disconnected")}
+			r.showOutput = map[int][]byte{2: []byte("LoadState=loaded\nActiveState=inactive\n")}
+		}},
+		{"unit disappeared", func(r *fleetRunner) {
+			r.showErr = map[int]error{2: errors.New("unit not found")}
+			r.showOutput = map[int][]byte{2: []byte("LoadState=not-found\nActiveState=inactive\n")}
+		}},
+		{"invalid", func(r *fleetRunner) { r.activeOverride = map[int]string{2: ""} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFleetHarness(t)
+			h.writeProfile("p", strings.Replace(h.profileRaw("p"), "image:test", "image:old", 1))
+			h.writeUnit("p", fleetUnit{loadState: "loaded", active: "active"})
+			tc.run(h.systemd)
+			report, err := h.manager.Apply(context.Background(), ApplyInput{Bundle: h.bundle("p"), Owner: config.ManagedByFleet})
+			if !errors.Is(err, ErrFleetPartial) || report.Complete {
+				t.Fatalf("state read failure=%+v err=%v", report, err)
+			}
+			if result := report.Results[0]; result.Outcome != FleetOutcomeFailed || result.Restart != FleetRestartFailed {
+				t.Fatalf("state read result=%+v", result)
+			}
+			marker := filepath.Join(filepath.Dir(h.state), "restart-pending", "p")
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatalf("restart marker was removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestRestartInactiveStillSkipsAndClearsMarker(t *testing.T) {
+	h := newFleetHarness(t)
+	h.writeProfile("p", strings.Replace(h.profileRaw("p"), "image:test", "image:old", 1))
+	h.writeUnit("p", fleetUnit{loadState: "loaded", active: "inactive"})
+	report, err := h.manager.Apply(context.Background(), ApplyInput{Bundle: h.bundle("p"), Owner: config.ManagedByFleet})
+	if err != nil || !report.Complete || report.Results[0].Restart != FleetRestartSkipped {
+		t.Fatalf("inactive restart=%+v err=%v", report, err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(h.state), "restart-pending", "p")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inactive marker remains: %v", err)
+	}
+	if len(h.systemd.calls) != 0 {
+		t.Fatalf("inactive restart called systemd: %v", h.systemd.calls)
 	}
 }
 

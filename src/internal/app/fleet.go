@@ -176,47 +176,48 @@ func fleetLockPath(m RunnerManager) string {
 	if m.LockPath != "" {
 		return m.LockPath
 	}
-	// Production runs as root through sudo and uses the documented host path.
-	// An unprivileged process (local tests or a dry-run) cannot write managed
-	// configuration anyway, so it uses a per-user lock instead of failing on
-	// the root-only /run directory.
-	if os.Geteuid() == 0 {
-		return DefaultApplyLockPath
+	// Every real writer and dry-run uses the same host path regardless of UID.
+	// A non-root process that cannot create the root-owned directory fails with
+	// an access hint instead of silently locking a private copy; a dry-run must
+	// observe the same state as the writer it previews for.
+	return DefaultApplyLockPath
+}
+
+func fleetLockError(lockPath string, err error) error {
+	if errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("%w: cannot access apply lock %s: %v; run with sudo or grant this user write access to %s", ErrFleetRejected, lockPath, err, filepath.Dir(lockPath))
 	}
-	// A non-root process cannot manage the root-owned production files. Keep
-	// an isolated per-config lock so parallel local tests and dry-runs do not
-	// queue behind each other or fail on the root-only /run directory.
-	return filepath.Join(os.TempDir(), "gha-runner-tui-"+shaOfBytes([]byte(m.ConfigPath))[:16]+".apply.lock")
+	return fmt.Errorf("%w: apply lock %s: %v", ErrFleetRejected, lockPath, err)
 }
 
 func (m RunnerManager) withFleetLock(fn func() error) error {
 	lockPath := fleetLockPath(m)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		return fmt.Errorf("%w: cannot create lock directory: %v", ErrFleetRejected, err)
+		return fleetLockError(lockPath, fmt.Errorf("cannot create lock directory: %w", err))
 	}
 	if info, err := os.Lstat(lockPath); err == nil {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("%w: lock path is not a regular file: %s", ErrFleetRejected, lockPath)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%w: cannot inspect lock: %v", ErrFleetRejected, err)
+		return fleetLockError(lockPath, fmt.Errorf("cannot inspect lock: %w", err))
 	}
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("%w: cannot open lock: %v", ErrFleetRejected, err)
+		return fleetLockError(lockPath, fmt.Errorf("cannot open lock: %w", err))
 	}
 	defer f.Close()
 	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
 		return fmt.Errorf("%w: lock is not a regular file", ErrFleetRejected)
 	}
 	if err := f.Chmod(0o600); err != nil {
-		return fmt.Errorf("%w: cannot secure lock permissions: %v", ErrFleetRejected, err)
+		return fleetLockError(lockPath, fmt.Errorf("cannot secure lock permissions: %w", err))
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return ErrFleetLocked
 		}
-		return fmt.Errorf("%w: cannot lock: %v", ErrFleetRejected, err)
+		return fleetLockError(lockPath, fmt.Errorf("cannot lock: %w", err))
 	}
 	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
 	return fn()
@@ -369,9 +370,10 @@ func writeIntent(cfg config.GlobalConfig, in fleetIntent) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	// One atomic, fsynced replacement: the intent exists either complete and
-	// verifiable or not at all.
-	return writeFileAtomic(dir, in.Name+".json", data, 0o600)
+	// One atomic, fsynced, non-replacing publication: the intent exists either
+	// complete and verifiable or not at all, and an unexpected existing intent
+	// is never overwritten.
+	return writeNewFileAtomic(dir, in.Name+".json", data, 0o600)
 }
 
 func removeIntent(cfg config.GlobalConfig, name string) error {
@@ -547,7 +549,8 @@ func (e unitEvidence) digest() string {
 		UnitFile    string   `json:"unit_file"`
 		DropInDir   string   `json:"dropin_dir"`
 		DropIns     []string `json:"dropins"`
-	}{e.Service, e.LoadState, e.Fragment, e.FragmentSHA, e.ConfigPath, e.ConfigErr, e.UnitFile, e.DropInDir, e.DropIns})
+		DropInPaths []string `json:"dropin_paths"`
+	}{e.Service, e.LoadState, e.Fragment, e.FragmentSHA, e.ConfigPath, e.ConfigErr, e.UnitFile, e.DropInDir, e.DropIns, e.dropInPaths})
 	return shaOfBytes(data)
 }
 
@@ -578,7 +581,8 @@ func collectUnitEvidence(ctx context.Context, m RunnerManager, cfg config.Global
 			evidence.FragmentSHA = shaOfBytes(raw)
 		}
 	}
-	evidence.dropInPaths = info.DropInPaths
+	evidence.dropInPaths = append([]string{}, info.DropInPaths...)
+	sort.Strings(evidence.dropInPaths)
 	if cfgPath, err := info.ConfigPath(); err == nil {
 		evidence.ConfigPath = cfgPath
 	} else {
@@ -609,42 +613,60 @@ func collectUnitEvidence(ctx context.Context, m RunnerManager, cfg config.Global
 		evidence.UnitFile = "absent"
 	}
 	dropInDir := unitPath + ".d"
-	entries, err := os.ReadDir(dropInDir)
+	digest, lines, err := readDropInEvidence(dropInDir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return evidence, err
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		evidence.DropInDir = "absent"
 	} else {
-		var lines []string
-		for _, entry := range entries {
-			path := filepath.Join(dropInDir, entry.Name())
-			entryInfo, err := entry.Info()
-			if err != nil {
-				return evidence, err
-			}
-			kind := "file"
-			sha := ""
-			if entryInfo.Mode()&os.ModeSymlink != 0 {
-				kind = "symlink"
-			} else if !entryInfo.Mode().IsRegular() {
-				kind = "other"
-			} else {
-				raw, err := os.ReadFile(path)
-				if err != nil {
-					return evidence, err
-				}
-				sha = shaOfBytes(raw)
-			}
-			lines = append(lines, entry.Name()+"\x00"+kind+"\x00"+sha)
-		}
-		sort.Strings(lines)
 		evidence.DropIns = lines
-		evidence.DropInDir = shaOfBytes([]byte(strings.Join(lines, "\n")))
+		evidence.DropInDir = digest
 	}
 	evidence.Valid = true
 	evidence.Message = evidence.validate()
 	return evidence, nil
+}
+
+// readDropInEvidence hashes the names, kinds, and file contents of one unit
+// drop-in directory. The same helper verifies live and archived copies so an
+// interrupted delete can match each artifact independently.
+func readDropInEvidence(dir string) (string, []string, error) {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", nil, err
+	}
+	if !info.IsDir() {
+		return "", nil, fmt.Errorf("drop-in path %q is not a directory", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", nil, err
+	}
+	var lines []string
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return "", nil, err
+		}
+		kind := "file"
+		sha := ""
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			kind = "symlink"
+		} else if !entryInfo.Mode().IsRegular() {
+			kind = "other"
+		} else {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return "", nil, err
+			}
+			sha = shaOfBytes(raw)
+		}
+		lines = append(lines, entry.Name()+"\x00"+kind+"\x00"+sha)
+	}
+	sort.Strings(lines)
+	return shaOfBytes([]byte(strings.Join(lines, "\n"))), lines, nil
 }
 
 func (e unitEvidence) validate() string {

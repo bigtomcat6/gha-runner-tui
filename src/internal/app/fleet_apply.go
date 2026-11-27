@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -603,18 +604,27 @@ func (m RunnerManager) executeUpdateTarget(ctx context.Context, cfg config.Globa
 }
 
 func (m RunnerManager) finishRestart(ctx context.Context, cfg config.GlobalConfig, t fleetTarget, result FleetResult) (FleetResult, error) {
-	active := t.evidence.ActiveState
-	if info, err := m.Systemd.Show(ctx, t.entry.Service); err == nil {
-		active = info.ActiveState
+	info, err := m.Systemd.Show(ctx, t.entry.Service)
+	if err != nil {
+		result.Restart = FleetRestartFailed
+		return result, fmt.Errorf("cannot read current ActiveState for %s; restart marker retained: %w", t.entry.Service, err)
 	}
-	if active == "active" || active == "activating" {
+	if info.LoadState != "loaded" {
+		result.Restart = FleetRestartFailed
+		return result, fmt.Errorf("unexpected LoadState %q for %s; restart marker retained", info.LoadState, t.entry.Service)
+	}
+	switch info.ActiveState {
+	case "active", "activating", "reloading":
 		if err := m.Systemd.RestartNoBlock(ctx, t.entry.Service); err != nil {
 			result.Restart = FleetRestartFailed
 			return result, err
 		}
 		result.Restart = FleetRestartQueued
-	} else {
+	case "inactive", "failed", "deactivating":
 		result.Restart = FleetRestartSkipped
+	default:
+		result.Restart = FleetRestartFailed
+		return result, fmt.Errorf("unexpected ActiveState %q for %s; restart marker retained", info.ActiveState, t.entry.Service)
 	}
 	if err := removeRestartMarker(cfg, t.entry.Name); err != nil {
 		result.Restart = FleetRestartFailed
@@ -661,6 +671,9 @@ func (m RunnerManager) prepareDeleteTarget(ctx context.Context, cfg config.Globa
 		return fleetTarget{}, []string{message}
 	}
 	disk, present := inv.ByName[name]
+	if hasIntent && present && (disk.Path != in.ProfilePath || disk.Profile.Service.Name != in.Service) {
+		return fleetTarget{}, []string{"live profile does not match the delete intent; repair required"}
+	}
 	if !present {
 		if !hasIntent {
 			return fleetTarget{}, []string{"profile not found"}
@@ -706,29 +719,23 @@ func (m RunnerManager) prepareDeleteTarget(ctx context.Context, cfg config.Globa
 			return t, []string{"duplicate unit claim with " + other.Name}
 		}
 	}
-	// A crash after the profile/unit were already archived leaves only the
-	// daemon-reload and intent removal. That state is safe to resume without
-	// revalidating files systemd no longer sees.
+	// A crash can leave any subset of the profile, unit, drop-in directory,
+	// and restart marker live or archived. Verify each artifact independently
+	// against the durable intent before touching systemd again.
 	if hasIntent {
 		if message := deleteArchiveDirProblem(cfg, in.ArchiveDir); message != "" {
 			return t, []string{message}
 		}
-	}
-	archived := hasIntent && !present && !fileExists(in.ProfilePath) && !fileExists(unitPath)
-	if archived {
-		if message := archivedDeleteEvidenceProblem(in, !fileExists(unitPath+".d"), !RestartPending(cfg, name)); message != "" {
-			return t, []string{message}
+		state, err := inspectDeleteArtifacts(cfg, in, evidence)
+		if err != nil {
+			return t, []string{err.Error()}
 		}
-		t.entry.Message = "resuming archived delete; completing daemon-reload"
+		if state.anyLive() || len(state.duplicates) > 0 {
+			t.entry.Message = "resuming interrupted delete"
+		} else {
+			t.entry.Message = "resuming archived delete; completing daemon-reload"
+		}
 		return t, nil
-	}
-	if hasIntent {
-		if present && in.ProfileSHA != "" && disk.SHA != in.ProfileSHA {
-			return t, []string{"profile changed after the delete plan; repair required"}
-		}
-		if in.UnitEvidence != "" && evidence.digest() != in.UnitEvidence {
-			return t, []string{"unit evidence changed after the delete plan; repair required"}
-		}
 	}
 	switch evidence.LoadState {
 	case "not-found":
@@ -772,46 +779,220 @@ func deleteArchiveDirProblem(cfg config.GlobalConfig, dir string) string {
 	return ""
 }
 
-func archivedDeleteEvidenceProblem(in fleetIntent, dropInsArchived, markerArchived bool) string {
-	info, err := os.Lstat(in.ArchiveDir)
-	if err != nil || !info.IsDir() {
-		return "delete intent archive destination is missing; repair required"
+type deleteArtifactState struct {
+	profileLive bool
+	unitLive    bool
+	dropInsLive bool
+	markerLive  bool
+	duplicates  []string
+}
+
+func (s deleteArtifactState) anyLive() bool {
+	return s.profileLive || s.unitLive || s.dropInsLive || s.markerLive
+}
+
+func verifyFileSHA(path, want, label string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("%s: %w", label, err)
 	}
-	if in.ProfileSHA != "" && in.ProfileSHA != "absent" {
-		if !fileExists(filepath.Join(in.ArchiveDir, filepath.Base(in.ProfilePath))) {
-			return "archived profile is missing; repair required"
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file; repair required", label)
+	}
+	got, err := fileSHA(path)
+	if err != nil {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	if got != want {
+		return fmt.Errorf("%s changed after the delete plan; repair required", label)
+	}
+	return nil
+}
+
+func unitContentKnown(value string) bool {
+	return value != "" && value != "absent" && value != "symlink" && value != "not-regular"
+}
+
+// inspectDeleteArtifacts verifies each planned artifact independently. Every
+// artifact must be exactly live or archived; a live copy whose verified
+// archive copy already exists is a duplicate safe to remove. Any content or
+// systemd identity change fails closed.
+func inspectDeleteArtifacts(cfg config.GlobalConfig, in fleetIntent, evidence unitEvidence) (deleteArtifactState, error) {
+	var state deleteArtifactState
+	if in.ArchiveDir == "" {
+		return state, errors.New("delete intent has no archive destination; repair required")
+	}
+	archivePath := func(name string) string { return filepath.Join(in.ArchiveDir, name) }
+
+	profileArchive := archivePath(filepath.Base(in.ProfilePath))
+	profileLive := fileExists(in.ProfilePath)
+	profileArchived := fileExists(profileArchive)
+	if in.ProfileSHA == "" || in.ProfileSHA == "absent" {
+		if profileLive || profileArchived {
+			return state, errors.New("delete intent expected no profile but one exists; repair required")
+		}
+	} else {
+		if profileLive {
+			if err := verifyFileSHA(in.ProfilePath, in.ProfileSHA, "profile"); err != nil {
+				return state, err
+			}
+		}
+		if profileArchived {
+			if err := verifyFileSHA(profileArchive, in.ProfileSHA, "archived profile"); err != nil {
+				return state, err
+			}
+		}
+		if !profileLive && !profileArchived {
+			return state, errors.New("profile is neither live nor archived; repair required")
 		}
 	}
+	state.profileLive = profileLive
+	if profileLive && profileArchived {
+		state.profileLive = false
+		state.duplicates = append(state.duplicates, in.ProfilePath)
+	}
+
+	unitArchive := archivePath(filepath.Base(in.UnitPath))
+	unitLive := fileExists(in.UnitPath)
+	unitArchived := fileExists(unitArchive)
 	if in.HadUnit {
-		if !fileExists(filepath.Join(in.ArchiveDir, filepath.Base(in.UnitPath))) {
-			return "archived unit is missing; repair required"
+		if !unitContentKnown(in.OriginalUnit) {
+			return state, errors.New("delete intent does not record the planned unit content; repair required")
 		}
+		if unitLive && evidence.UnitFile != in.OriginalUnit {
+			return state, errors.New("unit file changed after the delete plan; repair required")
+		}
+		if unitArchived {
+			if err := verifyFileSHA(unitArchive, in.OriginalUnit, "archived unit"); err != nil {
+				return state, err
+			}
+		}
+		if !unitLive && !unitArchived {
+			return state, errors.New("unit is neither live nor archived; repair required")
+		}
+	} else if unitLive || unitArchived {
+		return state, errors.New("unit appeared after the delete plan; repair required")
 	}
+	state.unitLive = unitLive
+	if unitLive && unitArchived {
+		state.unitLive = false
+		state.duplicates = append(state.duplicates, in.UnitPath)
+	}
+
+	dropInDir := in.UnitPath + ".d"
+	dropInArchive := archivePath(filepath.Base(dropInDir))
+	dropInsLive := fileExists(dropInDir)
+	dropInsArchived := fileExists(dropInArchive)
 	if in.HadDropIns {
-		if !fileExists(filepath.Join(in.ArchiveDir, filepath.Base(in.UnitPath)+".d")) {
-			return "archived drop-ins are missing; repair required"
+		if in.OriginalDropIns == "" || in.OriginalDropIns == "absent" {
+			return state, errors.New("delete intent does not record the planned drop-ins; repair required")
 		}
+		if dropInsLive && evidence.DropInDir != in.OriginalDropIns {
+			return state, errors.New("live drop-ins changed after the delete plan; repair required")
+		}
+		if dropInsArchived {
+			digest, lines, err := readDropInEvidence(dropInArchive)
+			if err != nil {
+				return state, fmt.Errorf("archived drop-ins: %w", err)
+			}
+			if digest != in.OriginalDropIns {
+				return state, errors.New("archived drop-ins changed after the delete plan; repair required")
+			}
+			if !dropInsLive {
+				evidence.DropInDir, evidence.DropIns = digest, lines
+			}
+		}
+		if !dropInsLive && !dropInsArchived {
+			return state, errors.New("drop-ins are neither live nor archived; repair required")
+		}
+	} else if dropInsLive || dropInsArchived {
+		return state, errors.New("drop-ins appeared after the delete plan; repair required")
 	}
+	state.dropInsLive = dropInsLive
+	if dropInsLive && dropInsArchived {
+		state.dropInsLive = false
+		state.duplicates = append(state.duplicates, dropInDir)
+	}
+	if message := deleteUnitIdentityProblem(in, evidence, unitLive); message != "" {
+		return state, errors.New(message)
+	}
+
+	markerLive := RestartPending(cfg, in.Name)
+	markerArchived := fileExists(archivePath(in.Name))
 	if in.HadMarker {
-		if !fileExists(filepath.Join(in.ArchiveDir, in.Name)) {
-			return "archived restart marker is missing; repair required"
+		if !markerLive && !markerArchived {
+			return state, errors.New("restart marker is neither live nor archived; repair required")
 		}
+	} else if markerLive || markerArchived {
+		return state, errors.New("restart marker appeared after the delete plan; repair required")
 	}
-	return ""
+	state.markerLive = markerLive
+	if markerLive && markerArchived {
+		state.markerLive = false
+		state.duplicates = append(state.duplicates, restartPendingPath(cfg, in.Name))
+	}
+	return state, nil
+}
+
+func deleteUnitIdentityProblem(in fleetIntent, evidence unitEvidence, unitLive bool) string {
+	if !unitLive && evidence.LoadState == "not-found" {
+		return ""
+	}
+	if !in.HadUnit || evidence.LoadState != "loaded" {
+		return fmt.Sprintf("unexpected unit LoadState %q during delete; repair required", evidence.LoadState)
+	}
+	if evidence.Fragment != in.UnitPath {
+		return fmt.Sprintf("unit fragment is %s, not %s", evidence.Fragment, in.UnitPath)
+	}
+	if !unitLive {
+		// Before reload, systemd can still report the previous unit. Match
+		// its cached identity using the already verified archived fragment.
+		evidence.UnitFile, evidence.FragmentSHA = in.OriginalUnit, in.OriginalUnit
+	}
+	if in.EffectiveConfig != "" && evidence.ConfigPath != in.EffectiveConfig {
+		return fmt.Sprintf("unit reads %s, not %s", evidence.ConfigPath, in.EffectiveConfig)
+	}
+	if message := evidence.validate(); message != "" {
+		return "unit evidence is not safe: " + message
+	}
+	if in.UnitEvidence != "" && evidence.digest() != in.UnitEvidence {
+		return "unit evidence changed after the delete plan; repair required"
+	}
+	return evidence.dropInsInOwnDir(in.UnitPath)
+}
+
+func removeLiveDuplicate(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		err = os.RemoveAll(path)
+	} else {
+		err = os.Remove(path)
+	}
+	if err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }
 
 func deleteEvidenceDigest(t fleetTarget) string {
 	data, err := json.Marshal(struct {
-		ProfileSHA  string   `json:"profile_sha"`
-		ProfilePath string   `json:"profile_path"`
-		UnitPath    string   `json:"unit_path"`
-		UnitFile    string   `json:"unit_file"`
-		DropInDir   string   `json:"dropin_dir"`
-		DropIns     []string `json:"dropins"`
-		ConfigPath  string   `json:"config_path"`
-		ArchiveDir  string   `json:"archive_dir"`
-		Marker      string   `json:"marker"`
-	}{t.entry.DiskSHA, t.entry.Path, t.unitPath, t.evidence.UnitFile, t.evidence.DropInDir, t.evidence.DropIns, t.evidence.ConfigPath, t.intent.ArchiveDir, t.entry.Marker})
+		ProfileSHA       string   `json:"profile_sha"`
+		ProfilePath      string   `json:"profile_path"`
+		UnitPath         string   `json:"unit_path"`
+		UnitFile         string   `json:"unit_file"`
+		DropInDir        string   `json:"dropin_dir"`
+		DropIns          []string `json:"dropins"`
+		EffectiveDropIns []string `json:"effective_dropins"`
+		ConfigPath       string   `json:"config_path"`
+		ArchiveDir       string   `json:"archive_dir"`
+		Marker           string   `json:"marker"`
+	}{t.entry.DiskSHA, t.entry.Path, t.unitPath, t.evidence.UnitFile, t.evidence.DropInDir, t.evidence.DropIns, t.evidence.dropInPaths, t.evidence.ConfigPath, t.intent.ArchiveDir, t.entry.Marker})
 	if err != nil {
 		return ""
 	}
@@ -913,50 +1094,82 @@ func (m RunnerManager) executeDeleteTarget(ctx context.Context, cfg config.Globa
 			ProfileSHA: t.entry.DiskSHA, UnitEvidence: t.entry.UnitEvidence,
 			OriginalUnit: t.evidence.UnitFile, OriginalDropIns: t.evidence.DropInDir,
 			HadUnit: t.evidence.LoadState == "loaded", HadDropIns: t.evidence.DropInDir != "absent",
-			HadMarker: RestartPending(cfg, t.entry.Name), ArchiveDir: t.intent.ArchiveDir,
+			HadMarker: t.entry.Marker != "", ArchiveDir: t.intent.ArchiveDir,
 			FragmentPath: t.evidence.Fragment, EffectiveConfig: t.evidence.ConfigPath}
+	}
+	// Re-read systemd and every artifact immediately before the destructive
+	// steps. An earlier create in the same apply may have reloaded an edited
+	// drop-in, so the plan-time ExecStart is not sufficient evidence here.
+	evidence, err := collectUnitEvidence(ctx, m, cfg, t.entry.Service, t.entry.Path)
+	if err != nil {
+		return result, err
+	}
+	state, err := inspectDeleteArtifacts(cfg, t.intent, evidence)
+	if err != nil {
+		return result, err
+	}
+	if !t.hasIntent {
 		if err := writeIntent(cfg, t.intent); err != nil {
 			return result, err
 		}
 	}
-	paths := []string{t.entry.Path, t.unitPath, t.unitPath + ".d", restartPendingPath(cfg, t.entry.Name)}
-	stateFiles := fileExists(t.entry.Path) || fileExists(t.unitPath)
-	if stateFiles {
-		if t.evidence.LoadState == "loaded" {
-			stopCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-			err := m.Systemd.Stop(stopCtx, t.entry.Service)
-			cancel()
-			if err != nil {
-				result.Message = "stop failed or timed out; nothing was archived"
-				return result, err
-			}
-			if err := m.Systemd.Disable(ctx, t.entry.Service); err != nil {
-				result.Message = "disable failed; nothing was archived"
-				return result, err
-			}
-		} else if t.evidence.LoadState == "not-found" {
-			if fileExists(t.unitPath) || fileExists(t.unitPath+".d") {
-				return result, errors.New("unit files appeared after the plan; repair required")
-			}
+	if state.unitLive || slices.Contains(state.duplicates, t.intent.UnitPath) {
+		stopCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+		err := m.Systemd.Stop(stopCtx, t.entry.Service)
+		cancel()
+		if err != nil {
+			result.Message = "stop failed or timed out; nothing was archived"
+			return result, err
+		}
+		if err := m.Systemd.Disable(ctx, t.entry.Service); err != nil {
+			result.Message = "disable failed; nothing was archived"
+			return result, err
 		}
 	}
-	moved := false
-	for _, path := range paths {
-		if !fileExists(path) {
+	for _, path := range state.duplicates {
+		if err := removeLiveDuplicate(path); err != nil {
+			return result, err
+		}
+	}
+	artifacts := []struct {
+		live bool
+		path string
+	}{
+		{state.profileLive, t.intent.ProfilePath},
+		{state.unitLive, t.intent.UnitPath},
+		{state.dropInsLive, t.intent.UnitPath + ".d"},
+		{state.markerLive, restartPendingPath(cfg, t.intent.Name)},
+	}
+	for _, artifact := range artifacts {
+		if !artifact.live {
 			continue
 		}
 		if err := os.MkdirAll(t.intent.ArchiveDir, 0o700); err != nil {
 			return result, err
 		}
-		if err := movePath(path, filepath.Join(t.intent.ArchiveDir, filepath.Base(path))); err != nil {
+		if err := movePath(artifact.path, filepath.Join(t.intent.ArchiveDir, filepath.Base(artifact.path))); err != nil {
 			return result, err
 		}
-		moved = true
 	}
-	if t.intent.HadUnit || (moved && t.evidence.LoadState == "loaded") {
+	postEvidence := evidence
+	if t.intent.HadUnit {
 		if err := m.Systemd.DaemonReload(ctx); err != nil {
 			return result, err
 		}
+		postEvidence, err = collectUnitEvidence(ctx, m, cfg, t.entry.Service, t.entry.Path)
+		if err != nil {
+			return result, err
+		}
+		if postEvidence.LoadState != "not-found" {
+			return result, fmt.Errorf("unit LoadState is %s after archive; repair required", postEvidence.LoadState)
+		}
+	}
+	post, err := inspectDeleteArtifacts(cfg, t.intent, postEvidence)
+	if err != nil {
+		return result, err
+	}
+	if post.anyLive() || len(post.duplicates) > 0 {
+		return result, errors.New("delete did not archive every artifact; repair required")
 	}
 	if t.force {
 		if _, err := m.ForceRemoveProfile(ctx, t.disk.Profile); err != nil {

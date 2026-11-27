@@ -867,10 +867,15 @@ func (m RunnerManager) ensureDir(ctx context.Context, path string) error {
 }
 
 func (m RunnerManager) writeNewManagedFile(_ context.Context, path string, data []byte, perm os.FileMode) error {
-	open := m.openNewFile
-	if open == nil {
-		open = os.OpenFile
+	if m.openNewFile == nil {
+		// Publish a fully written, fsynced temporary file without replacing an
+		// existing path. A crash cannot leave an empty or partial managed file.
+		if err := writeNewFileAtomic(filepath.Dir(path), filepath.Base(path), data, perm); err != nil {
+			return fmt.Errorf("create %q: %w", path, err)
+		}
+		return nil
 	}
+	open := m.openNewFile
 	f, err := open(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return fmt.Errorf("create %q: %w", path, err)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -206,17 +207,15 @@ func TestCLIAdoptAndDeleteJSON(t *testing.T) {
 	if writes := cliWriteCalls(f); len(writes) != 0 {
 		t.Fatalf("adopt called systemd write: %v", writes)
 	}
+	const service = "gha-p.service"
+	loaded := map[string]bool{service: true}
+	show := cliShowResponder(loaded, map[string]bool{service: true}, f)
 	f.respond = func(name string, args []string) ([]byte, error) {
-		switch {
-		case name == "systemctl" && args[0] == "show":
-			b := "LoadState=loaded\nActiveState=active\n"
-			b += "FragmentPath=" + filepath.Join(f.units, "gha-p.service") + "\n"
-			b += "ExecStart={ path=/bin/loop ; argv[]=/bin/loop --config " + filepath.Join(f.profiles, "p.yaml") + " ; ignore_errors=no }\n"
-			return []byte(b), nil
-		case name == "systemctl":
-			return []byte("ok\n"), nil
+		// systemd keeps the cached unit until it rereads the unit directory.
+		if name == "systemctl" && args[0] == "daemon-reload" {
+			loaded[service] = !errors.Is(checkNoFile(filepath.Join(f.units, service)), os.ErrNotExist)
 		}
-		return nil, nil
+		return show(name, args)
 	}
 	code, out, stderr = f.run(t, "delete", "p", "--owner", "fleet", "--json")
 	var deleted app.FleetReport
@@ -225,6 +224,11 @@ func TestCLIAdoptAndDeleteJSON(t *testing.T) {
 	}
 	if !errors.Is(checkNoFile(filepath.Join(f.profiles, "p.yaml")), os.ErrNotExist) {
 		t.Fatalf("profile remains")
+	}
+	if writes := cliWriteCalls(f); !reflect.DeepEqual(writes, [][]string{
+		{"systemctl", "stop", service}, {"systemctl", "disable", service}, {"systemctl", "daemon-reload"},
+	}) {
+		t.Fatalf("delete write calls: %v", writes)
 	}
 }
 
