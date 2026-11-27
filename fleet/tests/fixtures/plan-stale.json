@@ -1,0 +1,23 @@
+{
+  "phase": "plan",
+  "plan_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "complete": false,
+  "results": [
+    {
+      "name": "a-create",
+      "action": "create",
+      "restart_needed": true,
+      "outcome": "planned",
+      "restart": "none",
+      "message": ""
+    },
+    {
+      "name": "b-update-restart",
+      "action": "update",
+      "restart_needed": true,
+      "outcome": "planned",
+      "restart": "none",
+      "message": ""
+    }
+  ]
+}

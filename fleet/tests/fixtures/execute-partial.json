@@ -1,0 +1,47 @@
+{
+  "phase": "execute",
+  "plan_id": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "complete": false,
+  "results": [
+    {
+      "name": "a-create",
+      "action": "create",
+      "restart_needed": true,
+      "outcome": "done",
+      "restart": "queued",
+      "message": ""
+    },
+    {
+      "name": "b-update-restart",
+      "action": "update",
+      "restart_needed": true,
+      "outcome": "failed",
+      "restart": "failed",
+      "message": "systemctl restart --no-block failed"
+    },
+    {
+      "name": "c-update-format",
+      "action": "update",
+      "restart_needed": false,
+      "outcome": "not_run",
+      "restart": "none",
+      "message": "earlier profile failed"
+    },
+    {
+      "name": "d-unchanged",
+      "action": "unchanged",
+      "restart_needed": false,
+      "outcome": "not_run",
+      "restart": "none",
+      "message": "earlier profile failed"
+    },
+    {
+      "name": "e-restart",
+      "action": "restart",
+      "restart_needed": true,
+      "outcome": "not_run",
+      "restart": "none",
+      "message": "earlier profile failed"
+    }
+  ]
+}

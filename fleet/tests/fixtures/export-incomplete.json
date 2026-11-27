@@ -1,0 +1,17 @@
+{
+  "complete": false,
+  "profiles": [
+    {
+      "name": "alpha",
+      "path": "/etc/gha-runner-tui/profiles-live-20261117/alpha.yaml",
+      "owner": "fleet",
+      "yaml": "name: alpha\nservice:\n  name: alpha\nmanaged_by: fleet\n"
+    }
+  ],
+  "errors": [
+    {
+      "path": "/etc/gha-runner-tui/profiles-live-20261117/broken.yaml",
+      "error": "parse profile: yaml: mapping values are not allowed in this context"
+    }
+  ]
+}
