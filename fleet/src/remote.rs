@@ -270,10 +270,9 @@ pub fn stderr_tail(stderr: &str) -> Option<String> {
     stderr
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with("debug1:"))
-        .filter(|line| !line.starts_with("OpenSSH_"))
-        .next_back()
+        .rfind(|line| {
+            !line.is_empty() && !line.starts_with("debug1:") && !line.starts_with("OpenSSH_")
+        })
         .map(|line| line.chars().take(300).collect())
 }
 

@@ -143,5 +143,6 @@ GOLDEN_DIR=../src/cmd/gha-runner-tui/testdata/contract \
 The test decodes each Go golden with the center's contract types, checks the
 scenario's expected phase/exit code (an optional `<scenario>.exit` sidecar is
 honored), compares object schemas with our fixture, and drives the same golden
-through fake-ssh center flows. Without `GOLDEN_DIR` it uses the default path
-when present and otherwise skips.
+through fake-ssh center flows. The default path is used when `GOLDEN_DIR` is
+unset; either path must exist, and the test fails when it is missing instead of
+skipping.

@@ -1,7 +1,9 @@
 //! Cross-checks against T1's Go-generated contract goldens.
 //!
-//! Run the normal suite without these files (the test skips when the partner
-//! directory is absent). To run against the node PR's fixtures:
+//! The golden directory must exist; a missing default or `GOLDEN_DIR` fails
+//! the test instead of skipping it. The default is
+//! `../src/cmd/gha-runner-tui/testdata/contract` relative to this crate. To
+//! point at another checkout:
 //!
 //! ```text
 //! GOLDEN_DIR=../src/cmd/gha-runner-tui/testdata/contract cargo test --test golden_contract
@@ -92,29 +94,23 @@ fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn golden_dir() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("GOLDEN_DIR") {
-        let path = PathBuf::from(dir);
-        assert!(
-            path.is_dir(),
-            "GOLDEN_DIR={} does not exist; point it at src/cmd/gha-runner-tui/testdata/contract",
-            path.display()
-        );
-        return Some(path);
-    }
-    let default = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("fleet crate is inside the repo")
-        .join("src/cmd/gha-runner-tui/testdata/contract");
-    if default.is_dir() {
-        Some(default)
-    } else {
-        eprintln!(
-            "golden_contract: skipping; {} does not exist (T1 fixtures not present)",
-            default.display()
-        );
-        None
-    }
+fn golden_dir() -> PathBuf {
+    let (path, source) = match env::var("GOLDEN_DIR") {
+        Ok(dir) => (PathBuf::from(dir), "GOLDEN_DIR"),
+        Err(_) => (
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("fleet crate is inside the repo")
+                .join("src/cmd/gha-runner-tui/testdata/contract"),
+            "default golden directory",
+        ),
+    };
+    assert!(
+        path.is_dir(),
+        "{source} {} does not exist; T1 fixtures are required (set GOLDEN_DIR to src/cmd/gha-runner-tui/testdata/contract)",
+        path.display()
+    );
+    path
 }
 
 fn local_fixture(scenario: &str) -> Value {
@@ -496,9 +492,12 @@ fn run_center_flow(_dir: &Path, expectation: &Expectation, golden: &Value) {
 
 #[test]
 fn go_goldens_decode_and_meet_contract_expectations() {
-    let Some(dir) = golden_dir() else {
-        return;
-    };
+    let dir = golden_dir();
+    println!(
+        "golden_contract: checking {} scenarios in {}",
+        EXPECTATIONS.len(),
+        dir.display()
+    );
     for expectation in EXPECTATIONS {
         let scenario = expectation.scenario;
         let path = dir.join(format!("{scenario}.json"));
@@ -537,5 +536,9 @@ fn go_goldens_decode_and_meet_contract_expectations() {
         compare_schema(&ours, &decoded)
             .unwrap_or_else(|e| panic!("{scenario}: local fixture and golden schema differ: {e}"));
         run_center_flow(&dir, expectation, &golden);
+        println!(
+            "golden_contract: {scenario} ok (exit {}, decode/schema/flow verified)",
+            expectation.exit_code
+        );
     }
 }
