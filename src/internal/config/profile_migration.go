@@ -61,6 +61,13 @@ func migrateProfiles(dir string, migrate func(string) (ProfileMigrationResult, e
 
 	results := make([]ProfileMigrationResult, 0, len(files))
 	for _, path := range files {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			if fleet, parseErr := fleetManagedRaw(raw); parseErr == nil && fleet {
+				results = append(results, ProfileMigrationResult{Path: path, Status: ProfileMigrationSkipped, Message: "managed by fleet; local migration skipped"})
+				continue
+			}
+		}
 		result, err := migrate(path)
 		if err != nil {
 			results = append(results, ProfileMigrationResult{
@@ -77,10 +84,25 @@ func migrateProfiles(dir string, migrate func(string) (ProfileMigrationResult, e
 	return results, nil
 }
 
+// fleetManagedRaw reports whether a profile is owned by the fleet center. A
+// parse failure is not treated as fleet: the migration itself reports it.
+func fleetManagedRaw(raw []byte) (bool, error) {
+	var probe struct {
+		ManagedBy string `yaml:"managed_by"`
+	}
+	if err := yaml.Unmarshal(raw, &probe); err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(probe.ManagedBy) == ManagedByFleet, nil
+}
+
 func MigrateProfileAccessMode(path string) (ProfileMigrationResult, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return ProfileMigrationResult{}, err
+	}
+	if fleet, parseErr := fleetManagedRaw(raw); parseErr == nil && fleet {
+		return ProfileMigrationResult{Path: path, Status: ProfileMigrationSkipped, Message: "managed by fleet; local migration skipped"}, nil
 	}
 
 	var profile Profile
@@ -157,6 +179,9 @@ func MigrateProfileGitHubConfig(path string, defaults GitHubProfile) (ProfileMig
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return ProfileMigrationResult{}, err
+	}
+	if fleet, parseErr := fleetManagedRaw(raw); parseErr == nil && fleet {
+		return ProfileMigrationResult{Path: path, Status: ProfileMigrationSkipped, Message: "managed by fleet; local migration skipped"}, nil
 	}
 
 	var doc yaml.Node
