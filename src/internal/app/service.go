@@ -43,6 +43,7 @@ type ProfileSnapshot struct {
 	GitHubState      state.GitHubStatus
 	BusyState        state.BusyStatus
 	Health           state.CombinedHealth
+	RestartPending   bool
 	Errors           []string
 	DisplayLoopState state.LoopStatus
 }
@@ -62,6 +63,9 @@ type Service struct {
 	Systemd          SystemdClient
 	Docker           DockerClient
 	GitHubForProfile func(config.GlobalConfig, config.Profile) GitHubClient
+	// NoGitHub disables every GitHub request for status. GitHub and busy
+	// values report skipped; health uses local evidence only.
+	NoGitHub bool
 }
 
 func (s Service) LoadDashboard(ctx context.Context) (Dashboard, error) {
@@ -124,8 +128,9 @@ func (s Service) loadProfile(ctx context.Context, cfg config.GlobalConfig, profi
 		Container: dockerpkg.ContainerInfo{
 			State: state.ContainerNone,
 		},
-		GitHubState: state.GitHubUnknown,
-		BusyState:   state.BusyUnknown,
+		GitHubState:    state.GitHubUnknown,
+		BusyState:      state.BusyUnknown,
+		RestartPending: RestartPending(cfg, profile.Name),
 	}
 	var matchedContainers []dockerpkg.ContainerInfo
 	admission, admissionErr := state.LoadAdmissionPolicy(profile.Loop.StateFile)
@@ -167,11 +172,16 @@ func (s Service) loadProfile(ctx context.Context, cfg config.GlobalConfig, profi
 	}
 
 	var github GitHubClient
-	if s.GitHubForProfile != nil {
-		github = s.GitHubForProfile(cfg, profile)
-	}
-	if github == nil {
-		snapshot.Errors = append(snapshot.Errors, "github: profile client is not configured")
+	if s.NoGitHub {
+		snapshot.GitHubState = state.GitHubSkipped
+		snapshot.BusyState = state.BusySkipped
+	} else {
+		if s.GitHubForProfile != nil {
+			github = s.GitHubForProfile(cfg, profile)
+		}
+		if github == nil {
+			snapshot.Errors = append(snapshot.Errors, "github: profile client is not configured")
+		}
 	}
 	if github != nil {
 		target, targetErr := profile.ResolveTarget()

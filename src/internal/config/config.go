@@ -48,6 +48,9 @@ type PathsConfig struct {
 type SystemdConfig struct {
 	ServicePrefix  string `yaml:"service_prefix"`
 	LoopBinaryPath string `yaml:"loop_binary_path"`
+	// UnitTemplate is an optional path to a text/template file for new units.
+	// Empty selects the embedded template.
+	UnitTemplate string `yaml:"unit_template,omitempty"`
 }
 
 type DockerConfig struct {

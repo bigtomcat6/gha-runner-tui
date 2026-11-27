@@ -1,0 +1,1 @@
+{"phase":"plan","plan_id":"sha256:4444444444444444444444444444444444444444444444444444444444444444","complete":false,"results":[{"name":"p","action":"conflict","restart_needed":false,"outcome":"planned","restart":"none","message":"profile belongs to local; use adopt first"}]}

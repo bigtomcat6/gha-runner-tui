@@ -1,0 +1,1 @@
+{"complete":false,"profiles":[{"name":"a","path":"/etc/gha-runner-tui/profiles-live-20261117/a.yaml","owner":"fleet","yaml":"name: a\n"}],"errors":[{"path":"/etc/gha-runner-tui/profiles-live-20261117/b.yaml","error":"yaml: line 1: did not find expected node content"}]}

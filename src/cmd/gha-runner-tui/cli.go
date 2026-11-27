@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -20,6 +21,8 @@ import (
 
 const defaultConfigPath = "/etc/gha-runner-tui/config.yaml"
 const defaultUnitDir = "/etc/systemd/system"
+
+func defaultStdin() io.Reader { return os.Stdin }
 
 func parseInterspersed(fs *flag.FlagSet, args []string) error {
 	var flagArgs, positionals []string
@@ -56,6 +59,14 @@ func parseInterspersed(fs *flag.FlagSet, args []string) error {
 }
 
 func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeManager func(string, string) app.RunnerManager) int {
+	return runCLIWithInput(ctx, args, defaultStdin(), stdout, stderr, makeManager)
+}
+
+func runCLIWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, makeManager func(string, string) app.RunnerManager) int {
+	return runCommandWithInput(ctx, args, stdin, stdout, stderr, makeManager)
+}
+
+func runCommandWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, makeManager func(string, string) app.RunnerManager) int {
 	if len(args) == 0 {
 		return writeArgumentError(stderr, errors.New("command is required"))
 	}
@@ -79,6 +90,8 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", defaultConfigPath, "Path to global config file")
 	var jsonOutput, dockerLogs, force bool
+	var noGitHub, dryRun, prune, noStart bool
+	var owner, match, expectPlan, bundleFile string
 	tail := 200
 	input := app.CreateProfileInput{Scope: config.TargetScopeRepository, Ephemeral: true}
 	var scope, labels, watch string
@@ -87,17 +100,24 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 	switch cmd {
 	case "status":
 		fs.BoolVar(&jsonOutput, "json", false, "Output JSON")
+		fs.BoolVar(&noGitHub, "no-github", false, "Do not call GitHub")
 	case "logs":
 		wantArgs = 1
 		fs.BoolVar(&dockerLogs, "docker", false, "Read container logs")
 		fs.IntVar(&tail, "n", 200, "Number of lines")
 	case "start", "restart":
 		wantArgs = 1
+		fs.BoolVar(&jsonOutput, "json", false, "Output JSON")
+		fs.StringVar(&match, "match", "", "Profile name glob")
 	case "stop":
 		wantArgs = 1
+		fs.BoolVar(&jsonOutput, "json", false, "Output JSON")
+		fs.StringVar(&match, "match", "", "Profile name glob")
 		fs.BoolVar(&force, "force", false, "Remove slot holders; running jobs will fail")
 	case "mode":
 		fs.IntVar(&admission.DelaySeconds, "delay-seconds", 60, "Fallback grace period (mode 2 only)")
+		fs.BoolVar(&jsonOutput, "json", false, "Output JSON")
+		fs.StringVar(&match, "match", "", "Profile name glob")
 	case "create":
 		fs.StringVar(&scope, "scope", "repository", "repository or organization")
 		fs.StringVar(&input.RepoOwner, "owner", "", "Repository owner")
@@ -115,6 +135,27 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 		fs.StringVar(&input.GitHubEnvFile, "github-env-file", "", "GitHub environment file path")
 		fs.StringVar(&watch, "watch", "", "Comma-separated owner/repo watch list")
 		fs.BoolVar(&input.NoStart, "no-start", false, "Do not start the new unit")
+	case "export":
+		fs.StringVar(&owner, "owner", "all", "local, fleet, or all")
+		fs.BoolVar(&jsonOutput, "json", false, "Output JSON")
+	case "adopt":
+		fs.StringVar(&owner, "owner", "", "local or fleet")
+		fs.StringVar(&match, "match", "", "Profile name glob")
+		fs.BoolVar(&dryRun, "dry-run", false, "Only print the plan")
+		fs.StringVar(&expectPlan, "expect-plan", "", "Approve exactly this plan_id")
+		fs.BoolVar(&jsonOutput, "json", false, "Output JSON")
+	case "delete":
+		fs.StringVar(&owner, "owner", "local", "local or fleet")
+		fs.BoolVar(&force, "force", false, "Also remove running slot holders")
+		fs.BoolVar(&jsonOutput, "json", false, "Output JSON")
+	case "apply":
+		fs.StringVar(&bundleFile, "f", "", "Bundle file, or - for stdin")
+		fs.StringVar(&owner, "owner", "local", "local or fleet")
+		fs.BoolVar(&prune, "prune", false, "Delete fleet profiles absent from the bundle")
+		fs.BoolVar(&dryRun, "dry-run", false, "Only print the plan")
+		fs.StringVar(&expectPlan, "expect-plan", "", "Approve exactly this plan_id")
+		fs.BoolVar(&noStart, "no-start", false, "Create profiles without starting units")
+		fs.BoolVar(&jsonOutput, "json", false, "Output JSON")
 	case "migrate", "version":
 	default:
 		return writeArgumentError(stderr, fmt.Errorf("unknown command: %s", cmd))
@@ -123,8 +164,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 		return writeArgumentError(stderr, err)
 	}
 	if cmd == "mode" {
-		if fs.NArg() != 1 && fs.NArg() != 2 {
-			return writeArgumentError(stderr, errors.New("usage: mode PROFILE [0|1|2] [--delay-seconds N]"))
+		maxArgs := 2
+		if match != "" {
+			maxArgs = 1
+		}
+		if fs.NArg() > maxArgs {
+			return writeArgumentError(stderr, errors.New("usage: mode PROFILE [0|1|2] [--delay-seconds N] [--match GLOB]"))
 		}
 		delaySet := false
 		fs.Visit(func(f *flag.Flag) {
@@ -132,8 +177,14 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 				delaySet = true
 			}
 		})
+		modeArg := -1
 		if fs.NArg() == 2 {
-			mode, err := strconv.Atoi(fs.Arg(1))
+			modeArg = 1
+		} else if fs.NArg() == 1 && match != "" {
+			modeArg = 0
+		}
+		if modeArg >= 0 {
+			mode, err := strconv.Atoi(fs.Arg(modeArg))
 			if err != nil {
 				return writeArgumentError(stderr, errors.New("mode must be 0, 1, or 2"))
 			}
@@ -142,17 +193,66 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 				return writeArgumentError(stderr, err)
 			}
 		}
-		if delaySet && (fs.NArg() != 2 || admission.Mode != state.AdmissionDelayed) {
+		if delaySet && (modeArg == -1 || admission.Mode != state.AdmissionDelayed) {
 			return writeArgumentError(stderr, errors.New("--delay-seconds requires mode 2"))
 		}
+	} else if cmd == "export" || cmd == "adopt" {
+		// Names are optional; --match selects adopt targets.
+	} else if cmd == "apply" {
+		if fs.NArg() != 0 {
+			return writeArgumentError(stderr, errors.New("apply takes no positional arguments; use -f"))
+		}
+		if bundleFile != "" && (bundleFile == "-" && stdin == nil) {
+			return writeArgumentError(stderr, errors.New("apply -f - requires stdin"))
+		}
+	} else if cmd == "delete" {
+		if fs.NArg() != 1 {
+			return writeArgumentError(stderr, errors.New("delete requires 1 profile name"))
+		}
 	} else if fs.NArg() != wantArgs {
-		return writeArgumentError(stderr, fmt.Errorf("%s requires %d positional argument(s)", cmd, wantArgs))
+		if match == "" || (cmd != "start" && cmd != "stop" && cmd != "restart") || fs.NArg() != 0 {
+			return writeArgumentError(stderr, fmt.Errorf("%s requires %d positional argument(s)", cmd, wantArgs))
+		}
 	}
-	if (wantArgs == 1 || cmd == "mode") && strings.TrimSpace(fs.Arg(0)) == "" {
+	if cmd == "mode" {
+		if match == "" && fs.NArg() == 0 {
+			return writeArgumentError(stderr, errors.New("usage: mode PROFILE [0|1|2] [--delay-seconds N]"))
+		}
+	} else if cmd == "start" || cmd == "stop" || cmd == "restart" {
+		if match == "" && fs.NArg() == 0 {
+			return writeArgumentError(stderr, fmt.Errorf("%s requires %d positional argument(s)", cmd, wantArgs))
+		}
+		if match != "" && fs.NArg() > 0 {
+			return writeArgumentError(stderr, errors.New("use a profile name or --match, not both"))
+		}
+	}
+	if cmd == "stop" && match != "" && force {
+		return writeArgumentError(stderr, errors.New("stop --match does not allow --force"))
+	}
+	if cmd == "delete" && strings.TrimSpace(fs.Arg(0)) == "" {
+		return writeArgumentError(stderr, errors.New("profile name is required"))
+	}
+	if (wantArgs == 1 || cmd == "mode") && match == "" && fs.NArg() > 0 && strings.TrimSpace(fs.Arg(0)) == "" {
 		return writeArgumentError(stderr, errors.New("profile name is required"))
 	}
 	if tail < 0 {
 		return writeArgumentError(stderr, errors.New("logs -n must not be negative"))
+	}
+	if cmd == "apply" && bundleFile == "" {
+		return writeArgumentError(stderr, errors.New("apply requires -f PATH|-"))
+	}
+	if cmd == "adopt" {
+		if owner != config.ManagedByLocal && owner != config.ManagedByFleet {
+			return writeArgumentError(stderr, errors.New("adopt requires --owner local|fleet"))
+		}
+	} else if cmd == "export" {
+		if owner != "all" && owner != config.ManagedByLocal && owner != config.ManagedByFleet {
+			return writeArgumentError(stderr, errors.New("--owner must be local, fleet, or all"))
+		}
+	} else if cmd == "apply" || cmd == "delete" {
+		if owner != config.ManagedByLocal && owner != config.ManagedByFleet {
+			return writeArgumentError(stderr, errors.New("--owner must be local or fleet"))
+		}
 	}
 	if cmd == "create" {
 		input.Scope = config.TargetScope(scope)
@@ -170,6 +270,7 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 	m := makeManager(*configPath, defaultUnitDir)
 	switch cmd {
 	case "status":
+		m.Service.NoGitHub = noGitHub
 		d, err := m.Dashboard(ctx)
 		if err != nil {
 			return writeOperationError(stderr, err)
@@ -194,63 +295,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 			return writeOperationError(stderr, err)
 		}
 		return 0
-	}
-	p, err := m.LookupProfile(fs.Arg(0))
-	if err != nil {
-		return writeOperationError(stderr, err)
-	}
-	snapshot := app.ProfileSnapshot{Profile: p}
-	switch cmd {
-	case "mode":
-		if fs.NArg() == 2 {
-			if err := state.SaveAdmissionPolicy(p.Loop.StateFile, admission); err != nil {
-				return writeOperationError(stderr, fmt.Errorf("set mode (run with sudo if permission is denied): %w", err))
-			}
-		} else {
-			admission, err = state.LoadAdmissionPolicy(p.Loop.StateFile)
-			if err != nil {
-				return writeOperationError(stderr, err)
-			}
-		}
-		return writeCLIText(stdout, stderr, fmt.Sprintf("profile %s: mode=%d delay=%ds (0=paused, 1=normal, 2=delayed)\n", p.Name, admission.Mode, admission.DelaySeconds))
-	case "start":
-		err = m.StartLoop(ctx, p)
-	case "restart":
-		err = m.RestartLoop(ctx, snapshot)
-	case "stop":
-		if err := m.StopLoop(ctx, snapshot); err != nil {
-			return writeOperationError(stderr, err)
-		}
-		holders, err := m.ProfileSlotHolders(ctx, p)
+	case "logs":
+		p, err := m.LookupProfile(fs.Arg(0))
 		if err != nil {
 			return writeOperationError(stderr, err)
 		}
-		if force {
-			if _, err := fmt.Fprintln(stderr, "WARNING: 正在跑的 job 会失败"); err != nil {
-				return 1
-			}
-			removed, err := m.ForceRemoveProfile(ctx, p)
-			if err != nil {
-				return writeOperationError(stderr, err)
-			}
-			for _, name := range removed {
-				if code := writeCLIText(stdout, stderr, "removed container "+name+"\n"); code != 0 {
-					return code
-				}
-			}
-		} else {
-			for _, holder := range holders {
-				message := fmt.Sprintf("%s %s (container %s): 占槽", p.Name, holder.State, holder.Name)
-				// A created container occupies the slot but has not started a job.
-				if holder.State != state.ContainerCreated {
-					message += "; 仍在跑 job，跑完后自动退出"
-				}
-				if code := writeCLIText(stdout, stderr, message+"\n"); code != 0 {
-					return code
-				}
-			}
-		}
-	case "logs":
+		snapshot := app.ProfileSnapshot{Profile: p}
 		var text string
 		if dockerLogs {
 			snapshot.Loop, _ = state.LoadLoopState(p.Loop.StateFile)
@@ -262,11 +312,79 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, makeMa
 			return writeOperationError(stderr, err)
 		}
 		return writeCLIText(stdout, stderr, text)
+	case "export":
+		report, err := m.Export(ctx, app.ExportInput{Names: fs.Args(), Owner: owner})
+		if report.Profiles == nil {
+			report.Profiles = []app.ExportEntry{}
+		}
+		if report.Errors == nil {
+			report.Errors = []app.ExportError{}
+		}
+		if jsonOutput {
+			if code := writeFleetJSON(stdout, stderr, report); code != 0 {
+				return code
+			}
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				if errors.Is(err, app.ErrFleetInput) {
+					return 2
+				}
+				return 1
+			}
+			if !report.Complete {
+				return 1
+			}
+			return 0
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			if errors.Is(err, app.ErrFleetInput) {
+				return 2
+			}
+			return 1
+		}
+		for _, p := range report.Profiles {
+			fmt.Fprintf(stdout, "%s\t%s\t%s\n", p.Name, p.Owner, p.Path)
+		}
+		for _, e := range report.Errors {
+			fmt.Fprintf(stderr, "%s: %s\n", e.Path, e.Error)
+		}
+		if !report.Complete {
+			return 1
+		}
+		return 0
+	case "adopt":
+		report, err := m.Adopt(ctx, app.AdoptInput{Names: fs.Args(), Match: match, Owner: owner, DryRun: dryRun, ExpectPlan: expectPlan})
+		return finishFleetReport(ctx, stdout, stderr, report, err, jsonOutput, func() error {
+			for _, r := range report.Results {
+				fmt.Fprintf(stdout, "%s\t%s\t%s\n", r.Name, r.Action, r.Message)
+			}
+			return nil
+		})
+	case "apply":
+		bundle, readErr := readApplyBundle(stdin, bundleFile)
+		if readErr != nil {
+			return writeArgumentError(stderr, readErr)
+		}
+		report, err := m.Apply(ctx, app.ApplyInput{Bundle: bundle, Owner: owner, Prune: prune, DryRun: dryRun, ExpectPlan: expectPlan, NoStart: noStart})
+		return finishFleetReport(ctx, stdout, stderr, report, err, jsonOutput, func() error {
+			fmt.Fprintf(stdout, "phase=%s plan_id=%s complete=%t\n", report.Phase, report.PlanID, report.Complete)
+			for _, r := range report.Results {
+				fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\n", r.Name, r.Action, r.Restart, r.Outcome, r.Message)
+			}
+			return nil
+		})
+	case "delete":
+		report, err := m.Delete(ctx, app.DeleteInput{Name: fs.Arg(0), Owner: owner, Force: force})
+		return finishFleetReport(ctx, stdout, stderr, report, err, jsonOutput, func() error {
+			fmt.Fprintf(stdout, "phase=%s plan_id=%s complete=%t\n", report.Phase, report.PlanID, report.Complete)
+			for _, r := range report.Results {
+				fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", r.Name, r.Action, r.Outcome, r.Message)
+			}
+			return nil
+		})
 	}
-	if err != nil {
-		return writeOperationError(stderr, err)
-	}
-	return writeCLIText(stdout, stderr, fmt.Sprintf("%s profile %s (unit %s)\n", cmd, p.Name, p.Service.Name))
+	return runRuntimeCLI(ctx, m, cmd, match, jsonOutput, force, admission, fs, stdout, stderr)
 }
 
 func splitCSV(value string) []string {
@@ -401,8 +519,9 @@ func writeStatus(w io.Writer, d app.Dashboard, jsonOutput bool) error {
 				State state.GitHubStatus `json:"state"`
 				Busy  state.BusyStatus   `json:"busy"`
 			} `json:"github"`
-			Health state.CombinedHealth `json:"health"`
-			Errors []string             `json:"errors"`
+			Health         state.CombinedHealth `json:"health"`
+			RestartPending bool                 `json:"restart_pending"`
+			Errors         []string             `json:"errors"`
 		}
 		type profileErrorDTO struct {
 			Path  string `json:"path"`
@@ -419,6 +538,7 @@ func writeStatus(w io.Writer, d app.Dashboard, jsonOutput bool) error {
 		}
 		for _, p := range d.Profiles {
 			item := profileDTO{Name: p.Profile.Name, Admission: p.Admission, Health: p.Health, Errors: append([]string{}, p.Errors...)}
+			item.RestartPending = p.RestartPending
 			item.Service.Active, item.Service.Enabled = p.Service.Active, p.Service.Enabled
 			item.Loop.State, item.Loop.LastError = p.DisplayLoopState, p.Loop.LastError
 			if !p.Loop.LastTransitionAt.IsZero() {

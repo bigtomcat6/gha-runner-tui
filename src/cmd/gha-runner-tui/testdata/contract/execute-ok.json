@@ -1,0 +1,1 @@
+{"phase":"execute","plan_id":"sha256:1111111111111111111111111111111111111111111111111111111111111111","complete":true,"results":[{"name":"a","action":"update","restart_needed":true,"outcome":"done","restart":"queued","message":""}]}
