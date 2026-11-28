@@ -142,6 +142,122 @@ fn apply_preview_and_execute_reuse_the_same_plan_id_and_bundle() {
 }
 
 #[test]
+fn apply_create_only_executes_create_and_unchanged_with_the_preview_plan_id() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    let plan_id = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let preview = format!(
+        r#"{{
+          "phase": "plan",
+          "plan_id": "{plan_id}",
+          "complete": false,
+          "results": [
+            {{"name": "a-create", "action": "create", "restart_needed": true,
+             "outcome": "planned", "restart": "none", "message": ""}},
+            {{"name": "b-unchanged", "action": "unchanged", "restart_needed": false,
+             "outcome": "planned", "restart": "none", "message": ""}}
+          ]
+        }}"#
+    );
+    let execute = format!(
+        r#"{{
+          "phase": "execute",
+          "plan_id": "{plan_id}",
+          "complete": true,
+          "results": [
+            {{"name": "a-create", "action": "create", "restart_needed": true,
+             "outcome": "done", "restart": "queued", "message": ""}},
+            {{"name": "b-unchanged", "action": "unchanged", "restart_needed": false,
+             "outcome": "done", "restart": "none", "message": ""}}
+          ]
+        }}"#
+    );
+    env.write_profile(
+        "s1",
+        "a-create",
+        "name: a-create\nservice:\n  name: a-create\nmanaged_by: fleet\n",
+    )
+    .write_response("s1", "apply.preview", &preview)
+    .write_response("s1", "apply.execute", &execute);
+
+    let output = env.run_yes(&["apply", "--create-only", "--yes", "--host", "s1"], &[]);
+    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains(&format!("s1: plan {plan_id}")), "{text}");
+    assert!(
+        text.contains("s1: applied (1 create, 1 unchanged)"),
+        "{text}"
+    );
+
+    let log = env.argv_log("s1");
+    assert_eq!(log.matches("CALL s1.apply.preview").count(), 1, "{log}");
+    assert_eq!(log.matches("CALL s1.apply.execute").count(), 1, "{log}");
+    assert!(
+        log.contains(&format!("ARG '--expect-plan'\nARG '{plan_id}'")),
+        "execute must reuse the preview plan_id:\n{log}"
+    );
+    assert!(!log.contains("ARG '--create-only'"), "{log}");
+
+    let preview_stdin = env.actual_stdin("s1", "apply.preview");
+    let execute_stdin = env.actual_stdin("s1", "apply.execute");
+    assert_eq!(preview_stdin, execute_stdin);
+    assert!(preview_stdin.contains("name: a-create"));
+}
+
+#[test]
+fn apply_create_only_refuses_other_actions_and_executes_nothing() {
+    let env = TestEnv::new(vec![FakeHost::new("s1"), FakeHost::new("s2")]);
+    env.write_profile(
+        "s1",
+        "a-create",
+        "name: a-create\nservice:\n  name: a-create\nmanaged_by: fleet\n",
+    )
+    .write_profile(
+        "s2",
+        "a",
+        "name: a\nservice:\n  name: a\nmanaged_by: fleet\n",
+    )
+    .write_response_file("s1", "apply.preview", &common::fixture("plan-mixed.json"))
+    .write_response_file(
+        "s2",
+        "apply.preview",
+        &common::fixture("plan-conflict.json"),
+    );
+
+    let output = env.run_yes(&["apply", "--create-only", "--yes"], &[]);
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    let err = stderr(&output);
+    assert!(err.contains("refusing --create-only"), "{err}");
+    let text = stdout(&output);
+    assert!(text.contains("s1: b-update-restart: update"), "{text}");
+    assert!(text.contains("s1: c-update-format: update"), "{text}");
+    assert!(text.contains("s1: e-restart: restart"), "{text}");
+    assert!(text.contains("s2: a-conflict: conflict"), "{text}");
+    assert!(!text.contains("s1: a-create: create"), "{text}");
+    for host in ["s1", "s2"] {
+        let log = env.argv_log(host);
+        assert!(
+            !log.contains("apply.execute"),
+            "{host} must not execute:\n{log}"
+        );
+    }
+}
+
+#[test]
+fn apply_create_only_with_prune_is_refused_by_argument_parsing() {
+    let env = TestEnv::new(vec![FakeHost::new("s1")]);
+    for args in [
+        vec!["apply", "--create-only", "--prune", "--host", "s1"],
+        vec!["apply", "--prune", "--create-only", "--host", "s1"],
+    ] {
+        let output = env.run_yes(&args, &[]);
+        assert_eq!(code(&output), 2, "args {args:?}: {}", stderr(&output));
+        let err = stderr(&output);
+        assert!(err.contains("--create-only with --prune"), "{err}");
+    }
+    assert!(env.argv_log("s1").is_empty());
+}
+
+#[test]
 fn plan_stale_is_rejected_without_retry() {
     let env = TestEnv::new(vec![FakeHost::new("s1")]);
     env.write_profile(

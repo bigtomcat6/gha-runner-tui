@@ -992,6 +992,35 @@ fn eligible_apply(previews: &[(String, PlanPreview)]) -> Vec<(String, String)> {
         .collect()
 }
 
+struct CreateOnlyOffender {
+    host: String,
+    profile: String,
+    action: String,
+}
+
+/// `--create-only` accepts only plans whose every action is `create` or
+/// `unchanged`. Conflict/error plans are classified as `Rejected`, so both
+/// preview variants must be inspected or those rows would be missed.
+fn create_only_offenders(previews: &[(String, PlanPreview)]) -> Vec<CreateOnlyOffender> {
+    let mut offenders = Vec::new();
+    for (host, preview) in previews {
+        let plan = match preview {
+            PlanPreview::Ok(plan) | PlanPreview::Rejected(plan, _) => plan,
+            _ => continue,
+        };
+        for result in &plan.results {
+            if !matches!(result.action.as_str(), "create" | "unchanged") {
+                offenders.push(CreateOnlyOffender {
+                    host: host.clone(),
+                    profile: result.name.clone(),
+                    action: result.action.clone(),
+                });
+            }
+        }
+    }
+    offenders
+}
+
 fn confirm(ctx: &Context, action: &str, hosts: &[String]) -> Result<bool, i32> {
     if hosts.is_empty() {
         return Ok(true);
@@ -1018,7 +1047,13 @@ fn confirm(ctx: &Context, action: &str, hosts: &[String]) -> Result<bool, i32> {
     ))
 }
 
-pub fn apply(ctx: &Context, hosts: &[HostConfig], prune: bool, yes: bool) -> i32 {
+pub fn apply(
+    ctx: &Context,
+    hosts: &[HostConfig],
+    prune: bool,
+    create_only: bool,
+    yes: bool,
+) -> i32 {
     let (prepared, empty) = match read_bundles(ctx, hosts, prune) {
         Ok(value) => value,
         Err(message) => {
@@ -1035,6 +1070,22 @@ pub fn apply(ctx: &Context, hosts: &[HostConfig], prune: bool, yes: bool) -> i32
     });
     for (name, preview) in &previews {
         print_preview(name, preview);
+    }
+    if create_only {
+        let offenders = create_only_offenders(&previews);
+        if !offenders.is_empty() {
+            eprintln!(
+                "gha-fleet: refusing --create-only: every planned action must be create or \
+                 unchanged; nothing was executed"
+            );
+            for offender in &offenders {
+                println!(
+                    "  {}: {}: {}",
+                    offender.host, offender.profile, offender.action
+                );
+            }
+            return 1;
+        }
     }
     let preview_failures = preview_exit(&previews);
     let eligible = eligible_apply(&previews);

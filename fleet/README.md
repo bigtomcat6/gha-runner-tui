@@ -65,11 +65,14 @@ host. Runtime and adopt `--match` values are limited to
   node `plan_id`. Hosts without expected-state files are skipped. An empty or
   missing directory plus `--prune` refuses the whole run because an empty
   bundle would delete every fleet profile on the node.
-- `apply [--prune] [--yes]` — previews every host, prints all plans, asks once
-  for confirmation, then executes only hosts whose preview was accepted and
-  had changes, passing the exact preview `plan_id` and reusing the same
-  in-memory bundle and flags. Without a terminal and without `--yes` it exits
-  2 before executing.
+- `apply [--prune] [--create-only] [--yes]` — previews every host, prints all
+  plans, asks once for confirmation, then executes only hosts whose preview was
+  accepted and had changes, passing the exact preview `plan_id` and reusing the
+  same in-memory bundle and flags. Without a terminal and without `--yes` it
+  exits 2 before executing. `--create-only` refuses the whole run (exit 1, no
+  execute) unless every previewed action is `create` or `unchanged`, and lists
+  the offending host/profile/action pairs. It cannot be combined with `--prune`
+  (argument error, exit 2).
 - `adopt --match GLOB [--owner fleet|local] [--yes]` — same preview/execute
   flow for ownership-only changes. Previews are `adopt --dry-run`; execution
   uses the preview plan id. It never triggers a restart.
