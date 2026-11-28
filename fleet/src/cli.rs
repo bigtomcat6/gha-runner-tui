@@ -20,7 +20,7 @@ Usage: gha-fleet <command> [options]
 Commands:
   status [--host H]... [--json] [--cached]
   plan [--host H]... [--prune]
-  apply [--host H]... [--prune] [--yes]
+  apply [--host H]... [--prune] [--create-only] [--yes]
   adopt --match GLOB [--host H]... [--owner fleet|local] [--yes]
   import [--host H]... [--force]
   mode --match GLOB <0|1|2> [--delay-seconds N] [--host H]...
@@ -50,6 +50,7 @@ enum Command {
     },
     Apply {
         prune: bool,
+        create_only: bool,
         yes: bool,
     },
     Adopt {
@@ -135,7 +136,11 @@ pub fn run() -> i32 {
             }
         }
         Command::Plan { prune } => commands::plan(&ctx, &selected, prune),
-        Command::Apply { prune, yes } => commands::apply(&ctx, &selected, prune, yes),
+        Command::Apply {
+            prune,
+            create_only,
+            yes,
+        } => commands::apply(&ctx, &selected, prune, create_only, yes),
         Command::Adopt { glob, owner, yes } => commands::adopt(&ctx, &selected, &glob, &owner, yes),
         Command::Import { force } => commands::import(&ctx, &selected, force),
         Command::Runtime {
@@ -155,6 +160,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut json = false;
     let mut cached = false;
     let mut prune = false;
+    let mut create_only = false;
     let mut yes = false;
     let mut force = false;
     let mut glob: Option<String> = None;
@@ -204,6 +210,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             prune = true;
             continue;
         }
+        if arg == "--create-only" {
+            create_only = true;
+            continue;
+        }
         if arg == "--yes" {
             yes = true;
             continue;
@@ -250,7 +260,13 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let dir = dir.unwrap_or_else(default_dir);
     let command = match command_name.as_str() {
         "status" => {
-            if prune || yes || force || glob.is_some() || owner.is_some() || delay_seconds.is_some()
+            if prune
+                || create_only
+                || yes
+                || force
+                || glob.is_some()
+                || owner.is_some()
+                || delay_seconds.is_some()
             {
                 return Err("status does not accept plan/apply/adopt options".into());
             }
@@ -262,6 +278,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         "plan" => {
             if json
                 || cached
+                || create_only
                 || yes
                 || force
                 || glob.is_some()
@@ -276,6 +293,9 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             Command::Plan { prune }
         }
         "apply" => {
+            if create_only && prune {
+                return Err("apply does not accept --create-only with --prune".into());
+            }
             if json
                 || cached
                 || force
@@ -283,15 +303,19 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 || owner.is_some()
                 || delay_seconds.is_some()
             {
-                return Err("apply accepts only --host, --prune and --yes".into());
+                return Err("apply accepts only --host, --prune, --create-only and --yes".into());
             }
             if !positionals.is_empty() {
                 return Err("apply does not accept positional arguments".into());
             }
-            Command::Apply { prune, yes }
+            Command::Apply {
+                prune,
+                create_only,
+                yes,
+            }
         }
         "adopt" => {
-            if json || cached || prune || force || delay_seconds.is_some() {
+            if json || cached || prune || create_only || force || delay_seconds.is_some() {
                 return Err("adopt accepts only --host, --match, --owner and --yes".into());
             }
             if !positionals.is_empty() {
@@ -309,6 +333,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             if json
                 || cached
                 || prune
+                || create_only
                 || yes
                 || glob.is_some()
                 || owner.is_some()
@@ -322,7 +347,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             Command::Import { force }
         }
         "mode" => {
-            if json || cached || prune || yes || force || owner.is_some() {
+            if json || cached || prune || create_only || yes || force || owner.is_some() {
                 return Err("mode accepts only --host, --match and --delay-seconds".into());
             }
             let glob = glob.ok_or_else(|| "mode requires --match GLOB".to_string())?;
@@ -347,7 +372,14 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
         }
         "start" | "stop" | "restart" => {
-            if json || cached || prune || yes || force || owner.is_some() || delay_seconds.is_some()
+            if json
+                || cached
+                || prune
+                || create_only
+                || yes
+                || force
+                || owner.is_some()
+                || delay_seconds.is_some()
             {
                 return Err(format!("{command_name} accepts only --host and --match"));
             }
